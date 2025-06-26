@@ -19,10 +19,6 @@ def setup(rank, world_size):
     dist.init_process_group('nccl', rank=rank, world_size=world_size)
 
 
-def cleanup():
-    dist.destroy_process_group()
-
-
 def train(rank, world_size, model, optimizer, train_dataloader, val_dataloader, device):
     for epoch in range(config.NUM_EPOCHS):
         model.train()
@@ -83,44 +79,48 @@ def evaluate(model, dataloader, mode, device):
 
 def run(rank, world_size, dataset):
     setup(rank, world_size)
-    device = rank
+    try:
+        device = rank
 
-    train_dataset, val_dataset, test_dataset = split_dataset(dataset, train_ratio=0.7, val_ratio=0.2)
-    train_dataloader, val_dataloader, test_dataloader = create_loaders(
-        train_dataset, val_dataset, test_dataset, config.BATCH_SIZE, world_size=world_size, rank=rank
-    )
+        train_dataset, val_dataset, test_dataset = split_dataset(dataset, train_ratio=0.7, val_ratio=0.2)
+        train_dataloader, val_dataloader, test_dataloader = create_loaders(
+            train_dataset, val_dataset, test_dataset, config.BATCH_SIZE, world_size=world_size, rank=rank
+        )
 
-    node_dim = dataset.num_node_features + 3
-    edge_dim = 1
+        node_dim = dataset.num_node_features + 3
+        edge_dim = 1
 
-    model = Model(
-        node_dim=node_dim, edge_dim=edge_dim, hidden_dim=config.HIDDEN_DIM, num_timesteps=config.NUM_TIMESTEPS
-    ).to(device)
-    model = DistributedDataParallel(model, device_ids=[device])
-    optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
+        model = Model(
+            node_dim=node_dim, edge_dim=edge_dim, hidden_dim=config.HIDDEN_DIM, num_timesteps=config.NUM_TIMESTEPS
+        ).to(device)
+        model = DistributedDataParallel(model, device_ids=[device])
+        optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
 
-    train(rank, world_size, model, optimizer, train_dataloader, val_dataloader, device)
+        train(rank, world_size, model, optimizer, train_dataloader, val_dataloader, device)
 
-    if rank == 0:
-        avg_test_loss = evaluate(model, test_dataloader, 'Test', device)
-        print(f'Test loss: {avg_test_loss:.4f}')
+        if rank == 0:
+            avg_test_loss = evaluate(model, test_dataloader, 'Test', device)
+            print(f'Test loss: {avg_test_loss:.4f}')
 
-        model_path = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'model.pth')
-        # Save the state of the underlying model
-        torch.save(model.module.state_dict(), model_path)
-        print(f'Model saved to `{model_path}`')
-
-    cleanup()
+            model_path = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'model.pth')
+            # Save the state of the underlying model
+            torch.save(model.module.state_dict(), model_path)
+            print(f'Model saved to `{model_path}`')
+    finally:
+        dist.destroy_process_group()
 
 
 if __name__ == '__main__':
     world_size = torch.cuda.device_count()
     if world_size < 2:
-        print('This script is designed for multi-GPU training. Found {world_size} GPUs.')
+        print(f'This script is designed for multi-GPU training. Found {world_size} GPUs.')
         # Simple fallback or error could be here. For now, we assume user wants DDP.
         # To run on a single GPU, you might want to call a different main function.
 
     print(f'Spawning {world_size} processes.')
     # Load dataset once and share it across processes
     dataset = DNADataset()
-    mp.spawn(run, args=(world_size, dataset), nprocs=world_size, join=True)
+    try:
+        mp.spawn(run, args=(world_size, dataset), nprocs=world_size, join=True)  # type: ignore
+    except KeyboardInterrupt:
+        print('\nInterrupted by user. Cleaning up processes...')

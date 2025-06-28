@@ -12,7 +12,7 @@ from tqdm import tqdm
 import config
 from dataset import DNADataset
 from model import Model
-from utils import create_loaders, split_dataset
+from utils import create_loaders, log_visualization, split_dataset
 
 
 def evaluate(model, dataloader, device):
@@ -112,11 +112,11 @@ def run(rank, world_size, dataset, log_dir):
                     'hidden_dim': config.HIDDEN_DIM,
                     'num_timesteps': config.NUM_TIMESTEPS,
                     'num_epochs': config.NUM_EPOCHS,
-                    'bond_threshold': config.BOND_THRESHOLD,
-                    'window_size': config.WINDOW_SIZE
+                    'bond_threshold': config.BOND_THRESHOLD
                 }
                 metrics = {'Test Loss': avg_test_loss}
                 writer.add_hparams(hparams, metrics)
+                log_visualization(writer, model.module, test_data_list, device)
 
             model_path = osp.join(log_dir, 'model.pth')
             torch.save(model.module.state_dict(), model_path)
@@ -130,9 +130,8 @@ if __name__ == '__main__':
     # Create log directory with a human-readable name
     current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
     log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'logs', current_time)
-    os.makedirs(log_dir)
 
-    dataset = DNADataset(config.BOND_THRESHOLD, config.WINDOW_SIZE)
+    dataset = DNADataset(config.BOND_THRESHOLD)
 
     if torch.cuda.is_available():
         world_size = torch.cuda.device_count()

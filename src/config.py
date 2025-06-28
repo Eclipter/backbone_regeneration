@@ -1,11 +1,9 @@
-BATCH_SIZE = 64
 HIDDEN_DIM = 64
-LR = 1e-3
-NUM_EPOCHS = 50
 NUM_TIMESTEPS = 200
-WINDOW_SIZE = 3
-
-# TODO: consider adding these features to the model
+LR = 1e-3
+BATCH_SIZE = 64
+NUM_EPOCHS = 30
 BOND_THRESHOLD = 1.9
+
+# TODO: consider adding this feature to the model
 SUPPORTED_EDGES = ['SINGLE', 'DOUBLE', 'TRIPLE', 'AROMATIC']
-ATOMIC_NUMBERS = [6, 7, 8, 15, 16]

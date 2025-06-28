@@ -10,7 +10,7 @@ from torch_geometric.data import Data, Dataset
 from tqdm import tqdm
 
 import config
-from utils import collect_dna_residues, get_pdb_ids, is_dna_chain
+from utils import atom_to_idx, collect_dna_residues, get_pdb_ids, is_dna_chain
 
 
 class DNADataset(Dataset):
@@ -20,20 +20,19 @@ class DNADataset(Dataset):
     структуры сахарофосфатного остова центрального нуклеотида.
     """
 
-    def __init__(self, bond_threshold, window_size):
+    def __init__(self, bond_threshold):
         """
         Args:
             bond_threshold (float): Максимальное расстояние в ангстремах для определения связи.
             window_size (int): Размер скользящего окна (количество нуклеотидов).
         """
         self.bond_threshold = bond_threshold
-        self.window_size = window_size
 
         self.backbone_atoms = {
             "P", "OP1", "OP2", "O5'", "C5'", "C4'", "O4'", "C3'", "O3'", "C2'", "C1'"
         }
-        self.atom_to_idx = {'C': 0, 'N': 1, 'O': 2, 'P': 3}
         self.supported_resnames = {'DA', 'DC', 'DG', 'DT', 'BRU'}
+        self.window_size = 3
 
         self.pdb_ids = get_pdb_ids()
         self.data_list = []
@@ -112,7 +111,7 @@ class DNADataset(Dataset):
                                 if atom.element == 'H':
                                     continue
                                 positions.append(atom.get_coord())
-                                atom_features.append(self.atom_to_idx[atom.element])
+                                atom_features.append(atom_to_idx[atom.element])
                                 backbone_mask.append(1 if atom.get_name() in self.backbone_atoms else 0)
                                 nucleotide_masks.append(j)
 
@@ -128,7 +127,7 @@ class DNADataset(Dataset):
 
                         x = F.one_hot(
                             torch.tensor(atom_features, dtype=torch.long),
-                            num_classes=len(self.atom_to_idx)
+                            num_classes=len(atom_to_idx)
                         ).float()
 
                         central_mask = torch.tensor(nucleotide_masks) == self.window_size // 2
@@ -156,4 +155,4 @@ class DNADataset(Dataset):
 
 
 if __name__ == '__main__':
-    DNADataset(config.BOND_THRESHOLD, config.WINDOW_SIZE)
+    DNADataset(config.BOND_THRESHOLD)

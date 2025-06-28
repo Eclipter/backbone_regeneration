@@ -44,7 +44,16 @@ class DenoisingGNN(nn.Module):
         time_emb = self.time_emb(timestep)
         node_emb = self.node_emb(x)
 
-        is_condition = ~batch_obj.central_mask
+        # Autoregressive-friendly conditioning:
+        # Condition on the full left nucleotide, and the bases of the central and right nucleotides.
+        # This simulates generating a backbone from left to right.
+        is_left = batch_obj.nucleotide_mask == 0
+        is_central = batch_obj.central_mask
+        is_right = batch_obj.nucleotide_mask == 2
+        is_base = ~batch_obj.backbone_mask
+
+        is_condition = is_left | (is_central & is_base) | (is_right & is_base)
+
         condition_nodes_x_features = batch_obj.x[is_condition]
         condition_nodes_pos = batch_obj.pos[is_condition]
         condition_nodes_x = torch.cat([condition_nodes_x_features, condition_nodes_pos], dim=1)

@@ -9,6 +9,7 @@ from Bio.PDB.MMCIFParser import MMCIFParser
 from torch_geometric.data import Data, Dataset
 from tqdm import tqdm
 
+import config
 from utils import collect_dna_residues, get_pdb_ids, is_dna_chain
 
 
@@ -19,7 +20,7 @@ class DNADataset(Dataset):
     структуры сахарофосфатного остова центрального нуклеотида.
     """
 
-    def __init__(self, bond_threshold=1.9, window_size=3):
+    def __init__(self, bond_threshold, window_size):
         """
         Args:
             bond_threshold (float): Максимальное расстояние в ангстремах для определения связи.
@@ -115,10 +116,13 @@ class DNADataset(Dataset):
                                 backbone_mask.append(1 if atom.get_name() in self.backbone_atoms else 0)
                                 nucleotide_masks.append(j)
 
-                        # Calculate the adjacency matrix for the window
+                        # Calculate centroid and center positions
                         pos_tensor = torch.tensor(np.array(positions), dtype=torch.float)
+                        centroid = pos_tensor.mean(dim=0)
+                        pos_tensor_centered = pos_tensor - centroid
+
+                        # Calculate the adjacency matrix for the window
                         dist_matrix = torch.cdist(pos_tensor, pos_tensor)
-                        # TODO: implement better bond threshold
                         edge_index = (dist_matrix <= self.bond_threshold).nonzero().t().contiguous()
                         edge_index = edge_index[:, edge_index[0] != edge_index[1]]
 
@@ -132,10 +136,11 @@ class DNADataset(Dataset):
                         data = Data(
                             x=x,
                             edge_index=edge_index,
-                            pos=pos_tensor,
+                            pos=pos_tensor_centered,
                             backbone_mask=torch.tensor(backbone_mask, dtype=torch.bool),
                             nucleotide_mask=torch.tensor(nucleotide_masks, dtype=torch.long),
-                            central_mask=central_mask
+                            central_mask=central_mask,
+                            centroid=centroid
                         )
 
                         torch.save(data, osp.join(pdb_processed_dir, f'{data_counter}.pt'))
@@ -151,4 +156,4 @@ class DNADataset(Dataset):
 
 
 if __name__ == '__main__':
-    DNADataset()
+    DNADataset(config.BOND_THRESHOLD, config.WINDOW_SIZE)

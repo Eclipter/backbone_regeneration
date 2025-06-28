@@ -182,7 +182,11 @@ class Model(nn.Module):
         device = next(self.parameters()).device
 
         nodes_and_pos = torch.randn(shape, device=device)
-        edge_index = torch.stack(torch.meshgrid(torch.arange(num_nodes, device=device), torch.arange(num_nodes, device=device)), dim=0).view(2, -1)
+        edge_index = torch.stack(torch.meshgrid(
+            torch.arange(num_nodes, device=device),
+            torch.arange(num_nodes, device=device),
+            indexing='ij'
+        ), dim=0).view(2, -1)
         edge_index = edge_index[:, edge_index[0] != edge_index[1]]
         condition_graph.central_mask = torch.zeros(condition_graph.num_nodes, dtype=torch.bool, device=device)
         sample_batch_map = torch.zeros(num_nodes, dtype=torch.long, device=device)

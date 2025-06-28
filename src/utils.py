@@ -94,7 +94,7 @@ def get_pdb_ids():
     pdb_ids = [item['identifier'] for item in data.get('result_set', [])]
     print(f'API request resulted in {len(pdb_ids)} PDB IDs.')
 
-    return pdb_ids[:500]
+    return pdb_ids[:1000]
 
 
 def is_dna_chain(raw_path, chain_id):

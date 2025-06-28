@@ -115,10 +115,6 @@ class DNADataset(Dataset):
                                 backbone_mask.append(1 if atom.get_name() in self.backbone_atoms else 0)
                                 nucleotide_masks.append(j)
 
-                        # Skip if no atoms were found
-                        if not positions:
-                            continue
-
                         # Calculate the adjacency matrix for the window
                         pos_tensor = torch.tensor(np.array(positions), dtype=torch.float)
                         dist_matrix = torch.cdist(pos_tensor, pos_tensor)
@@ -139,8 +135,7 @@ class DNADataset(Dataset):
                             pos=pos_tensor,
                             backbone_mask=torch.tensor(backbone_mask, dtype=torch.bool),
                             nucleotide_mask=torch.tensor(nucleotide_masks, dtype=torch.long),
-                            central_mask=central_mask,
-                            # pdb_id=pdb_id
+                            central_mask=central_mask
                         )
 
                         torch.save(data, osp.join(pdb_processed_dir, f'{data_counter}.pt'))

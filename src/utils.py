@@ -92,7 +92,7 @@ def get_pdb_ids():
     data = response.json()
 
     pdb_ids = [item['identifier'] for item in data.get('result_set', [])]
-    print(f'API request resulted in {len(pdb_ids)} PDB IDs')
+    print(f'API request resulted in {len(pdb_ids)} PDB IDs.')
 
     return pdb_ids[:500]
 
@@ -160,4 +160,4 @@ def create_loaders(train_dataset, val_dataset, test_dataset, batch_size, world_s
 
 
 if __name__ == '__main__':
-    print(get_pdb_ids()[:100])
+    print(get_pdb_ids())

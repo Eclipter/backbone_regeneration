@@ -1,7 +1,7 @@
 import numpy as np
 import torch
 import torch.nn as nn
-from torch_geometric.nn import GCNConv, global_mean_pool
+from torch_geometric.nn import GATConv, global_mean_pool
 
 
 # Basic sinusoidal timestep embedding
@@ -26,7 +26,7 @@ class TimestepEmbedding(nn.Module):
 
 
 class DenoisingGNN(nn.Module):
-    def __init__(self, node_dim, hidden_dim=128):
+    def __init__(self, node_dim, hidden_dim=128, num_heads=4):
         super().__init__()
         self.time_emb = TimestepEmbedding(hidden_dim)
         self.node_emb = nn.Linear(node_dim, hidden_dim)
@@ -34,8 +34,8 @@ class DenoisingGNN(nn.Module):
         self.condition_proj = nn.Linear(hidden_dim, hidden_dim)
         self.time_proj = nn.Linear(hidden_dim, hidden_dim)
 
-        self.conv1 = GCNConv(hidden_dim, hidden_dim)
-        self.conv2 = GCNConv(hidden_dim, hidden_dim)
+        self.conv1 = GATConv(hidden_dim, hidden_dim, heads=num_heads, concat=True)
+        self.conv2 = GATConv(hidden_dim * num_heads, hidden_dim, heads=1, concat=False)
 
         self.node_out = nn.Linear(hidden_dim, node_dim)
         self.edge_out = nn.Linear(hidden_dim * 2, 1)
@@ -92,7 +92,7 @@ class Model(nn.Module):
         super().__init__()
 
         self.num_timesteps = num_timesteps
-        self.denoising_model = DenoisingGNN(node_dim, hidden_dim)
+        self.denoising_model = DenoisingGNN(node_dim, hidden_dim, num_heads=4)
 
         betas = self.cosine_schedule(num_timesteps)
         alphas = 1. - betas

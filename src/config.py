@@ -2,8 +2,7 @@ HIDDEN_DIM = 64
 NUM_TIMESTEPS = 200
 LR = 1e-3
 BATCH_SIZE = 64
-NUM_EPOCHS = 30
+NUM_EPOCHS = 200
 BOND_THRESHOLD = 1.9
 
-# TODO: consider adding this feature to the model
-SUPPORTED_EDGES = ['SINGLE', 'DOUBLE', 'TRIPLE', 'AROMATIC']
+# TODO: implement bond length depending on the atom types

@@ -1,8 +1,13 @@
 import numpy as np
 import requests
+import torch
 from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 from torch.utils.data import DistributedSampler, Subset
 from torch_geometric.loader import DataLoader
+
+atom_types = ['C', 'N', 'O', 'P']
+atom_to_idx = {atom: i for i, atom in enumerate(atom_types)}
+idx_to_atom = {i: atom for i, atom in enumerate(atom_types)}
 
 
 def get_pdb_ids():
@@ -157,6 +162,58 @@ def create_loaders(train_dataset, val_dataset, test_dataset, batch_size, world_s
     test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
     return train_dataloader, val_dataloader, test_dataloader
+
+
+def log_visualization(writer, model, test_data_list, device):
+    'Logs a visualization of a generated sample to TensorBoard.'
+    original_full_graph = test_data_list[0].to(device)
+
+    # Prepare condition graph
+    is_left = original_full_graph.nucleotide_mask == 0
+    is_central = original_full_graph.central_mask
+    is_right = original_full_graph.nucleotide_mask == 2
+    is_base = ~original_full_graph.backbone_mask
+    condition_mask = is_left | (is_central & is_base) | (is_right & is_base)
+    condition_graph = original_full_graph.subgraph(condition_mask)
+
+    # Get number of nodes to generate
+    central_backbone_mask = original_full_graph.backbone_mask & original_full_graph.central_mask
+    num_nodes_to_generate = central_backbone_mask.sum().item()
+
+    if num_nodes_to_generate > 0:
+        # Generate graph
+        generated_nodes, generated_pos, _ = model.sample(
+            condition_graph, num_nodes=num_nodes_to_generate
+        )
+
+        # Re-center
+        generated_pos = generated_pos + original_full_graph.centroid
+
+        # Get original graph for comparison
+        original_central_graph = original_full_graph.subgraph(central_backbone_mask)
+        orig_pos = original_central_graph.pos + original_full_graph.centroid
+
+        # Log generated structure
+        generated_atom_types = [
+            idx_to_atom[idx]
+            for idx in torch.argmax(generated_nodes, dim=1).cpu().tolist()
+        ]
+        writer.add_embedding(
+            generated_pos,
+            metadata=generated_atom_types,
+            tag='Generated Backbone'
+        )
+
+        # Log original structure
+        orig_atom_types = [
+            idx_to_atom[idx]
+            for idx in torch.argmax(original_central_graph.x, dim=1).cpu().tolist()
+        ]
+        writer.add_embedding(
+            orig_pos,
+            metadata=orig_atom_types,
+            tag='Original Backbone'
+        )
 
 
 if __name__ == '__main__':

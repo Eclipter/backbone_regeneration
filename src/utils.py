@@ -1,9 +1,9 @@
-import numpy as np
+import logging
+
+import pytorch_lightning as pl
 import requests
 import torch
 from Bio.PDB.MMCIF2Dict import MMCIF2Dict
-from torch.utils.data import DistributedSampler, Subset
-from torch_geometric.loader import DataLoader
 
 atom_types = ['C', 'N', 'O', 'P']
 atom_to_idx = {atom: i for i, atom in enumerate(atom_types)}
@@ -97,9 +97,8 @@ def get_pdb_ids():
     data = response.json()
 
     pdb_ids = [item['identifier'] for item in data.get('result_set', [])]
-    print(f'API request resulted in {len(pdb_ids)} PDB IDs.')
 
-    return pdb_ids[:1000]
+    return pdb_ids[:]
 
 
 def is_dna_chain(raw_path, chain_id):
@@ -132,89 +131,71 @@ def collect_dna_residues(structure, chain_id, supported_resnames):
     return []
 
 
-def split_dataset(dataset, train_ratio=0.7, val_ratio=0.2):
-    indices = np.random.permutation(len(dataset)).tolist()
-    train_val_split = int(len(dataset) * train_ratio)
-    val_test_split = int(len(dataset) * (train_ratio + val_ratio))
+class VisualizationCallback(pl.Callback):
+    def on_test_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule):
+        datamodule = getattr(trainer, 'datamodule', None)  # type: ignore
+        logger = getattr(trainer, 'logger', None)
+        writer = logger.experiment  # type: ignore
+        device = pl_module.device
 
-    train_indices = indices[:train_val_split]
-    val_indices = indices[train_val_split:val_test_split]
-    test_indices = indices[val_test_split:]
+        test_data_list = list(datamodule.test_dataset)  # type: ignore
 
-    train_dataset = Subset(dataset, train_indices)
-    val_dataset = Subset(dataset, val_indices)
-    test_dataset = Subset(dataset, test_indices)
+        original_full_graph = test_data_list[0].to(device)
 
-    return train_dataset, val_dataset, test_dataset
+        # Prepare condition graph
+        is_left = original_full_graph.nucleotide_mask == 0
+        is_central = original_full_graph.central_mask
+        is_right = original_full_graph.nucleotide_mask == 2
+        is_base = ~original_full_graph.backbone_mask
+        condition_mask = is_left | (is_central & is_base) | (is_right & is_base)
+        condition_graph = original_full_graph.subgraph(condition_mask)
+
+        # Get number of nodes to generate
+        central_backbone_mask = original_full_graph.backbone_mask & original_full_graph.central_mask
+        num_nodes_to_generate = central_backbone_mask.sum().item()
+
+        if num_nodes_to_generate > 0:
+            # Generate graph
+            generated_nodes, generated_pos, _ = pl_module.sample(
+                condition_graph, num_nodes=num_nodes_to_generate
+            )
+
+            # Re-center
+            generated_pos = generated_pos + original_full_graph.centroid
+
+            # Get original graph for comparison
+            original_central_graph = original_full_graph.subgraph(central_backbone_mask)
+            orig_pos = original_central_graph.pos + original_full_graph.centroid
+
+            # Log generated structure
+            generated_atom_types = [
+                idx_to_atom[idx]
+                for idx in torch.argmax(generated_nodes, dim=1).cpu().tolist()
+            ]
+            writer.add_embedding(
+                generated_pos,
+                metadata=generated_atom_types,
+                tag='Generated Backbone'
+            )
+
+            # Log original structure
+            orig_atom_types = [
+                idx_to_atom[idx]
+                for idx in torch.argmax(original_central_graph.x, dim=1).cpu().tolist()
+            ]
+            writer.add_embedding(
+                orig_pos,
+                metadata=orig_atom_types,
+                tag='Original Backbone'
+            )
 
 
-def create_loaders(train_dataset, val_dataset, test_dataset, batch_size, world_size=1, rank=0):
-    train_sampler = None
-    shuffle = True
-    if world_size > 1:
-        train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
-        shuffle = False
-
-    train_dataloader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=shuffle, drop_last=True, sampler=train_sampler
-    )
-    val_dataloader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_dataloader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-
-    return train_dataloader, val_dataloader, test_dataloader
-
-
-def log_visualization(writer, model, test_data_list, device):
-    'Logs a visualization of a generated sample to TensorBoard.'
-    original_full_graph = test_data_list[0].to(device)
-
-    # Prepare condition graph
-    is_left = original_full_graph.nucleotide_mask == 0
-    is_central = original_full_graph.central_mask
-    is_right = original_full_graph.nucleotide_mask == 2
-    is_base = ~original_full_graph.backbone_mask
-    condition_mask = is_left | (is_central & is_base) | (is_right & is_base)
-    condition_graph = original_full_graph.subgraph(condition_mask)
-
-    # Get number of nodes to generate
-    central_backbone_mask = original_full_graph.backbone_mask & original_full_graph.central_mask
-    num_nodes_to_generate = central_backbone_mask.sum().item()
-
-    if num_nodes_to_generate > 0:
-        # Generate graph
-        generated_nodes, generated_pos, _ = model.sample(
-            condition_graph, num_nodes=num_nodes_to_generate
-        )
-
-        # Re-center
-        generated_pos = generated_pos + original_full_graph.centroid
-
-        # Get original graph for comparison
-        original_central_graph = original_full_graph.subgraph(central_backbone_mask)
-        orig_pos = original_central_graph.pos + original_full_graph.centroid
-
-        # Log generated structure
-        generated_atom_types = [
-            idx_to_atom[idx]
-            for idx in torch.argmax(generated_nodes, dim=1).cpu().tolist()
-        ]
-        writer.add_embedding(
-            generated_pos,
-            metadata=generated_atom_types,
-            tag='Generated Backbone'
-        )
-
-        # Log original structure
-        orig_atom_types = [
-            idx_to_atom[idx]
-            for idx in torch.argmax(original_central_graph.x, dim=1).cpu().tolist()
-        ]
-        writer.add_embedding(
-            orig_pos,
-            metadata=orig_atom_types,
-            tag='Original Backbone'
-        )
+class NoUnusedParametersWarningFilter(logging.Filter):
+    def filter(self, record):
+        return 'find_unused_parameters=True' not in record.getMessage()
 
 
 if __name__ == '__main__':
-    print(get_pdb_ids())
+    pdb_ids = get_pdb_ids()
+    print(f'API request resulted in {len(pdb_ids)} PDB IDs.')
+    print()

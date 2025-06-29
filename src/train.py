@@ -1,145 +1,92 @@
-import os
+import logging
 import os.path as osp
+import warnings
 from datetime import datetime
 
+import pytorch_lightning as pl
 import torch
-import torch.distributed as dist
-import torch.multiprocessing as mp
-from torch.nn.parallel import DistributedDataParallel
-from torch.utils.tensorboard.writer import SummaryWriter
-from tqdm import tqdm
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.strategies import DDPStrategy
 
 import config
-from dataset import DNADataset
+from dataset import DNADataModule
 from model import Model
-from utils import create_loaders, log_visualization, split_dataset
+from utils import NoUnusedParametersWarningFilter, VisualizationCallback
 
 
-def evaluate(model, dataloader, device):
-    # Use model.module to get the original model when wrapped in DDP
-    model_to_eval = model.module if isinstance(model, DistributedDataParallel) else model
-    model_to_eval.eval()
+def main():
+    torch.set_float32_matmul_precision('high')
 
-    batch_loss = 0
-    with torch.no_grad():
-        for batch in dataloader:
-            batch = batch.to(device)
-
-            loss = model_to_eval(batch)
-            if loss is not None:
-                batch_loss += loss.item()
-
-    avg_loss = batch_loss / len(dataloader)
-    return avg_loss
-
-
-def train(rank, world_size, model, optimizer, train_dataloader, val_dataloader, device, writer):
-    # TQDM progress bar only on the main process
-    pbar = tqdm(
-        range(config.NUM_EPOCHS),
-        desc='Training',
-        colour='#AA80FF',
-        disable=(rank != 0)
+    # Suppress warnings
+    logging.getLogger('torch.distributed.ddp_model_wrapper').addFilter(
+        NoUnusedParametersWarningFilter()
     )
-    for epoch in pbar:
-        model.train()
-        if world_size > 1:
-            train_dataloader.sampler.set_epoch(epoch)
+    warnings.filterwarnings('ignore', 'The `srun` command is available on your.*')
 
-        batch_train_loss = 0
+    data_module = DNADataModule(
+        bond_threshold=config.BOND_THRESHOLD,
+        batch_size=config.BATCH_SIZE
+    )
 
-        for batch in train_dataloader:
-            batch = batch.to(device)
+    pl_module = Model(
+        hidden_dim=config.HIDDEN_DIM,
+        num_timesteps=config.NUM_TIMESTEPS,
+        lr=config.LR,
+        batch_size=config.BATCH_SIZE
+    )
 
-            loss = model(batch)
-            batch_train_loss += loss.item()
+    log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'logs')
+    current_time = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')
+    logger = TensorBoardLogger(log_dir, name='', version=current_time)
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+    checkpoint_callback = ModelCheckpoint(
+        monitor='val_loss',
+        mode='min',
+        save_top_k=10,
+        save_last=True
+    )
+    early_stopping_callback = EarlyStopping(
+        monitor='val_loss',
+        patience=10,
+        mode='min'
+    )
 
-        avg_train_loss = batch_train_loss / len(train_dataloader)
+    if torch.cuda.device_count() > 1:
+        strategy = DDPStrategy()
+    else:
+        strategy = 'auto'
+    trainer = pl.Trainer(
+        strategy=strategy,
+        log_every_n_steps=1,  # To disable warning
+        # precision='16-mixed',
+        max_epochs=-1,
+        logger=logger,
+        callbacks=[
+            checkpoint_callback,
+            early_stopping_callback,
+            VisualizationCallback()
+        ],
+        enable_progress_bar=False,
+        enable_model_summary=False
+    )
 
-        if rank == 0:
-            avg_val_loss = evaluate(model, val_dataloader, device)
+    trainer.fit(pl_module, datamodule=data_module)
 
-            writer.add_scalar('Loss/Train', avg_train_loss, epoch)
-            writer.add_scalar('Loss/Validation', avg_val_loss, epoch)
-
-        if world_size > 1:
-            dist.barrier()
-
-
-def run(rank, world_size, dataset, log_dir):
-    try:
-        os.environ['MASTER_ADDR'] = 'localhost'
-        os.environ['MASTER_PORT'] = '50000'
-        dist.init_process_group('nccl', rank=rank, world_size=world_size)
-        device = rank
-
-        writer = None
-        if rank == 0:
-            writer = SummaryWriter(log_dir=log_dir)
-
-        train_dataset, val_dataset, test_dataset = split_dataset(dataset, train_ratio=0.7, val_ratio=0.2)
-        train_dataloader, val_dataloader, test_dataloader = create_loaders(
-            train_dataset, val_dataset, test_dataset, config.BATCH_SIZE, world_size=world_size, rank=rank
+    # Test on a single GPU for accurate metrics
+    if trainer.global_rank == 0:
+        test_trainer = pl.Trainer(
+            devices=1,
+            logger=logger,
+            enable_progress_bar=False,
+            enable_model_summary=False
         )
-
-        if rank == 0:
-            # Save test dataset to file for visualization in jupyter notebook
-            test_data_list = list(test_dataset)  # type: ignore
-            test_dataset_path = osp.join(log_dir, 'test_dataset.pt')
-            torch.save(test_data_list, test_dataset_path)
-
-        node_dim = dataset.num_node_features + 3
-        edge_dim = 1
-        model = Model(
-            node_dim=node_dim, edge_dim=edge_dim, hidden_dim=config.HIDDEN_DIM, num_timesteps=config.NUM_TIMESTEPS
-        ).to(device)
-        model = DistributedDataParallel(model, device_ids=[device])
-        optimizer = torch.optim.Adam(model.parameters(), lr=config.LR)
-
-        train(rank, world_size, model, optimizer, train_dataloader, val_dataloader, device, writer)
-
-        if rank == 0:
-            avg_test_loss = evaluate(model, test_dataloader, device)
-
-            if writer:
-                hparams = {
-                    'lr': config.LR,
-                    'batch_size': config.BATCH_SIZE,
-                    'hidden_dim': config.HIDDEN_DIM,
-                    'num_timesteps': config.NUM_TIMESTEPS,
-                    'num_epochs': config.NUM_EPOCHS,
-                    'bond_threshold': config.BOND_THRESHOLD
-                }
-                metrics = {'Test Loss': avg_test_loss}
-                writer.add_hparams(hparams, metrics)
-                log_visualization(writer, model.module, test_data_list, device)
-
-            model_path = osp.join(log_dir, 'model.pth')
-            torch.save(model.module.state_dict(), model_path)
-    finally:
-        if rank == 0 and writer:
-            writer.close()
-        dist.destroy_process_group()
+        test_trainer.test(
+            pl_module,
+            datamodule=data_module,
+            ckpt_path=checkpoint_callback.best_model_path
+        )
 
 
 if __name__ == '__main__':
-    # Create log directory with a human-readable name
-    current_time = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'logs', current_time)
-
-    dataset = DNADataset(config.BOND_THRESHOLD)
-
-    if torch.cuda.is_available():
-        world_size = torch.cuda.device_count()
-    else:
-        world_size = 1
-    print(f'Spawning {world_size} processes.')
-
-    try:
-        mp.spawn(run, args=(world_size, dataset, log_dir), nprocs=world_size)  # type: ignore
-    except KeyboardInterrupt:
-        print('\nInterrupted by user. Cleaning up processes...')
+    main()

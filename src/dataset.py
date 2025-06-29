@@ -2,18 +2,21 @@ import os
 import os.path as osp
 
 import numpy as np
+import pytorch_lightning as pl
 import requests
 import torch
 import torch.nn.functional as F
 from Bio.PDB.MMCIFParser import MMCIFParser
+from torch.utils.data import Subset
 from torch_geometric.data import Data, Dataset
+from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 import config
 from utils import atom_to_idx, collect_dna_residues, get_pdb_ids, is_dna_chain
 
 
-class DNADataset(Dataset):
+class PyGDataset(Dataset):
     """
     Датасет для создания графов ДНК из mmCIF файлов.
     Использует скользящее окно из 3 нуклеотидов для генерации
@@ -154,5 +157,44 @@ class DNADataset(Dataset):
         return torch.load(self.data_list[idx], weights_only=False)
 
 
+class DNADataModule(pl.LightningDataModule):
+    def __init__(self, bond_threshold, batch_size, train_ratio=0.7, val_ratio=0.2):
+        super().__init__()
+        self.bond_threshold = bond_threshold
+        self.batch_size = batch_size
+        self.train_ratio = train_ratio
+        self.val_ratio = val_ratio
+        self.dataset = None
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+
+    def prepare_data(self):
+        PyGDataset(self.bond_threshold)
+
+    def setup(self, stage=None):
+        self.dataset = PyGDataset(self.bond_threshold)
+        indices = np.random.permutation(len(self.dataset)).tolist()
+        train_val_split = int(len(self.dataset) * self.train_ratio)
+        val_test_split = int(len(self.dataset) * (self.train_ratio + self.val_ratio))
+
+        train_indices = indices[:train_val_split]
+        val_indices = indices[train_val_split:val_test_split]
+        test_indices = indices[val_test_split:]
+
+        self.train_dataset = Subset(self.dataset, train_indices)
+        self.val_dataset = Subset(self.dataset, val_indices)
+        self.test_dataset = Subset(self.dataset, test_indices)
+
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)  # type: ignore
+
+    def val_dataloader(self):
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False)  # type: ignore
+
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False)  # type: ignore
+
+
 if __name__ == '__main__':
-    DNADataset(config.BOND_THRESHOLD)
+    PyGDataset(config.BOND_THRESHOLD)

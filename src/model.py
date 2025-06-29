@@ -1,7 +1,11 @@
 import numpy as np
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
-from torch_geometric.nn import GATConv, global_mean_pool
+from e3nn import o3
+from e3nn.nn import BatchNorm, Gate
+from torch_geometric.nn import global_mean_pool
+from torch_scatter import scatter
 
 
 # Basic sinusoidal timestep embedding
@@ -22,79 +26,127 @@ class TimestepEmbedding(nn.Module):
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
-# A GNN for the denoising model, now with MessagePassing
 
-
+# An SE(3) equivariant GNN for the denoising model
 class DenoisingGNN(nn.Module):
-    def __init__(self, node_dim, hidden_dim=128, num_heads=4):
+    def __init__(self, hidden_dim=128, num_atom_types=4):
         super().__init__()
+        # In E3NN, we define representations by o3.Irreps.
+        # 'o3.Irreps("1x0e")' is 1 scalar (l=0, even parity).
+        # 'o3.Irreps("1x1o")' is 1 vector (l=1, odd parity).
+        self.node_ireps_in = o3.Irreps(f'{num_atom_types}x0e')  # One-hot atom types
+        self.node_ireps_hidden = o3.Irreps(f'{hidden_dim}x0e + {hidden_dim//4}x1o')  # scalars and vectors
+        self.node_ireps_out = o3.Irreps(f'{num_atom_types}x0e + 1x1o')  # atom type noise + position noise
+
         self.time_emb = TimestepEmbedding(hidden_dim)
-        self.node_emb = nn.Linear(node_dim, hidden_dim)
+        self.node_emb = o3.Linear(self.node_ireps_in, self.node_ireps_hidden)
 
         self.condition_proj = nn.Linear(hidden_dim, hidden_dim)
         self.time_proj = nn.Linear(hidden_dim, hidden_dim)
 
-        self.conv1 = GATConv(hidden_dim, hidden_dim, heads=num_heads, concat=True)
-        self.conv2 = GATConv(hidden_dim * num_heads, hidden_dim, heads=1, concat=False)
+        self.conv1 = EquivariantConv(self.node_ireps_hidden, self.node_ireps_hidden)
+        self.conv2 = EquivariantConv(self.node_ireps_hidden, self.node_ireps_hidden)
 
-        self.node_out = nn.Linear(hidden_dim, node_dim)
+        self.node_out = o3.Linear(self.node_ireps_hidden, self.node_ireps_out)
         self.edge_out = nn.Linear(hidden_dim * 2, 1)
 
-    def forward(self, x, edge_index, timestep, batch_map, batch_obj):
+    def forward(self, x, pos, edge_index, timestep, batch_map, batch_obj, edge_candidates):
         time_emb = self.time_emb(timestep)
-        node_emb = self.node_emb(x)
 
-        # Autoregressive-friendly conditioning:
-        # Condition on the full left nucleotide, and the bases of the central and right nucleotides.
-        # This simulates generating a backbone from left to right.
+        # Separate atom features (scalars) and positions (vectors)
+        # Note: In e3nn, positions are handled by relative vectors in convolutions
+        # The `x` here are the invariant features (atom types)
+        node_h = self.node_emb(x)
+
+        # Autoregressive-friendly conditioning
         is_left = batch_obj.nucleotide_mask == 0
         is_central = batch_obj.central_mask
         is_right = batch_obj.nucleotide_mask == 2
         is_base = ~batch_obj.backbone_mask
-
         is_condition = is_left | (is_central & is_base) | (is_right & is_base)
 
         condition_nodes_x_features = batch_obj.x[is_condition]
-        condition_nodes_pos = batch_obj.pos[is_condition]
-        condition_nodes_x = torch.cat([condition_nodes_x_features, condition_nodes_pos], dim=1)
         condition_nodes_batch_map = batch_obj.batch[is_condition]
 
         num_graphs = batch_obj.num_graphs if hasattr(batch_obj, 'num_graphs') else 1
 
-        if condition_nodes_x.size(0) == 0:
-            pooled_condition = torch.zeros(num_graphs, self.node_emb.out_features, device=x.device)
+        if condition_nodes_x_features.size(0) == 0:
+            pooled_condition = torch.zeros(num_graphs, self.node_ireps_hidden.dim, device=x.device)
         else:
-            condition_emb = self.node_emb(condition_nodes_x)
+            # For conditioning, we only use the scalar features
+            condition_emb = self.node_emb(condition_nodes_x_features)[:, :self.node_ireps_hidden.dim // 5 * 4]
             pooled_condition = global_mean_pool(condition_emb, condition_nodes_batch_map, size=num_graphs)
 
         time_h = self.time_proj(time_emb)
         condition_h = self.condition_proj(pooled_condition)
 
-        # Correctly use batch_map which corresponds to x
-        node_emb = node_emb + time_h[batch_map] + condition_h[batch_map]
+        # Add time and condition embeddings to the scalar part of node embeddings
+        scalar_dim = self.node_ireps_hidden.count('0e')
+        node_h[:, :scalar_dim] = node_h[:, :scalar_dim] + time_h[batch_map] + condition_h[batch_map]
 
-        h = self.conv1(node_emb, edge_index).relu()
-        h = self.conv2(h, edge_index).relu()
+        h = self.conv1(node_h, pos, edge_index)
+        h = self.conv2(h, pos, edge_index)
 
         node_noise_pred = self.node_out(h)
 
-        num_nodes = x.size(0)
-        row, col = torch.triu_indices(num_nodes, num_nodes, 1, device=h.device)
-
-        edge_h = torch.cat([h[row], h[col]], dim=1)
-        edge_logits = self.edge_out(edge_h).squeeze(-1)
+        if edge_candidates.shape[1] > 0:
+            row, col = edge_candidates[0], edge_candidates[1]
+            # Use scalar features for edge prediction
+            edge_h = torch.cat([h[row, :scalar_dim], h[col, :scalar_dim]], dim=1)
+            edge_logits = self.edge_out(edge_h).squeeze(-1)
+        else:
+            edge_logits = torch.empty(0, device=h.device)
 
         return node_noise_pred, edge_logits
 
 
-class Model(nn.Module):
-    def __init__(self, node_dim, hidden_dim=128, num_timesteps=1000, **kwargs):
+class EquivariantConv(nn.Module):
+    def __init__(self, irreps_in, irreps_out):
         super().__init__()
+        self.irreps_in = o3.Irreps(irreps_in)
+        self.irreps_out = o3.Irreps(irreps_out)
+        self.irreps_sh = o3.Irreps.spherical_harmonics(lmax=1)
 
-        self.num_timesteps = num_timesteps
-        self.denoising_model = DenoisingGNN(node_dim, hidden_dim, num_heads=4)
+        self.tensor_prod = o3.FullyConnectedTensorProduct(
+            self.irreps_in, self.irreps_sh, self.irreps_in, shared_weights=False
+        )
+        self.fc = o3.FullyConnectedLinear(self.irreps_in, self.irreps_out, force_irreps_out=True)
+        self.gate = Gate(
+            self.irreps_out.slice_by_mul[0], [torch.relu, torch.sigmoid],
+            self.irreps_out.slice_by_mul[1]
+        )
+        self.bn = BatchNorm(self.irreps_out)
 
-        betas = self.cosine_schedule(num_timesteps)
+    def forward(self, node_h, pos, edge_index):
+        row, col = edge_index
+        edge_vec = pos[row] - pos[col]
+        edge_sh = o3.spherical_harmonics(self.irreps_sh, edge_vec, normalize=True, normalization='component')
+
+        # Message
+        msg = self.tensor_prod(node_h[col], edge_sh)
+
+        # Aggregate
+        node_h_agg = scatter(msg, row, dim=0, reduce='mean', dim_size=node_h.shape[0])
+
+        # Update
+        node_h_new = self.fc(node_h_agg) + node_h
+        node_h_new = self.gate(node_h_new)
+        node_h_new = self.bn(node_h_new)
+
+        return node_h_new
+
+
+class Model(pl.LightningModule):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.num_timesteps = self.hparams.num_timesteps  # type: ignore
+        self.denoising_model = DenoisingGNN(
+            self.hparams.hidden_dim, num_atom_types=4  # Assuming 4 atom types from one-hot encoding
+        )
+
+        betas = self.cosine_schedule(self.num_timesteps)
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
 
@@ -119,78 +171,92 @@ class Model(nn.Module):
         if noise is None:
             noise = torch.randn_like(x_start)
 
-        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[timestep][:, None]
-        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[timestep][:, None]
+        sqrt_alphas_cumprod_t = self.sqrt_alphas_cumprod[timestep].view(-1, 1)
+        sqrt_one_minus_alphas_cumprod_t = self.sqrt_one_minus_alphas_cumprod[timestep].view(-1, 1)
 
         return sqrt_alphas_cumprod_t * x_start + sqrt_one_minus_alphas_cumprod_t * noise
 
-    def p_losses(self, batch, timestep):
+    def _common_step(self, batch):
         """Calculates the loss for the reverse process using masks."""
-        # Combine features and positions for the diffusion process
-        x_start = torch.cat([batch.x, batch.pos], dim=1)
+        batch_size = batch.num_graphs
+        timestep = torch.randint(0, self.num_timesteps, (batch_size,), device=self.device).long()
 
-        node_noise = torch.randn_like(x_start)
-        noisy_x = self.q_sample(x_start, timestep[batch.batch], noise=node_noise)
+        # x_start is atom features (scalars), pos_start is coordinates (vectors)
+        x_start = batch.x
+        pos_start = batch.pos
 
-        # The denoising model now receives the concatenated tensor
-        predicted_node_noise, predicted_edge_logits = self.denoising_model(
-            x=noisy_x, edge_index=batch.edge_index, timestep=timestep, batch_map=batch.batch, batch_obj=batch
-        )
+        # Noise scalars and vectors separately
+        x_noise = torch.randn_like(x_start)
+        pos_noise = torch.randn_like(pos_start)
+        noisy_x = self.q_sample(x_start, timestep[batch.batch], noise=x_noise)
+        noisy_pos = self.q_sample(pos_start, timestep[batch.batch], noise=pos_noise)
 
         is_target_node = batch.backbone_mask & batch.central_mask
         if is_target_node.sum() == 0:
             return None
 
-        # Loss is calculated on the concatenated features and positions
-        node_loss = nn.MSELoss()(predicted_node_noise[is_target_node], node_noise[is_target_node])
+        target_node_indices = torch.where(is_target_node)[0]
+        if len(target_node_indices) < 2:
+            edge_candidates = torch.empty((2, 0), dtype=torch.long, device=batch.x.device)
+        else:
+            row, col = torch.triu_indices(len(target_node_indices), len(target_node_indices), 1, device=batch.x.device)
+            edge_candidates = torch.stack([target_node_indices[row], target_node_indices[col]], dim=0)
 
-        num_nodes_total = batch.num_nodes
-        row, col = torch.triu_indices(num_nodes_total, num_nodes_total, 1, device=batch.x.device)
-
-        # Create ground truth adjacency matrix for the batched graph
-        gt_adj_sparse = torch.sparse_coo_tensor(
-            batch.edge_index,
-            torch.ones(batch.edge_index.size(1), device=batch.x.device),
-            size=(num_nodes_total, num_nodes_total)
+        predicted_noise, predicted_edge_logits = self.denoising_model(
+            x=noisy_x, pos=noisy_pos, edge_index=batch.edge_index, timestep=timestep, batch_map=batch.batch, batch_obj=batch,
+            edge_candidates=edge_candidates
         )
-        gt_adj_flat_triu = gt_adj_sparse.to_dense()[row, col]
 
-        is_target_edge_mask = is_target_node[row] & is_target_node[col]
+        # Separate predicted noise into scalar and vector parts
+        num_atom_types = self.denoising_model.node_ireps_in.dim
+        pred_x_noise = predicted_noise[:, :num_atom_types]
+        pred_pos_noise = predicted_noise[:, num_atom_types:]
 
-        if is_target_edge_mask.sum() == 0:
-            return node_loss
+        x_loss = nn.MSELoss()(pred_x_noise[is_target_node], x_noise[is_target_node])
+        pos_loss = nn.MSELoss()(pred_pos_noise[is_target_node], pos_noise[is_target_node])
+        node_loss = x_loss + pos_loss
 
-        edge_loss = nn.BCEWithLogitsLoss()(
-            predicted_edge_logits[is_target_edge_mask],
-            gt_adj_flat_triu[is_target_edge_mask]
-        )
+        if edge_candidates.shape[1] > 0:
+            num_nodes_total = batch.num_nodes
+            gt_adj_sparse = torch.sparse_coo_tensor(
+                batch.edge_index,
+                torch.ones(batch.edge_index.size(1), device=batch.x.device),
+                size=(num_nodes_total, num_nodes_total)
+            ).to_dense()
+            gt_adj_for_candidates = gt_adj_sparse[edge_candidates[0], edge_candidates[1]]
+            edge_loss = nn.BCEWithLogitsLoss()(predicted_edge_logits, gt_adj_for_candidates)
+        else:
+            edge_loss = (predicted_edge_logits.sum() * 0.0)
 
         return node_loss + edge_loss
 
-    def forward(self, batch):
-        """
-        A full forward pass for training.
-        `batch` is the full batched graph from the dataloader.
-        """
-        batch_size = batch.num_graphs
-        timestep = torch.randint(0, self.num_timesteps, (batch_size,), device=batch.x.device).long()
+    def training_step(self, batch, batch_idx):
+        loss = self._common_step(batch)
+        self.log('Training Loss', loss, on_step=False, on_epoch=True, logger=True, batch_size=self.hparams.batch_size, sync_dist=True)  # type: ignore
+        return loss
 
-        # This will be changed later to use masks
-        # For now, we keep the old logic to make the change incremental
-        # We will need to split the batch here for the old p_losses to work
+    def validation_step(self, batch, batch_idx):
+        loss = self._common_step(batch)
+        self.log('Validation Loss', loss, on_step=False, on_epoch=True, logger=True, batch_size=self.hparams.batch_size, sync_dist=True)  # type: ignore
 
-        # Placeholder for the next refactoring step
-        # This will currently fail, but it's an intermediate step
+    def test_step(self, batch, batch_idx):
+        loss = self._common_step(batch)
+        self.log('Test Loss', loss, batch_size=self.hparams.batch_size, sync_dist=True)  # type: ignore
 
-        return self.p_losses(batch, timestep)
+    def configure_optimizers(self):
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)  # type: ignore
+        return optimizer
 
     @torch.no_grad()
     def sample(self, condition_graph, num_nodes):
-        node_dim = self.denoising_model.node_emb.in_features
-        shape = (num_nodes, node_dim)
+        num_atom_types = self.denoising_model.node_ireps_in.dim
+        x_shape = (num_nodes, num_atom_types)
+        pos_shape = (num_nodes, 3)
         device = next(self.parameters()).device
 
-        nodes_and_pos = torch.randn(shape, device=device)
+        x = torch.randn(x_shape, device=device)
+        pos = torch.randn(pos_shape, device=device)
+
         edge_index = torch.stack(torch.meshgrid(
             torch.arange(num_nodes, device=device),
             torch.arange(num_nodes, device=device),
@@ -203,25 +269,44 @@ class Model(nn.Module):
 
         for i in reversed(range(0, self.num_timesteps)):
             timestep = torch.full((1,), i, device=device, dtype=torch.long)
-            predicted_node_noise, _ = self.denoising_model(
-                x=nodes_and_pos, edge_index=edge_index, timestep=timestep, batch_map=sample_batch_map, batch_obj=condition_graph
+            # During sampling, we predict all-to-all edges for the generated nodes
+            row, col = torch.triu_indices(num_nodes, num_nodes, 1, device=device)
+            edge_candidates = torch.stack([row, col], dim=0)
+            predicted_noise, _ = self.denoising_model(
+                x=x, pos=pos, edge_index=edge_index, timestep=timestep, batch_map=sample_batch_map, batch_obj=condition_graph,
+                edge_candidates=edge_candidates
             )
-            alpha_t = self.alphas[i].to(device)
-            alpha_cumprod_t = self.alphas_cumprod[i].to(device)
-            model_mean = (1 / torch.sqrt(alpha_t)) * (nodes_and_pos - ((1 - alpha_t) / torch.sqrt(1 - alpha_cumprod_t)) * predicted_node_noise)
+
+            pred_x_noise = predicted_noise[:, :num_atom_types]
+            pred_pos_noise = predicted_noise[:, num_atom_types:]
+
+            # Reverse process for x
+            alpha_t_x = self.alphas[i].to(device)
+            alpha_cumprod_t_x = self.alphas_cumprod[i].to(device)
+            model_mean_x = (1 / torch.sqrt(alpha_t_x)) * (x - ((1 - alpha_t_x) / torch.sqrt(1 - alpha_cumprod_t_x)) * pred_x_noise)
+
+            # Reverse process for pos
+            alpha_t_pos = self.alphas[i].to(device)
+            alpha_cumprod_t_pos = self.alphas_cumprod[i].to(device)
+            model_mean_pos = (1 / torch.sqrt(alpha_t_pos)) * (pos - ((1 - alpha_t_pos) / torch.sqrt(1 - alpha_cumprod_t_pos)) * pred_pos_noise)
+
             if i == 0:
-                nodes_and_pos = model_mean
+                x = model_mean_x
+                pos = model_mean_pos
             else:
                 variance = (1 - self.alphas_cumprod[i-1]) / (1 - self.alphas_cumprod[i]) * self.betas[i]
-                noise = torch.randn_like(nodes_and_pos)
-                nodes_and_pos = model_mean + torch.sqrt(variance) * noise
+                noise_x = torch.randn_like(x)
+                noise_pos = torch.randn_like(pos)
+                x = model_mean_x + torch.sqrt(variance) * noise_x
+                pos = model_mean_pos + torch.sqrt(variance) * noise_pos
 
         final_timestep = torch.full((1,), 0, device=device, dtype=torch.long)
-        _, final_edge_logits = self.denoising_model(nodes_and_pos, edge_index, final_timestep, sample_batch_map, condition_graph)
+        row, col = torch.triu_indices(num_nodes, num_nodes, 1, device=device)
+        edge_candidates = torch.stack([row, col], dim=0)
+        _, final_edge_logits = self.denoising_model(
+            x, pos, edge_index, final_timestep, sample_batch_map, condition_graph,
+            edge_candidates=edge_candidates
+        )
         final_edges = (torch.sigmoid(final_edge_logits) > 0.5).nonzero().t()
 
-        num_features = self.denoising_model.node_emb.in_features - 3
-        final_nodes = nodes_and_pos[:, :num_features]
-        final_pos = nodes_and_pos[:, num_features:]
-
-        return final_nodes, final_pos, final_edges
+        return x, pos, final_edges

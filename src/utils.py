@@ -53,7 +53,7 @@ def get_pdb_ids():
                         'attribute': 'rcsb_entry_info.resolution_combined',
                         'operator': 'less_or_equal',
                         'negation': False,
-                        'value': 2
+                        'value': 2.5
                     }
                 },
                 {
@@ -98,7 +98,7 @@ def get_pdb_ids():
 
     pdb_ids = [item['identifier'] for item in data.get('result_set', [])]
 
-    return pdb_ids[:]
+    return pdb_ids[:1000]
 
 
 def is_dna_chain(raw_path, chain_id):

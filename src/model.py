@@ -4,8 +4,6 @@ import torch
 import torch.nn as nn
 from e3nn import o3
 from e3nn.nn import BatchNorm, Gate
-from torch_geometric.nn import global_mean_pool
-from torch_scatter import scatter
 
 
 # Basic sinusoidal timestep embedding
@@ -44,10 +42,10 @@ class DenoisingGNN(nn.Module):
         self.condition_proj = nn.Linear(hidden_dim, hidden_dim)
         self.time_proj = nn.Linear(hidden_dim, hidden_dim)
 
-        self.conv1 = EquivariantConv(self.node_ireps_hidden, self.node_ireps_hidden)
-        self.conv2 = EquivariantConv(self.node_ireps_hidden, self.node_ireps_hidden)
+        self.conv1 = EquivariantConv(self.node_ireps_hidden)
+        self.conv2 = EquivariantConv(self.conv1.irreps_out)
 
-        self.node_out = o3.Linear(self.node_ireps_hidden, self.node_ireps_out)
+        self.node_out = o3.Linear(self.conv2.irreps_out, self.node_ireps_out)
         self.edge_out = nn.Linear(hidden_dim * 2, 1)
 
     def forward(self, x, pos, edge_index, timestep, batch_map, batch_obj, edge_candidates):
@@ -69,19 +67,23 @@ class DenoisingGNN(nn.Module):
         condition_nodes_batch_map = batch_obj.batch[is_condition]
 
         num_graphs = batch_obj.num_graphs if hasattr(batch_obj, 'num_graphs') else 1
+        scalar_dim = sum(mul * ir.dim for mul, ir in self.node_ireps_hidden if ir.l == 0)
 
         if condition_nodes_x_features.size(0) == 0:
-            pooled_condition = torch.zeros(num_graphs, self.node_ireps_hidden.dim, device=x.device)
+            pooled_condition = torch.zeros(num_graphs, scalar_dim, device=x.device)
         else:
             # For conditioning, we only use the scalar features
-            condition_emb = self.node_emb(condition_nodes_x_features)[:, :self.node_ireps_hidden.dim // 5 * 4]
-            pooled_condition = global_mean_pool(condition_emb, condition_nodes_batch_map, size=num_graphs)
+            condition_emb = self.node_emb(condition_nodes_x_features)[:, :scalar_dim]
+            # Manual global_mean_pool
+            pooled_condition = torch.zeros(num_graphs, scalar_dim, device=x.device)
+            pooled_condition.index_add_(0, condition_nodes_batch_map, condition_emb)
+            graph_sizes = torch.bincount(condition_nodes_batch_map, minlength=num_graphs).float().unsqueeze(1).clamp(min=1)
+            pooled_condition = pooled_condition / graph_sizes
 
         time_h = self.time_proj(time_emb)
         condition_h = self.condition_proj(pooled_condition)
 
         # Add time and condition embeddings to the scalar part of node embeddings
-        scalar_dim = self.node_ireps_hidden.count('0e')
         node_h[:, :scalar_dim] = node_h[:, :scalar_dim] + time_h[batch_map] + condition_h[batch_map]
 
         h = self.conv1(node_h, pos, edge_index)
@@ -101,21 +103,42 @@ class DenoisingGNN(nn.Module):
 
 
 class EquivariantConv(nn.Module):
-    def __init__(self, irreps_in, irreps_out):
+    def __init__(self, irreps_in):
         super().__init__()
         self.irreps_in = o3.Irreps(irreps_in)
-        self.irreps_out = o3.Irreps(irreps_out)
+        self.irreps_out = self.irreps_in  # Ensure input and output irreps are the same
         self.irreps_sh = o3.Irreps.spherical_harmonics(lmax=1)
 
         self.tensor_prod = o3.FullyConnectedTensorProduct(
             self.irreps_in, self.irreps_sh, self.irreps_in, shared_weights=False
         )
-        self.fc = o3.FullyConnectedLinear(self.irreps_in, self.irreps_out, force_irreps_out=True)
-        self.gate = Gate(
-            self.irreps_out.slice_by_mul[0], [torch.relu, torch.sigmoid],
-            self.irreps_out.slice_by_mul[1]
-        )
+        self.tp_weights = nn.Parameter(torch.randn(self.tensor_prod.weight_numel).unsqueeze(0))
+        self.fc = o3.Linear(self.irreps_in, self.irreps_in)  # FC layer now maps irreps_in to irreps_in
+
+        s_mul, v_mul = 0, 0
+        for mul, ir in self.irreps_out:
+            if ir.l == 0 and ir.p == 1:  # 0e
+                s_mul = mul
+            elif ir.l == 1 and ir.p == -1:  # 1o
+                v_mul = mul
+
+        if v_mul > 0:
+            if s_mul < v_mul:
+                raise ValueError(f"Not enough scalars ({s_mul}) to gate vectors ({v_mul})")
+
+            s_gated_mul = s_mul - v_mul
+
+            self.gate = Gate(
+                f"{s_gated_mul}x0e" if s_gated_mul > 0 else "",
+                [torch.relu] if s_gated_mul > 0 else [],
+                f"{v_mul}x0e", [torch.sigmoid],
+                f"{v_mul}x1o"
+            )
+        else:
+            self.gate = Gate(f"{s_mul}x0e", [torch.relu])  # Gate with only scalars
+
         self.bn = BatchNorm(self.irreps_out)
+        self.irreps_out = self.gate.irreps_out
 
     def forward(self, node_h, pos, edge_index):
         row, col = edge_index
@@ -123,15 +146,19 @@ class EquivariantConv(nn.Module):
         edge_sh = o3.spherical_harmonics(self.irreps_sh, edge_vec, normalize=True, normalization='component')
 
         # Message
-        msg = self.tensor_prod(node_h[col], edge_sh)
+        msg = self.tensor_prod(node_h[col], edge_sh, self.tp_weights)
 
-        # Aggregate
-        node_h_agg = scatter(msg, row, dim=0, reduce='mean', dim_size=node_h.shape[0])
+        # Aggregate (manual scatter mean)
+        node_h_agg = torch.zeros_like(node_h)
+        node_h_agg.index_add_(0, row, msg)
+        counts = torch.zeros(node_h.shape[0], 1, device=node_h.device)
+        counts.index_add_(0, row, torch.ones(msg.shape[0], 1, device=node_h.device))
+        node_h_agg = node_h_agg / counts.clamp(min=1)
 
         # Update
         node_h_new = self.fc(node_h_agg) + node_h
-        node_h_new = self.gate(node_h_new)
         node_h_new = self.bn(node_h_new)
+        node_h_new = self.gate(node_h_new)
 
         return node_h_new
 
@@ -141,9 +168,9 @@ class Model(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
 
-        self.num_timesteps = self.hparams.num_timesteps  # type: ignore
+        self.num_timesteps = self.hparams['num_timesteps']
         self.denoising_model = DenoisingGNN(
-            self.hparams.hidden_dim, num_atom_types=4  # Assuming 4 atom types from one-hot encoding
+            self.hparams['hidden_dim'], num_atom_types=4
         )
 
         betas = self.cosine_schedule(self.num_timesteps)
@@ -232,19 +259,22 @@ class Model(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         loss = self._common_step(batch)
-        self.log('Training Loss', loss, on_step=False, on_epoch=True, logger=True, batch_size=self.hparams.batch_size, sync_dist=True)  # type: ignore
+        if loss is not None:
+            self.log('train_loss', loss, on_step=False, on_epoch=True, logger=True, batch_size=self.hparams['batch_size'], sync_dist=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         loss = self._common_step(batch)
-        self.log('Validation Loss', loss, on_step=False, on_epoch=True, logger=True, batch_size=self.hparams.batch_size, sync_dist=True)  # type: ignore
+        if loss is not None:
+            self.log('val_loss', loss, on_step=False, on_epoch=True, logger=True, batch_size=self.hparams['batch_size'], sync_dist=True)
 
     def test_step(self, batch, batch_idx):
         loss = self._common_step(batch)
-        self.log('Test Loss', loss, batch_size=self.hparams.batch_size, sync_dist=True)  # type: ignore
+        if loss is not None:
+            self.log('test_loss', loss, batch_size=self.hparams['batch_size'], sync_dist=True)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams.lr)  # type: ignore
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.hparams['lr'])
         return optimizer
 
     @torch.no_grad()

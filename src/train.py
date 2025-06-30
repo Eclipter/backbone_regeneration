@@ -43,8 +43,8 @@ def main():
     checkpoint_callback = ModelCheckpoint(
         monitor='val_loss',
         mode='min',
-        save_top_k=10,
-        save_last=True
+        save_top_k=1,
+        save_last=False
     )
     early_stopping_callback = EarlyStopping(
         monitor='val_loss',
@@ -52,14 +52,10 @@ def main():
         mode='min'
     )
 
-    if torch.cuda.device_count() > 1:
-        strategy = DDPStrategy()
-    else:
-        strategy = 'auto'
     trainer = pl.Trainer(
-        strategy=strategy,
+        strategy='auto',
         log_every_n_steps=1,  # To disable warning
-        # precision='16-mixed',
+        precision='16-mixed',
         max_epochs=-1,
         logger=logger,
         callbacks=[
@@ -72,20 +68,7 @@ def main():
     )
 
     trainer.fit(pl_module, datamodule=data_module)
-
-    # Test on a single GPU for accurate metrics
-    if trainer.global_rank == 0:
-        test_trainer = pl.Trainer(
-            devices=1,
-            logger=logger,
-            enable_progress_bar=False,
-            enable_model_summary=False
-        )
-        test_trainer.test(
-            pl_module,
-            datamodule=data_module,
-            ckpt_path=checkpoint_callback.best_model_path
-        )
+    trainer.test(datamodule=data_module, ckpt_path='best')
 
 
 if __name__ == '__main__':

@@ -168,6 +168,7 @@ class DNADataModule(pl.LightningDataModule):
         self.train_dataset = None
         self.val_dataset = None
         self.test_dataset = None
+        self.num_workers = 4
 
     def prepare_data(self):
         PyGDataset(self.bond_threshold)
@@ -187,13 +188,13 @@ class DNADataModule(pl.LightningDataModule):
         self.test_dataset = Subset(self.dataset, test_indices)
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)  # type: ignore
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)  # type: ignore
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False)  # type: ignore
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)  # type: ignore
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False)  # type: ignore
+        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)  # type: ignore
 
 
 if __name__ == '__main__':

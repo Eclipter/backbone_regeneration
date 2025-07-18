@@ -7,7 +7,6 @@ import pytorch_lightning as pl
 import torch
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
 from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.strategies import DDPStrategy
 
 import config
 from dataset import DNADataModule
@@ -25,7 +24,6 @@ def main():
     warnings.filterwarnings('ignore', 'The `srun` command is available on your.*')
 
     data_module = DNADataModule(
-        bond_threshold=config.BOND_THRESHOLD,
         batch_size=config.BATCH_SIZE
     )
 

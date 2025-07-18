@@ -249,6 +249,7 @@ dependencies:
       - e3nn==0.5.6
       - fastjsonschema==2.21.1
       - fqdn==1.5.1
+      - gemmi==0.7.3
       - griddataformats==1.0.2
       - isoduration==20.11.0
       - joblib==1.5.1

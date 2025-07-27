@@ -15,22 +15,15 @@ from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
+import utils
 from pynamod import CG_Structure
-from pynamod.atomic_analysis.nucleotides_parser import check_if_nucleotide
-from utils import atom_to_idx, backbone_atoms, base_to_idx, get_pdb_ids
 
 
 class PyGDataset(Dataset):
-    """
-    Датасет для создания графов ДНК из PDB файлов.
-    Использует скользящее окно из 3 нуклеотидов для генерации
-    структуры сахарофосфатного остова центрального нуклеотида.
-    """
-
     def __init__(self):
         self.window_size = 3
 
-        self.pdb_ids = get_pdb_ids()
+        self.pdb_ids = utils.get_pdb_ids()
 
         root_path = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'data')
         super().__init__(root_path)
@@ -53,7 +46,6 @@ class PyGDataset(Dataset):
         return 'processing_completion_tag.txt'
 
     def load_processed_paths(self):
-        """Сканирует папку с обработанными данными и заполняет список путей."""
         paths = []
         for root, _, filenames in os.walk(self.processed_dir):
             for filename in filenames:
@@ -79,7 +71,6 @@ class PyGDataset(Dataset):
             ))
 
     def download_file(self, pdb_id):
-        """Скачивает один PDB файл по PDB ID с помощью Biopython."""
         url = f'https://files.rcsb.org/download/{pdb_id}.pdb'
         response = requests.get(url)
 
@@ -90,13 +81,16 @@ class PyGDataset(Dataset):
     def process(self):
         shutil.rmtree(self.processed_dir)
         os.makedirs(self.processed_dir)
-        with ProcessPoolExecutor(max_workers=os.cpu_count()//2) as executor:  # type: ignore
-            list(tqdm(
-                executor.map(self.process_file, self.pdb_ids),
-                total=len(self.pdb_ids),
-                colour='#b366ff'
-            ))
-        # list(tqdm(map(self.process_file, self.pdb_ids), total=len(self.pdb_ids), colour='#b366ff'))
+
+        # with ProcessPoolExecutor(max_workers=os.cpu_count()//2) as executor:  # type: ignore
+        #     list(tqdm(
+        #         executor.map(self.process_file, self.pdb_ids),
+        #         total=len(self.pdb_ids),
+        #         colour='#b366ff'
+        #     ))
+
+        # Single-threaded processing for debugging
+        list(tqdm(map(self.process_file, self.pdb_ids), total=len(self.pdb_ids), colour='#b366ff'))
 
         # Create a completion tag file
         open(osp.join(self.processed_dir, self.processed_file_names), 'w').close()
@@ -134,7 +128,6 @@ class PyGDataset(Dataset):
             structure.dna.nucleotides.segids,  # type: ignore
             structure.dna.nucleotides
         ):
-            # nucleotide
             nucleotides_by_chain[segid].append(nucleotide)
 
         # Iterate over chains
@@ -147,8 +140,11 @@ class PyGDataset(Dataset):
             for window_idx in range(len(chain) - self.window_size + 1):
                 window = chain[window_idx: window_idx+self.window_size]
 
+                # Collect window features
+                edge_idx = utils.get_edge_idx(structure, window)
+
                 # Iterate over nucleotides in a window
-                base_names = []
+                base_types = []
                 central_mask = []
                 atom_names = []
                 atom_positions = []
@@ -156,46 +152,42 @@ class PyGDataset(Dataset):
                 has_pair_list = []
                 for nucleotide_idx, nucleotide in enumerate(window):
                     # Collect nucleotide features
-
-                    sel = structure.u.select_atoms(f'resid {nucleotide.resid} and segid {nucleotide.segid}')  # type: ignore
-                    _, ref_nucleotide, base_name = check_if_nucleotide(sel)
-                    base_names.append(base_to_idx[base_name])
+                    reference_nucleotide, base_type = utils.get_ref_nucleotide(structure, nucleotide)
+                    base_types.append(base_type)
 
                     central_mask.append(nucleotide_idx == self.window_size // 2)
 
-                    lead_idxs = structure.dna.pairs_list.lead_nucl_inds  # type: ignore
-                    lag_idxs = structure.dna.pairs_list.lag_nucl_inds  # type: ignore
-                    has_pair = nucleotide.ind in lead_idxs+lag_idxs
-                    has_pair_list.append(has_pair)
+                    has_pair_list.append(utils.has_pair(structure, nucleotide))
 
                     # Iterate over atoms in a nucleotide
-                    for atom in ref_nucleotide:
-                        atom_names.append(atom_to_idx[atom.name])
-                        backbone_mask.append(1 if atom.name in backbone_atoms else 0)
+                    for atom in reference_nucleotide:
+                        atom_names.append(utils.atom_to_idx[atom.name])
+                        backbone_mask.append(1 if atom.name in utils.backbone_atoms else 0)
                         atom_positions.append(atom.position)
 
-                # # Convert features to tensors
+                # Convert features to tensors
                 ohe_atom_names = F.one_hot(
                     torch.tensor(atom_names, dtype=torch.long),
-                    num_classes=len(atom_to_idx)
+                    num_classes=len(utils.atom_to_idx)
                 ).float()
                 pos_tensor = torch.tensor(atom_positions, dtype=torch.float)
                 central_mask_tensor = torch.tensor(central_mask, dtype=torch.bool)
                 backbone_mask_tensor = torch.tensor(backbone_mask, dtype=torch.bool)
                 has_pair_tensor = torch.tensor(has_pair_list, dtype=torch.bool)
-                base_names_tensor = F.one_hot(
-                    torch.tensor(base_names, dtype=torch.long),
-                    num_classes=len(base_to_idx)
+                base_types_tensor = F.one_hot(
+                    torch.tensor(base_types, dtype=torch.long),
+                    num_classes=len(utils.base_to_idx)
                 ).float()
 
                 # Create a data object
                 data = Data(
                     x=ohe_atom_names,
+                    edge_index=edge_idx,
                     pos=pos_tensor,
                     central_mask=central_mask_tensor,
                     backbone_mask=backbone_mask_tensor,
                     has_pair=has_pair_tensor,
-                    base_names=base_names_tensor
+                    base_types=base_types_tensor
                 )
 
                 # Save the data object

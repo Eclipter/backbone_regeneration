@@ -34,6 +34,10 @@ class PyGDataset(Dataset):
     def __len__(self):
         return len(self.data_list)
 
+    # Required by torch_geometric.data.Dataset for internal length access
+    def len(self):
+        return len(self.data_list)
+
     def get(self, idx):
         return torch.load(self.data_list[idx], weights_only=False)
 
@@ -82,15 +86,15 @@ class PyGDataset(Dataset):
         shutil.rmtree(self.processed_dir)
         os.makedirs(self.processed_dir)
 
-        # with ProcessPoolExecutor(max_workers=os.cpu_count()//2) as executor:  # type: ignore
-        #     list(tqdm(
-        #         executor.map(self.process_file, self.pdb_ids),
-        #         total=len(self.pdb_ids),
-        #         colour='#b366ff'
-        #     ))
+        with ProcessPoolExecutor(max_workers=os.cpu_count()//2) as executor:  # type: ignore
+            list(tqdm(
+                executor.map(self.process_file, self.pdb_ids),
+                total=len(self.pdb_ids),
+                colour='#b366ff'
+            ))
 
         # Single-threaded processing for debugging
-        list(tqdm(map(self.process_file, self.pdb_ids), total=len(self.pdb_ids), colour='#b366ff'))
+        # list(tqdm(map(self.process_file, self.pdb_ids), total=len(self.pdb_ids), colour='#b366ff'))
 
         # Create a completion tag file
         open(osp.join(self.processed_dir, self.processed_file_names), 'w').close()
@@ -133,66 +137,81 @@ class PyGDataset(Dataset):
         # Iterate over chains
         data_idx = 0
         for chain in nucleotides_by_chain.values():
-            if len(chain) < self.window_size:
+            try:
+                if len(chain) < self.window_size:
+                    continue
+
+                # Slide over a chain with a window
+                for window_idx in range(len(chain) - self.window_size + 1):
+                    window = chain[window_idx: window_idx+self.window_size]
+
+                    # Collect window features
+                    edge_idx = utils.get_edge_idx(structure, window)
+
+                    # Iterate over nucleotides in a window
+                    base_types = []
+                    central_mask = []
+                    atom_names = []
+                    atom_positions = []
+                    backbone_mask = []
+                    has_pair_list = []
+                    for nucleotide_idx, nucleotide in enumerate(window):
+                        # Get nucleotide features
+                        base_type = utils.base_to_idx[nucleotide.restype]
+                        is_central = nucleotide_idx == self.window_size // 2
+                        has_pair = utils.has_pair(structure, nucleotide)
+
+                        # Iterate over atoms in a nucleotide
+                        nucleotide_universe = structure.u.select_atoms(f'resid {nucleotide.resid} and segid {nucleotide.segid}')
+                        for atom in nucleotide_universe:
+                            # Rename some atoms to avoid key errors and skip hydrogens
+                            if atom.name == 'OP1':
+                                atom_name = 'O1P'
+                            elif atom.name == 'OP2':
+                                atom_name = 'O2P'
+                            elif 'H' in atom.name:
+                                continue
+                            else:
+                                atom_name = atom.name
+
+                            # Collect all features atom-wisely
+                            atom_names.append(utils.atom_to_idx[atom_name])
+                            backbone_mask.append(1 if atom_name in utils.backbone_atoms else 0)
+                            atom_positions.append(atom.position)
+                            base_types.append(base_type)
+                            central_mask.append(is_central)
+                            has_pair_list.append(has_pair)
+
+                    # Convert features to tensors
+                    ohe_atom_names = F.one_hot(
+                        torch.tensor(atom_names, dtype=torch.long),
+                        num_classes=len(utils.atom_to_idx)
+                    ).float()
+                    pos_tensor = torch.tensor(atom_positions, dtype=torch.float)
+                    central_mask_tensor = torch.tensor(central_mask, dtype=torch.bool)
+                    backbone_mask_tensor = torch.tensor(backbone_mask, dtype=torch.bool)
+                    has_pair_tensor = torch.tensor(has_pair_list, dtype=torch.bool)
+                    base_types_tensor = F.one_hot(
+                        torch.tensor(base_types, dtype=torch.long),
+                        num_classes=len(utils.base_to_idx)
+                    ).float()
+
+                    # Create a data object
+                    data = Data(
+                        x=ohe_atom_names,
+                        edge_index=edge_idx,
+                        pos=pos_tensor,
+                        central_mask=central_mask_tensor,
+                        backbone_mask=backbone_mask_tensor,
+                        has_pair=has_pair_tensor,
+                        base_types=base_types_tensor
+                    )
+
+                    # Save the data object
+                    torch.save(data, osp.join(pdb_id_processed_dir, f'{data_idx}.pt'))
+                    data_idx += 1
+            except KeyError:
                 continue
-
-            # Slide over a chain with a window
-            for window_idx in range(len(chain) - self.window_size + 1):
-                window = chain[window_idx: window_idx+self.window_size]
-
-                # Collect window features
-                edge_idx = utils.get_edge_idx(structure, window)
-
-                # Iterate over nucleotides in a window
-                base_types = []
-                central_mask = []
-                atom_names = []
-                atom_positions = []
-                backbone_mask = []
-                has_pair_list = []
-                for nucleotide_idx, nucleotide in enumerate(window):
-                    # Collect nucleotide features
-                    reference_nucleotide, base_type = utils.get_ref_nucleotide(structure, nucleotide)
-                    base_types.append(base_type)
-
-                    central_mask.append(nucleotide_idx == self.window_size // 2)
-
-                    has_pair_list.append(utils.has_pair(structure, nucleotide))
-
-                    # Iterate over atoms in a nucleotide
-                    for atom in reference_nucleotide:
-                        atom_names.append(utils.atom_to_idx[atom.name])
-                        backbone_mask.append(1 if atom.name in utils.backbone_atoms else 0)
-                        atom_positions.append(atom.position)
-
-                # Convert features to tensors
-                ohe_atom_names = F.one_hot(
-                    torch.tensor(atom_names, dtype=torch.long),
-                    num_classes=len(utils.atom_to_idx)
-                ).float()
-                pos_tensor = torch.tensor(atom_positions, dtype=torch.float)
-                central_mask_tensor = torch.tensor(central_mask, dtype=torch.bool)
-                backbone_mask_tensor = torch.tensor(backbone_mask, dtype=torch.bool)
-                has_pair_tensor = torch.tensor(has_pair_list, dtype=torch.bool)
-                base_types_tensor = F.one_hot(
-                    torch.tensor(base_types, dtype=torch.long),
-                    num_classes=len(utils.base_to_idx)
-                ).float()
-
-                # Create a data object
-                data = Data(
-                    x=ohe_atom_names,
-                    edge_index=edge_idx,
-                    pos=pos_tensor,
-                    central_mask=central_mask_tensor,
-                    backbone_mask=backbone_mask_tensor,
-                    has_pair=has_pair_tensor,
-                    base_types=base_types_tensor
-                )
-
-                # Save the data object
-                torch.save(data, osp.join(pdb_id_processed_dir, f'{data_idx}.pt'))
-                data_idx += 1
 
 
 class DNADataModule(pl.LightningDataModule):
@@ -202,34 +221,27 @@ class DNADataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
-        self.dataset = None
-        self.train_dataset = None
-        self.val_dataset = None
-        self.test_dataset = None
+
         self.num_workers = 4
 
-        # Индексы для сплитов - вычисляются один раз в prepare_data
-        self.train_indices: Optional[list[int]] = None
-        self.val_indices: Optional[list[int]] = None
-        self.test_indices: Optional[list[int]] = None
-
     def prepare_data(self):
-        # Создаём датасет один раз и вычисляем индексы для сплитов
-        self.dataset = PyGDataset()
+        # Download and process data
+        PyGDataset()
 
-        indices = np.random.permutation(len(self.dataset)).tolist()
+    def setup(self, stage: Optional[str] = None):
+        dataset = PyGDataset()
 
-        train_val_split = int(len(self.dataset) * self.train_ratio)
-        val_test_split = int(len(self.dataset) * (self.train_ratio + self.val_ratio))
+        indices = np.random.permutation(len(dataset)).tolist()
+        train_val_split = int(len(indices) * self.train_ratio)
+        val_test_split = int(len(indices) * (self.train_ratio + self.val_ratio))
 
-        self.train_indices = indices[:train_val_split]
-        self.val_indices = indices[train_val_split:val_test_split]
-        self.test_indices = indices[val_test_split:]
+        train_indices = indices[:train_val_split]
+        val_indices = indices[train_val_split:val_test_split]
+        test_indices = indices[val_test_split:]
 
-    def setup(self):
-        self.train_dataset = Subset(self.dataset, self.train_indices)  # type: ignore
-        self.val_dataset = Subset(self.dataset, self.val_indices)  # type: ignore
-        self.test_dataset = Subset(self.dataset, self.test_indices)  # type: ignore
+        self.train_dataset = Subset(dataset, train_indices)  # type: ignore
+        self.val_dataset = Subset(dataset, val_indices)  # type: ignore
+        self.test_dataset = Subset(dataset, test_indices)  # type: ignore
 
     def train_dataloader(self):
         return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)  # type: ignore

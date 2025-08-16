@@ -1,17 +1,13 @@
-import io
 import logging
 
-import MDAnalysis as mda
-import numpy as np
 import pytorch_lightning as pl
 import requests
 import torch
+from lightning_fabric.utilities.rank_zero import rank_zero_only
 
-from pynamod.atomic_analysis.nucleotides_parser import (build_graph,
-                                                        check_if_nucleotide,
-                                                        get_base_u)
+from pynamod.atomic_analysis.nucleotides_parser import build_graph
 
-backbone_atoms = ["C1'", "C2'", "C3'", "C4'", "C5'", "O1P", "O2P", "O3'", "O4'", "O5'"]
+backbone_atoms = ["C1'", "C2'", "C3'", "C4'", "C5'", "O1P", "O2P", "P", "O3'", "O4'", "O5'"]
 nucleic_acid_atoms = ['N1', 'N2', 'N3', 'N4', 'N6', 'N7', 'N9', 'C2', 'C4', 'C5', 'C6', 'C7', 'C8', 'O2', 'O4', 'O6']
 nucleotide_atoms = nucleic_acid_atoms + backbone_atoms
 atom_to_idx = {atom: i for i, atom in enumerate(nucleotide_atoms)}
@@ -117,6 +113,7 @@ def get_pdb_ids():
 def get_edge_idx(structure, window):
     sel_str = ' or '.join(f'(resid {nucleotide.resid} and segid {nucleotide.segid})' for nucleotide in window)
     sel = structure.u.select_atoms(sel_str)  # type: ignore
+    sel = sel.select_atoms('not name H*')
 
     graph = build_graph(sel)
 
@@ -124,12 +121,6 @@ def get_edge_idx(structure, window):
     edge_index = edges.t().contiguous()
 
     return edge_index
-
-
-def get_ref_nucleotide(structure, nucleotide):
-    sel = structure.u.select_atoms(f'resid {nucleotide.resid} and segid {nucleotide.segid}')  # type: ignore
-    _, ref_nucleotide, base_name = check_if_nucleotide(sel)
-    return ref_nucleotide, base_to_idx[base_name]
 
 
 def has_pair(structure, nucleotide):
@@ -140,26 +131,35 @@ def has_pair(structure, nucleotide):
 
 
 class VisualizationCallback(pl.Callback):
-    def on_test_end(self, trainer, pl_module):
-        # Получаем путь к структуре для визуализации
-        structure_path = None
-        if hasattr(pl_module, 'structure_path'):
-            structure_path = pl_module.structure_path
-        elif hasattr(pl_module, 'test_dataloader'):
-            # Попытаемся получить путь из dataloader
-            try:
-                dataloader = pl_module.test_dataloader()
-                if hasattr(dataloader.dataset, 'structure_path'):
-                    structure_path = dataloader.dataset.structure_path
-            except:
-                pass
+    @rank_zero_only
+    def on_validation_end(self, trainer, pl_module):
+        val_dataloader = trainer.datamodule.val_dataloader()
+        batch = next(iter(val_dataloader))
 
-        if structure_path:
-            print(f"Структура для анализа: {structure_path}")
-            # Здесь можно добавить код для визуализации
-            # например, сохранение графиков или 3D структур
-        else:
-            print("Путь к структуре не найден для визуализации")
+        # Get a single example from the batch for visualization
+        graph = batch.get_example(0)
+        graph = graph.to(pl_module.device)
+
+        target_mask = graph.central_mask & graph.backbone_mask
+        true_pos = graph.pos[target_mask]
+        true_atom_types_idx = torch.argmax(graph.x[target_mask], dim=1)
+
+        pred_x, pred_pos = pl_module.sample(graph)
+        pred_atom_types_idx = torch.argmax(pred_x, dim=1)
+
+        idx_to_atom = {i: atom for atom, i in atom_to_idx.items()}
+        true_atom_types = [f'true_{idx_to_atom[i.item()]}' for i in true_atom_types_idx]
+        pred_atom_types = [f'pred_{idx_to_atom[i.item()]}' for i in pred_atom_types_idx]
+
+        all_pos = torch.cat([true_pos, pred_pos], dim=0)
+        all_labels = true_atom_types + pred_atom_types
+
+        trainer.logger.experiment.add_embedding(
+            all_pos,
+            metadata=all_labels,
+            tag=f'epoch_{trainer.current_epoch}_structure',
+            global_step=trainer.global_step
+        )
 
 
 class NoUnusedParametersWarningFilter(logging.Filter):

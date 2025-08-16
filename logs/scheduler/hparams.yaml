@@ -1,0 +1,4 @@
+batch_size: 128
+hidden_dim: 128
+num_timesteps: 1000
+patience: 200

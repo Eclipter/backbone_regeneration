@@ -1,11 +1,15 @@
 import logging
+import os
+import tempfile
 
+import MDAnalysis as mda
 import pytorch_lightning as pl
 import requests
 import torch
+from Bio.PDB import PDBIO, MMCIFParser
 from lightning_fabric.utilities.rank_zero import rank_zero_only
 
-from pynamod.atomic_analysis.nucleotides_parser import build_graph
+from pynamod.atomic_analysis.nucleotides_parser import build_graph, get_base_u
 
 backbone_atoms = ["C1'", "C2'", "C3'", "C4'", "C5'", "O1P", "O2P", "P", "O3'", "O4'", "O5'"]
 nucleic_acid_atoms = ['N1', 'N2', 'N3', 'N4', 'N6', 'N7', 'N9', 'C2', 'C4', 'C5', 'C6', 'C7', 'C8', 'O2', 'O4', 'O6']
@@ -110,16 +114,76 @@ def get_pdb_ids():
     return pdb_ids
 
 
-def get_edge_idx(structure, window):
-    sel_str = ' or '.join(f'(resid {nucleotide.resid} and segid {nucleotide.segid})' for nucleotide in window)
-    sel = structure.u.select_atoms(sel_str)  # type: ignore
-    sel = sel.select_atoms('not name H*')
+def mmcif_to_mda_universe(path):
+    parser = MMCIFParser(QUIET=True)
+    structure = parser.get_structure('struct', path)
 
-    graph = build_graph(sel)
+    io = PDBIO()
+    io.set_structure(structure)
+    tmp = tempfile.NamedTemporaryFile(suffix='.pdb', delete=False)
+    tmp_pdb = tmp.name
+    tmp.close()
+    io.save(tmp_pdb)
 
-    edges = torch.tensor(list(graph.edges), dtype=torch.long)
-    edge_index = edges.t().contiguous()
+    u = mda.Universe(tmp_pdb)
+    os.unlink(tmp_pdb)
 
+    return u
+
+
+def get_edge_idx(base_types):
+    all_edges = []
+    atom_selections = []
+    atom_offsets = [0]
+    current_offset = 0
+
+    # First, collect atom selections from standard structures and offsets
+    for base_type in base_types:
+        # Use reference nucleotide structures
+        sel = get_base_u(base_type)
+        atom_selections.append(sel)
+        current_offset += len(sel)
+        atom_offsets.append(current_offset)
+
+    # Build graphs for individual nucleotides and add intra-nucleotide edges
+    for i, sel in enumerate(atom_selections):
+        graph = build_graph(sel)
+        edges = torch.tensor(list(graph.edges), dtype=torch.long)
+        all_edges.append(edges + atom_offsets[i])
+
+    # Add inter-nucleotide edges (phosphodiester bonds)
+    for i in range(len(base_types) - 1):
+        sel1 = atom_selections[i]
+        sel2 = atom_selections[i+1]
+
+        # Get atom names using the same renaming scheme as in dataset processing
+        atom_names1 = [rename_atom(a.name) for a in sel1]
+        atom_names2 = [rename_atom(a.name) for a in sel2]
+
+        try:
+            # Find local index of O3' in the first nucleotide
+            o3_idx_local = atom_names1.index("O3'")
+            # Find local index of P in the second nucleotide
+            p_idx_local = atom_names2.index("P")
+
+            # Convert to global indices
+            o3_idx_global = atom_offsets[i] + o3_idx_local
+            p_idx_global = atom_offsets[i+1] + p_idx_local
+
+            # Add edges for the bond (both directions for an undirected graph)
+            bond = torch.tensor([[o3_idx_global, p_idx_global],
+                                 [p_idx_global, o3_idx_global]], dtype=torch.long)
+            all_edges.append(bond)
+        except ValueError:
+            # If O3' or P is not found, we cannot form the bond.
+            # This might happen with modified residues or at the end of a chain, so we can safely skip.
+            pass
+
+    # Concatenate all edges and create the final edge_index tensor
+    if not all_edges:
+        return torch.empty((2, 0), dtype=torch.long)
+
+    edge_index = torch.cat(all_edges).t().contiguous()
     return edge_index
 
 
@@ -128,6 +192,20 @@ def has_pair(structure, nucleotide):
     lag_idxs = structure.dna.pairs_list.lag_nucl_inds  # type: ignore
 
     return nucleotide.ind in lead_idxs+lag_idxs
+
+
+def rename_atom(atom_name):
+    if atom_name == 'OP1':
+        return 'O1P'
+    elif atom_name == 'OP2':
+        return 'O2P'
+    elif atom_name == 'O1A':
+        return 'O1P'
+    elif atom_name == 'O2A':
+        return 'O2P'
+    else:
+        atom_name = atom_name.replace('A', '').replace('B', '')
+        return atom_name
 
 
 class VisualizationCallback(pl.Callback):
@@ -140,24 +218,18 @@ class VisualizationCallback(pl.Callback):
         graph = batch.get_example(0)
         graph = graph.to(pl_module.device)
 
-        target_mask = graph.central_mask & graph.backbone_mask
-        true_pos = graph.pos[target_mask]
-        true_atom_types_idx = torch.argmax(graph.x[target_mask], dim=1)
-
-        pred_x, pred_pos = pl_module.sample(graph)
-        pred_atom_types_idx = torch.argmax(pred_x, dim=1)
+        true_pos, true_atom_names_idx, pred_pos, pred_atom_names_idx = pl_module._get_generations(graph)
 
         idx_to_atom = {i: atom for atom, i in atom_to_idx.items()}
-        true_atom_types = [f'true_{idx_to_atom[i.item()]}' for i in true_atom_types_idx]
-        pred_atom_types = [f'pred_{idx_to_atom[i.item()]}' for i in pred_atom_types_idx]
+        true_atom_names = [f'true_{idx_to_atom[i.item()]}' for i in true_atom_names_idx]
+        pred_atom_names = [f'pred_{idx_to_atom[i.item()]}' for i in pred_atom_names_idx]
 
         all_pos = torch.cat([true_pos, pred_pos], dim=0)
-        all_labels = true_atom_types + pred_atom_types
+        all_labels = true_atom_names + pred_atom_names
 
         trainer.logger.experiment.add_embedding(
             all_pos,
             metadata=all_labels,
-            tag=f'epoch_{trainer.current_epoch}_structure',
             global_step=trainer.global_step
         )
 

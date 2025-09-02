@@ -1,0 +1,85 @@
+embeddings {
+  tensor_name: "epoch_0_structure:00000"
+  metadata_path: "00000/epoch_0_structure/metadata.tsv"
+  tensor_path: "00000/epoch_0_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_0_structure:00065"
+  metadata_path: "00065/epoch_0_structure/metadata.tsv"
+  tensor_path: "00065/epoch_0_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_1_structure:00130"
+  metadata_path: "00130/epoch_1_structure/metadata.tsv"
+  tensor_path: "00130/epoch_1_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_2_structure:00195"
+  metadata_path: "00195/epoch_2_structure/metadata.tsv"
+  tensor_path: "00195/epoch_2_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_3_structure:00260"
+  metadata_path: "00260/epoch_3_structure/metadata.tsv"
+  tensor_path: "00260/epoch_3_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_4_structure:00325"
+  metadata_path: "00325/epoch_4_structure/metadata.tsv"
+  tensor_path: "00325/epoch_4_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_5_structure:00390"
+  metadata_path: "00390/epoch_5_structure/metadata.tsv"
+  tensor_path: "00390/epoch_5_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_6_structure:00455"
+  metadata_path: "00455/epoch_6_structure/metadata.tsv"
+  tensor_path: "00455/epoch_6_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_7_structure:00520"
+  metadata_path: "00520/epoch_7_structure/metadata.tsv"
+  tensor_path: "00520/epoch_7_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_8_structure:00585"
+  metadata_path: "00585/epoch_8_structure/metadata.tsv"
+  tensor_path: "00585/epoch_8_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_9_structure:00650"
+  metadata_path: "00650/epoch_9_structure/metadata.tsv"
+  tensor_path: "00650/epoch_9_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_10_structure:00715"
+  metadata_path: "00715/epoch_10_structure/metadata.tsv"
+  tensor_path: "00715/epoch_10_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_11_structure:00780"
+  metadata_path: "00780/epoch_11_structure/metadata.tsv"
+  tensor_path: "00780/epoch_11_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_12_structure:00845"
+  metadata_path: "00845/epoch_12_structure/metadata.tsv"
+  tensor_path: "00845/epoch_12_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_13_structure:00910"
+  metadata_path: "00910/epoch_13_structure/metadata.tsv"
+  tensor_path: "00910/epoch_13_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_14_structure:00975"
+  metadata_path: "00975/epoch_14_structure/metadata.tsv"
+  tensor_path: "00975/epoch_14_structure/tensors.tsv"
+}
+embeddings {
+  tensor_name: "epoch_15_structure:01040"
+  metadata_path: "01040/epoch_15_structure/metadata.tsv"
+  tensor_path: "01040/epoch_15_structure/tensors.tsv"
+}

@@ -10,6 +10,7 @@ import pytorch_lightning as pl
 import requests
 import torch
 import torch.nn.functional as F
+from MDAnalysis.exceptions import SelectionError
 from torch.utils.data import Subset
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
@@ -43,7 +44,7 @@ class PyGDataset(Dataset):
 
     @property
     def raw_file_names(self):
-        return [f'{pdb_id}.pdb' for pdb_id in self.pdb_ids]
+        return [f'{pdb_id}.cif' for pdb_id in self.pdb_ids]
 
     @property
     def processed_file_names(self):
@@ -63,24 +64,27 @@ class PyGDataset(Dataset):
         pdb_ids_to_download = [
             pdb_id
             for pdb_id in self.pdb_ids
-            if not osp.exists(osp.join(self.raw_dir, f'{pdb_id}.pdb'))
+            if not osp.exists(osp.join(self.raw_dir, f'{pdb_id}.cif'))
         ]
 
         with ThreadPoolExecutor() as executor:
             list(tqdm(
                 executor.map(self.download_file, pdb_ids_to_download),
                 total=len(pdb_ids_to_download),
-                desc='Downloading PDB files',
+                desc='Downloading mmCIF files',
                 colour='#b366ff'
             ))
 
+        tag_path = osp.join(self.processed_dir, self.processed_file_names)
+        if osp.exists(tag_path):
+            os.remove(tag_path)
+
     def download_file(self, pdb_id):
-        url = f'https://files.rcsb.org/download/{pdb_id}.pdb'
+        url = f'https://files.rcsb.org/download/{pdb_id}.cif'
         response = requests.get(url)
 
-        path = osp.join(self.raw_dir, f'{pdb_id}.pdb')
-        with open(path, 'wb') as f:
-            f.write(response.content)
+        path = osp.join(self.raw_dir, f'{pdb_id}.cif')
+        open(path, 'wb').write(response.content)
 
     def process(self):
         shutil.rmtree(self.processed_dir)
@@ -110,9 +114,9 @@ class PyGDataset(Dataset):
         os.makedirs(pdb_id_processed_dir, exist_ok=True)
 
         # Create CG_Structure
-        raw_path = osp.join(self.raw_dir, f'{pdb_id}.pdb')
+        raw_path = osp.join(self.raw_dir, f'{pdb_id}.cif')
         try:
-            structure = CG_Structure(file=raw_path)
+            structure = CG_Structure(mdaUniverse=utils.mmcif_to_mda_universe(raw_path))
         except:
             return
 
@@ -137,16 +141,13 @@ class PyGDataset(Dataset):
         # Iterate over chains
         data_idx = 0
         for chain in nucleotides_by_chain.values():
-            try:
-                if len(chain) < self.window_size:
-                    continue
+            if len(chain) < self.window_size:
+                continue
 
-                # Slide over a chain with a window
+            # Slide over a chain with a window
+            try:
                 for window_idx in range(len(chain) - self.window_size + 1):
                     window = chain[window_idx: window_idx+self.window_size]
-
-                    # Collect window features
-                    edge_idx = utils.get_edge_idx(structure, window)
 
                     # Iterate over nucleotides in a window
                     base_types = []
@@ -163,24 +164,23 @@ class PyGDataset(Dataset):
 
                         # Iterate over atoms in a nucleotide
                         nucleotide_universe = structure.u.select_atoms(f'resid {nucleotide.resid} and segid {nucleotide.segid}')
+                        # TODO: print(nucleotide_universe, nucleotide.e_residue, nucleotide.s_residue, sep='\n\n', end='\n\n\n')
                         for atom in nucleotide_universe:
-                            # Rename some atoms to avoid key errors and skip hydrogens
-                            if atom.name == 'OP1':
-                                atom_name = 'O1P'
-                            elif atom.name == 'OP2':
-                                atom_name = 'O2P'
-                            elif 'H' in atom.name:
+                            # Rename some atoms to avoid some key errors and skip hydrogens
+                            atom_name = utils.rename_atom(atom.name)
+                            if 'H' in atom.name:
                                 continue
-                            else:
-                                atom_name = atom.name
 
                             # Collect all features atom-wisely
                             atom_names.append(utils.atom_to_idx[atom_name])
-                            backbone_mask.append(1 if atom_name in utils.backbone_atoms else 0)
                             atom_positions.append(atom.position)
+                            backbone_mask.append(1 if atom_name in utils.backbone_atoms else 0)
                             base_types.append(base_type)
                             central_mask.append(is_central)
                             has_pair_list.append(has_pair)
+
+                    # Collect window features
+                    edge_idx = utils.get_edge_idx([nucleotide.restype for nucleotide in window])
 
                     # Convert features to tensors
                     ohe_atom_names = F.one_hot(
@@ -210,7 +210,7 @@ class PyGDataset(Dataset):
                     # Save the data object
                     torch.save(data, osp.join(pdb_id_processed_dir, f'{data_idx}.pt'))
                     data_idx += 1
-            except KeyError:
+            except (KeyError, SelectionError):
                 continue
 
 
@@ -244,13 +244,31 @@ class DNADataModule(pl.LightningDataModule):
         self.test_dataset = Subset(dataset, test_indices)  # type: ignore
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)  # type: ignore
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.num_workers,
+            persistent_workers=True
+        )  # type: ignore
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)  # type: ignore
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            persistent_workers=True
+        )  # type: ignore
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)  # type: ignore
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.num_workers,
+            persistent_workers=True
+        )  # type: ignore
 
 
 if __name__ == '__main__':
@@ -267,9 +285,3 @@ if __name__ == '__main__':
     # structure.dna.nucleotides.ref_frames: torch.Tensor — система отсчета для каждого нуклеотида (N, 3, 3)
 
     # structure.dna.nucleotides.leading_strands: list[bool] — булевые значения для каждого нуклеотида, указывающие, является ли он лидирующим
-
-    # structure = CG_Structure(file='data/raw/1A0A.pdb')
-    # dna_segids = np.unique(structure.u.select_atoms('nucleic').segids)  # type: ignore
-    # structure.analyze_dna(leading_strands=['C'])
-
-    # print(len(structure.dna.nucleotides))

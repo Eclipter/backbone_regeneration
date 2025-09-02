@@ -1,7 +1,9 @@
 import logging
+import os
 import os.path as osp
 import shutil
 import subprocess
+import time
 import warnings
 from datetime import datetime
 
@@ -31,44 +33,44 @@ def main():
         hidden_dim=config.HIDDEN_DIM,
         num_timesteps=config.NUM_TIMESTEPS,
         batch_size=config.BATCH_SIZE,
-        patience=config.PATIENCE
+        lr=config.LR
     )
 
     # Initialize logger
     log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'logs')
+    # On rank 0, kill previous tensorboard and remove old logs
+    if os.environ.get('LOCAL_RANK', '0') == '0':
+        subprocess.run('pkill -f tensorboard', shell=True, stdout=subprocess.DEVNULL)
+        time.sleep(1)
     if config.CKPT_PATH:
         config.RUN_NAME = None
     if config.RUN_NAME:
         run_path = osp.join(log_dir, config.RUN_NAME)
         if osp.exists(run_path):
-            try:
-                shutil.rmtree(run_path)
-            except OSError:
-                print('Stop Tensorboard before running the script')
-                exit()
+            shutil.rmtree(run_path)
     if config.CKPT_PATH:
         run_name = config.CKPT_PATH.split('/')[5]
     elif config.RUN_NAME:
         run_name = config.RUN_NAME
     else:
         run_name = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')
-    logger = TensorBoardLogger(log_dir, name='', version=run_name)
+    logger = TensorBoardLogger(log_dir, name='', version=run_name, default_hp_metric='test_combined_score')
 
     # Initialize callbacks
     checkpoint_callback = ModelCheckpoint(
-        monitor='val_loss',
+        monitor='val_combined_score',
         save_last=True
     )
     early_stopping_callback = EarlyStopping(
-        monitor='val_loss',
-        patience=config.PATIENCE,
+        monitor='val_combined_score',
+        patience=700,
     )
 
     # Initialize trainer
     trainer = pl.Trainer(
         strategy='auto',
-        log_every_n_steps=1,  # To disable warning
-        precision='16-mixed',
+        gradient_clip_val=1,
+        # precision='16-mixed',
         max_epochs=-1,
         logger=logger,
         callbacks=[
@@ -83,16 +85,12 @@ def main():
     # Launch TensorBoard on rank 0
     if trainer.is_global_zero:
         subprocess.Popen(
-            [
-                'tensorboard',
-                '--logdir', 'logs',
-                '--host', '127.0.0.1',
-                '--port', 6006,
-            ],
+            'tensorboard --logdir logs',
+            shell=True,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT,
+            stderr=subprocess.STDOUT
         )
-        print(f'TensorBoard is running at http://127.0.0.1:6006', end='\n')
+        print(f'\nTensorBoard is running at http://127.0.0.1:6006\n')
 
     # Train and test
     trainer.fit(pl_module, datamodule=data_module, ckpt_path=config.CKPT_PATH)

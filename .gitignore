@@ -80,3 +80,4 @@ Thumbs.db
 # Log files
 *.log
 logs/
+nohup.out

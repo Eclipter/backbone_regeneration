@@ -1,11 +1,14 @@
+import os.path as osp
+
 import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.utils import degree
 from torchmetrics.classification import CohenKappa
 
-from utils import atom_to_idx
+from utils import atom_to_idx, base_to_idx
 
 
 class EquivariantConv(nn.Module):
@@ -21,13 +24,15 @@ class EquivariantConv(nn.Module):
         self.coord_mlp = nn.Sequential(
             nn.Linear(hidden_nf, hidden_nf),
             act_fn,
-            nn.Linear(hidden_nf, 1, bias=False)
+            nn.Linear(hidden_nf, 1, bias=False),
+            nn.Tanh()
         )
         self.node_update_mlp = nn.Sequential(
             nn.Linear(hidden_nf + hidden_nf, hidden_nf),
             act_fn,
             nn.Linear(hidden_nf, hidden_nf)
         )
+        self.ln = nn.LayerNorm(hidden_nf)
 
     def forward(self, h, x, edge_index, edge_attr=None):
         # h: [N, hidden_nf], x: [N, 3]
@@ -40,16 +45,15 @@ class EquivariantConv(nn.Module):
         messages = self.message_mlp(message_input)
 
         # Aggregate messages
-        agg_messages = torch.zeros_like(h)
+        agg_messages = torch.zeros_like(h, dtype=messages.dtype)
         index = col.unsqueeze(1).expand_as(messages)
         agg_messages.scatter_add_(0, index, messages)
 
-        # Update coordinates
-        # Normalize relative coordinates to unit vectors
+        # Update & normalize coordinates
         rel_dir = rel_coords / (dist + 1e-8)
         coord_mult = self.coord_mlp(messages)
         coord_update_src = coord_mult * rel_dir
-        coord_update = torch.zeros_like(x)
+        coord_update = torch.zeros_like(x, dtype=coord_update_src.dtype)
         index = col.unsqueeze(1).expand_as(coord_update_src)
         coord_update.scatter_add_(0, index, coord_update_src)
 
@@ -61,29 +65,30 @@ class EquivariantConv(nn.Module):
         # Update features
         node_update_input = torch.cat([h, agg_messages], dim=-1)
         h_new = h + self.node_update_mlp(node_update_input)
+        h_new = self.ln(h_new)
 
         return h_new, x_new
 
 
-def get_beta_schedule(beta_schedule, *, beta_start, beta_end, num_diffusion_timesteps):
-    def linear_beta_schedule(timesteps):
-        scale = 1000 / timesteps
+def get_beta_schedule(beta_schedule, num_timesteps):
+    def linear_beta_schedule(num_timesteps):
+        scale = 1000 / num_timesteps
         beta_start = scale * 0.0001
         beta_end = scale * 0.02
-        return torch.linspace(beta_start, beta_end, timesteps, dtype=torch.float32)
+        return torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
 
-    def cosine_beta_schedule(timesteps, s=0.008):
-        steps = timesteps + 1
-        x = torch.linspace(0, timesteps, steps, dtype=torch.float32)
-        alphas_cumprod = torch.cos(((x / timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
+    def cosine_beta_schedule(num_timesteps, s=0.008):
+        steps = num_timesteps + 1
+        x = torch.linspace(0, num_timesteps, steps, dtype=torch.float32)
+        alphas_cumprod = torch.cos(((x / num_timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
         alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
         betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
         return torch.clip(betas, 0, 0.999)
 
     if beta_schedule == 'linear':
-        return linear_beta_schedule(num_diffusion_timesteps)
+        return linear_beta_schedule(num_timesteps)
     elif beta_schedule == 'cosine':
-        return cosine_beta_schedule(num_diffusion_timesteps)
+        return cosine_beta_schedule(num_timesteps)
     else:
         raise NotImplementedError(f'unknown beta schedule: {beta_schedule}')
 
@@ -95,10 +100,10 @@ def extract(a, t, x_shape):
 
 
 class EGNNDiff(nn.Module):
-    def __init__(self, in_node_nf, hidden_nf, out_node_nf, n_layers, in_edge_nf=0, act_fn=nn.SiLU(), normalize=False, attention=False):
+    def __init__(self, in_node_nf, hidden_nf, out_node_nf, num_layers, in_edge_nf=0, act_fn=nn.SiLU()):
         super().__init__()
         self.hidden_nf = hidden_nf
-        self.n_layers = n_layers
+        self.num_layers = num_layers
 
         self.embedding_in = nn.Linear(in_node_nf, self.hidden_nf)
 
@@ -108,36 +113,36 @@ class EGNNDiff(nn.Module):
             nn.Linear(self.hidden_nf, out_node_nf)
         )
 
-        for i in range(0, n_layers):
+        for i in range(0, num_layers):
             self.add_module(f'gcl_{i}', EquivariantConv(self.hidden_nf, act_fn=act_fn))
 
-    def forward(self, h, x, edge_index, edge_attr):
+    def forward(self, h, x, edge_index, edge_attr=None):
         h = self.embedding_in(h)
-        for i in range(0, self.n_layers):
+        for i in range(0, self.num_layers):
             h, x = self._modules[f'gcl_{i}'](h, x, edge_index, edge_attr=edge_attr)
         h = self.embedding_out(h)
         return h, x
 
 
 class PytorchLightningModule(pl.LightningModule):
-    def __init__(self, hidden_dim, num_timesteps, batch_size, lr):
+    def __init__(self, hidden_dim, num_layers, num_timesteps, batch_size, lr, scheduler_patience=30):
         super().__init__()
         self.save_hyperparameters()
 
         self.n_atom_types = len(atom_to_idx)
 
         self.gnn = EGNNDiff(
-            in_node_nf=self.n_atom_types + 1,  # +1 for time embedding
+            in_node_nf=self.n_atom_types + 1 + len(base_to_idx) + 1,  # +1 for time embedding, +5 for base types, +1 for has_pair
             hidden_nf=hidden_dim,
             out_node_nf=self.n_atom_types,  # atom types and positions
-            n_layers=7
+            n_layers=self.num_layers
         )
 
         self.train_kappa = CohenKappa(task='multiclass', num_classes=self.n_atom_types)
         self.val_kappa = CohenKappa(task='multiclass', num_classes=self.n_atom_types)
         self.test_kappa = CohenKappa(task='multiclass', num_classes=self.n_atom_types)
 
-        betas = get_beta_schedule('linear', beta_start=1e-6, beta_end=1e-2, num_diffusion_timesteps=num_timesteps)
+        betas = get_beta_schedule('linear', num_timesteps=num_timesteps)
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, axis=0)
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.)
@@ -156,6 +161,11 @@ class PytorchLightningModule(pl.LightningModule):
         self.register_buffer('posterior_log_variance_clipped', torch.log(self.posterior_variance.clamp(min=1e-20)))
         self.register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         self.register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
+
+    def on_test_start(self):
+        if self.trainer.is_global_zero:
+            test_dataset_path = osp.join(self.trainer.logger.log_dir, 'test_dataset.pt')
+            torch.save(self.trainer.datamodule.test_dataset, test_dataset_path)
 
     def q_sample(self, atom_names_start, pos_start, t, noise_atom_names=None, noise_pos=None):
         if noise_atom_names is None:
@@ -188,38 +198,6 @@ class PytorchLightningModule(pl.LightningModule):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    @torch.no_grad()
-    def p_sample(self, atom_names_t, pos_t, t, batch):
-        target_mask = batch.central_mask & batch.backbone_mask
-
-        # Create complete graph with noisy target
-        h = batch.x.clone()
-        pos = batch.pos.clone()
-        h[target_mask] = atom_names_t
-        pos[target_mask] = pos_t
-
-        # Add time embedding
-        time_emb = t.repeat(h.size(0), 1)
-        h = torch.cat([h, time_emb], dim=1)
-
-        h_out, x_out = self.gnn(h, pos, batch.edge_index, None)
-
-        # Process atom names (model predicts noise)
-        pred_atom_names_noise = h_out[target_mask]
-        model_mean_atom_names, _, _ = self.p_mean_variance(x=atom_names_t, t=t, model_output=pred_atom_names_noise)
-
-        # ODE sampler is deterministic
-        pred_atom_names = model_mean_atom_names
-
-        # Process positions (model predicts x_0)
-        pred_pos_start = x_out[target_mask]
-        model_mean_pos, _, _ = self.q_posterior_mean_variance(x_start=pred_pos_start, x_t=pos_t, t=t)
-
-        # ODE sampler is deterministic
-        pred_pos = model_mean_pos
-
-        return pred_atom_names, pred_pos
-
     def p_losses(self, batch, t):
         target_mask = batch.central_mask & batch.backbone_mask
         atom_names_start = batch.x[target_mask]
@@ -236,11 +214,12 @@ class PytorchLightningModule(pl.LightningModule):
         h[target_mask] = atom_names_noisy
         pos[target_mask] = pos_noisy
 
-        # Add time embedding
+        # Add time embedding, base types, and has_pair information
         time_emb = t.repeat(h.size(0), 1)
-        h = torch.cat([h, time_emb], dim=1)
+        has_pair_expanded = batch.has_pair.float().unsqueeze(1)
+        h = torch.cat([h, time_emb, batch.base_types, has_pair_expanded], dim=1)
 
-        h_out, pos_out = self.gnn(h, pos, batch.edge_index, None)
+        h_out, pos_out = self.gnn(h, pos, batch.edge_index)
 
         # Atom names loss (model predicts noise)
         pred_atom_names_noise = h_out[target_mask]
@@ -266,6 +245,43 @@ class PytorchLightningModule(pl.LightningModule):
 
         return atom_names_loss, pos_loss, pred_atom_names_idx, true_atom_names_idx
 
+    @torch.no_grad()
+    def p_sample(self, atom_names_t, pos_t, t, batch):
+        target_mask = batch.central_mask & batch.backbone_mask
+
+        # Create complete graph with noisy target
+        h = batch.x.clone()
+        pos = batch.pos.clone()
+        h[target_mask] = atom_names_t
+        pos[target_mask] = pos_t
+
+        # Add time embedding, base types, and has_pair information
+        time_emb = t.repeat(h.size(0), 1)
+        has_pair_expanded = batch.has_pair.float().unsqueeze(1)
+        h = torch.cat([h, time_emb, batch.base_types, has_pair_expanded], dim=1)
+
+        h_out, x_out = self.gnn(h, pos, batch.edge_index)
+
+        # Process atom names (model predicts noise)
+        pred_atom_names_noise = h_out[target_mask]
+        model_mean_atom_names, _, model_log_variance_atom_names = self.p_mean_variance(x=atom_names_t, t=t, model_output=pred_atom_names_noise)
+
+        # Process positions (model predicts x_0)
+        pred_pos_start = x_out[target_mask]
+        model_mean_pos, _, model_log_variance_pos = self.q_posterior_mean_variance(x_start=pred_pos_start, x_t=pos_t, t=t)
+
+        if t[0] > 0:
+            noise_atom_names = torch.randn_like(atom_names_t)
+            noise_pos = torch.randn_like(pos_t)
+        else:
+            noise_atom_names = 0.
+            noise_pos = 0.
+
+        pred_atom_names = model_mean_atom_names + (0.5 * model_log_variance_atom_names).exp() * noise_atom_names
+        pred_pos = model_mean_pos + (0.5 * model_log_variance_pos).exp() * noise_pos
+
+        return pred_atom_names, pred_pos
+
     def training_step(self, batch, _):
         t = torch.randint(0, self.hparams.num_timesteps, (1,), device=self.device).long()
         atom_name_loss, pos_loss, pred_atom_names_idx, true_atom_names_idx = self.p_losses(batch, t)
@@ -273,7 +289,7 @@ class PytorchLightningModule(pl.LightningModule):
         self.train_kappa(pred_atom_names_idx, true_atom_names_idx)
 
         self.log_dict({
-            'train_loss': atom_name_loss+pos_loss,
+            'train_loss': atom_name_loss+pos_loss**2,
             'train_rmse': pos_loss,
             'train_kappa': self.train_kappa
         }, on_step=False, on_epoch=True, sync_dist=True)
@@ -294,26 +310,10 @@ class PytorchLightningModule(pl.LightningModule):
 
         rmse = torch.sqrt(F.mse_loss(pred_pos, true_pos))
 
-        # Normalize RMSE by the standard deviation of true positions' norms for better scaling
-        std_dev_true_pos = torch.std(torch.norm(true_pos, dim=1))
-        # Avoid division by zero
-        if std_dev_true_pos > 1e-6:
-            nrmse = rmse / std_dev_true_pos
-        else:
-            nrmse = rmse
-
         self.val_kappa(pred_atom_names_idx, true_atom_names_idx)
 
         # We want to minimize nrmse and maximize kappa. So we minimize (nrmse - kappa).
-        combined_score = nrmse - self.val_kappa.compute()
-
-        # # Debugging prints, only on rank 0
-        # if self.global_rank == 0:
-        #     print(f'--- Validation Step Stats ---')
-        #     print(f'RMSE: {rmse.item():.4f}')
-        #     print(f'Kappa: {self.val_kappa.compute().item():.4f}')
-        #     print(f'Combined Score: {combined_score.item():.4f}')
-        #     print(f'-----------------------------')
+        combined_score = rmse - self.val_kappa.compute()
 
         self.log_dict({
             'val_rmse': rmse,
@@ -326,16 +326,8 @@ class PytorchLightningModule(pl.LightningModule):
 
         rmse = torch.sqrt(F.mse_loss(pred_pos, true_pos))
 
-        # Normalize RMSE by the standard deviation of true positions' norms for better scaling
-        std_dev_true_pos = torch.std(torch.norm(true_pos, dim=1))
-        # Avoid division by zero
-        if std_dev_true_pos > 1e-6:
-            nrmse = rmse / std_dev_true_pos
-        else:
-            nrmse = rmse
-
         self.test_kappa(pred_atom_names_idx, true_atom_names_idx)
-        combined_score = nrmse - self.test_kappa.compute()
+        combined_score = rmse - self.test_kappa.compute()
 
         self.log_dict({
             'test_rmse': rmse,
@@ -344,7 +336,22 @@ class PytorchLightningModule(pl.LightningModule):
         }, on_step=False, on_epoch=True, sync_dist=True)
 
     def configure_optimizers(self):
-        return torch.optim.AdamW(self.parameters(), lr=self.hparams.lr)
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, betas=(0.9, 0.9))
+
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            patience=self.hparams.scheduler_patience,
+            cooldown=15,
+            factor=0.5
+        )
+
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'monitor': 'val_combined_score'
+            },
+        }
 
     @torch.no_grad()
     def sample(self, batch):
@@ -360,21 +367,5 @@ class PytorchLightningModule(pl.LightningModule):
         for i in reversed(range(0, self.hparams.num_timesteps)):
             t = torch.full((1,), i, device=device, dtype=torch.long)
             atom_names, pos = self.p_sample(atom_names, pos, t, batch)
-
-        #     # Debugging prints, only on rank 0
-        #     if self.global_rank == 0:
-        #         if torch.isnan(pos).any() or torch.isinf(pos).any():
-        #             print(f'!!! NaN or Inf detected in "pos" at timestep t={i}')
-        #             break
-        #         if i % 100 == 0:
-        #             print(f'Sample step t={i}, pos mean: {pos.mean().item():.4f}, pos std: {pos.std().item():.4f}')
-
-        # if self.global_rank == 0:
-        #     print(f'--- Final sampled pos stats ---')
-        #     print(f'Has NaN: {torch.isnan(pos).any().item()}')
-        #     print(f'Has Inf: {torch.isinf(pos).any().item()}')
-        #     if not (torch.isnan(pos).any() or torch.isinf(pos).any()):
-        #         print(f'pos mean: {pos.mean().item():.4f}, pos std: {pos.std().item():.4f}, pos min: {pos.min().item():.4f}, pos max: {pos.max().item():.4f}')
-        #     print(f'-----------------------------')
 
         return atom_names, pos

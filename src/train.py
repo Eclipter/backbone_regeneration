@@ -9,7 +9,8 @@ from datetime import datetime
 
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint
+from pytorch_lightning.callbacks import (EarlyStopping, ModelCheckpoint,
+                                         StochasticWeightAveraging)
 from pytorch_lightning.loggers import TensorBoardLogger
 
 import config
@@ -31,6 +32,7 @@ def main():
     data_module = DNADataModule(batch_size=config.BATCH_SIZE)
     pl_module = PytorchLightningModule(
         hidden_dim=config.HIDDEN_DIM,
+        num_layers=config.NUM_LAYERS,
         num_timesteps=config.NUM_TIMESTEPS,
         batch_size=config.BATCH_SIZE,
         lr=config.LR
@@ -63,19 +65,23 @@ def main():
     )
     early_stopping_callback = EarlyStopping(
         monitor='val_combined_score',
-        patience=700,
+        patience=50,
+    )
+    swa = StochasticWeightAveraging(
+        swa_lrs=0.1*config.LR,
+        swa_epoch_start=50
     )
 
     # Initialize trainer
     trainer = pl.Trainer(
         strategy='auto',
         gradient_clip_val=1,
-        # precision='16-mixed',
         max_epochs=-1,
         logger=logger,
         callbacks=[
             checkpoint_callback,
             early_stopping_callback,
+            swa,
             VisualizationCallback()
         ],
         enable_progress_bar=False,
@@ -85,8 +91,7 @@ def main():
     # Launch TensorBoard on rank 0
     if trainer.is_global_zero:
         subprocess.Popen(
-            'tensorboard --logdir logs',
-            shell=True,
+            ['tensorboard', '--logdir', 'logs', '--port', '6006'],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT
         )

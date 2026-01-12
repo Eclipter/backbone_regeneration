@@ -90,7 +90,7 @@ class PyGDataset(Dataset):
         shutil.rmtree(self.processed_dir)
         os.makedirs(self.processed_dir)
 
-        with ProcessPoolExecutor(max_workers=os.cpu_count()//2) as executor:  # type: ignore
+        with ProcessPoolExecutor(max_workers=len(os.sched_getaffinity(0))) as executor:  # type: ignore
             list(tqdm(
                 executor.map(self.process_file, self.pdb_ids),
                 total=len(self.pdb_ids),
@@ -188,6 +188,8 @@ class PyGDataset(Dataset):
                         num_classes=len(utils.atom_to_idx)
                     ).float()
                     pos_tensor = torch.tensor(atom_positions, dtype=torch.float)
+                    pos_center = pos_tensor.mean(dim=0, keepdim=True)
+                    pos_tensor -= pos_center
                     central_mask_tensor = torch.tensor(central_mask, dtype=torch.bool)
                     backbone_mask_tensor = torch.tensor(backbone_mask, dtype=torch.bool)
                     has_pair_tensor = torch.tensor(has_pair_list, dtype=torch.bool)
@@ -201,6 +203,7 @@ class PyGDataset(Dataset):
                         x=ohe_atom_names,
                         edge_index=edge_idx,
                         pos=pos_tensor,
+                        pos_center=pos_center,
                         central_mask=central_mask_tensor,
                         backbone_mask=backbone_mask_tensor,
                         has_pair=has_pair_tensor,

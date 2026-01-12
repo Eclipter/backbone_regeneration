@@ -11,7 +11,7 @@ from lightning_fabric.utilities.rank_zero import rank_zero_only
 
 from pynamod.atomic_analysis.nucleotides_parser import build_graph, get_base_u
 
-backbone_atoms = ["C1'", "C2'", "C3'", "C4'", "C5'", "O1P", "O2P", "P", "O3'", "O4'", "O5'"]
+backbone_atoms = ["C1'", "C2'", "C3'", "C4'", "C5'", "OP1", "OP2", "P", "O3'", "O4'", "O5'"]
 nucleic_acid_atoms = ['N1', 'N2', 'N3', 'N4', 'N6', 'N7', 'N9', 'C2', 'C4', 'C5', 'C6', 'C7', 'C8', 'O2', 'O4', 'O6']
 nucleotide_atoms = nucleic_acid_atoms + backbone_atoms
 atom_to_idx = {atom: i for i, atom in enumerate(nucleotide_atoms)}
@@ -195,27 +195,39 @@ def has_pair(structure, nucleotide):
 
 
 def rename_atom(atom_name):
-    if atom_name == 'OP1':
-        return 'O1P'
-    elif atom_name == 'OP2':
-        return 'O2P'
+    if atom_name == 'O1P':
+        return 'OP1'
+    elif atom_name == 'O2P':
+        return 'OP2'
     elif atom_name == 'O1A':
-        return 'O1P'
+        return 'OP1'
     elif atom_name == 'O2A':
-        return 'O2P'
+        return 'OP2'
     else:
         atom_name = atom_name.replace('A', '').replace('B', '')
         return atom_name
+
+
+def repeat_interleave_non_contiguous(repeats, device=None):
+    # Create an array of indices to repeat, e.g., [0, 0, 1, 2, 2, 2] for repeats=[2, 1, 3]
+    indices = torch.cat([torch.full((r,), i, device=device) for i, r in enumerate(repeats)])
+    return indices
 
 
 class VisualizationCallback(pl.Callback):
     @rank_zero_only
     def on_validation_end(self, trainer, pl_module):
         val_dataloader = trainer.datamodule.val_dataloader()
-        batch = next(iter(val_dataloader))
+        batch_or_data = next(iter(val_dataloader))
 
-        # Get a single example from the batch for visualization
-        graph = batch.get_example(0)
+        # Handle both Batch and single Data objects
+        if hasattr(batch_or_data, 'get_example'):
+            # It's a Batch object, get the first graph
+            graph = batch_or_data.get_example(0)
+        else:
+            # It's a single Data object
+            graph = batch_or_data
+
         graph = graph.to(pl_module.device)
 
         true_pos, true_atom_names_idx, pred_pos, pred_atom_names_idx = pl_module._get_generations(graph)

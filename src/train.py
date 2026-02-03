@@ -91,7 +91,7 @@ def main():
     # Launch TensorBoard on rank 0
     if trainer.is_global_zero:
         subprocess.Popen(
-            ['tensorboard', '--logdir', 'logs', '--port', '6006'],
+            ['tensorboard', '--logdir', log_dir, '--port', '6006'],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT
         )

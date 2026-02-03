@@ -15,7 +15,7 @@ backbone_atoms = ["C1'", "C2'", "C3'", "C4'", "C5'", "OP1", "OP2", "P", "O3'", "
 nucleic_acid_atoms = ['N1', 'N2', 'N3', 'N4', 'N6', 'N7', 'N9', 'C2', 'C4', 'C5', 'C6', 'C7', 'C8', 'O2', 'O4', 'O6']
 nucleotide_atoms = nucleic_acid_atoms + backbone_atoms
 atom_to_idx = {atom: i for i, atom in enumerate(nucleotide_atoms)}
-base_to_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3, 'U': 4}
+base_to_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 
 
 def get_pdb_ids():

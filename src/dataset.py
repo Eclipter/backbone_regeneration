@@ -112,7 +112,7 @@ class PyGDataset(Dataset):
         os.makedirs(self.processed_dir)
 
         # Enables single-threaded processing when True
-        debug = True
+        debug = False
         if not debug:
             with ProcessPoolExecutor(max_workers=len(os.sched_getaffinity(0))) as executor:  # type: ignore
                 list(tqdm(
@@ -201,7 +201,7 @@ class PyGDataset(Dataset):
                             has_pair_list.append(has_pair)
 
                     # Collect window features
-                    edge_idx = utils.get_edge_idx([nucleotide.restype for nucleotide in window])
+                    edge_idx = utils.get_edge_idx((nucleotide.restype for nucleotide in window))
 
                     # Convert features to tensors
                     ohe_atom_names = F.one_hot(

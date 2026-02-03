@@ -1,6 +1,7 @@
 import logging
 import os
 import tempfile
+from functools import lru_cache
 
 import MDAnalysis as mda
 import pytorch_lightning as pl
@@ -131,7 +132,9 @@ def mmcif_to_mda_universe(path):
     return u
 
 
-def get_edge_idx(base_types):
+# Cache edge_index per base-type window to avoid rebuilding reference graphs for every window
+@lru_cache(maxsize=4096)
+def get_edge_idx(base_types: tuple):
     all_edges = []
     atom_selections = []
     atom_offsets = [0]

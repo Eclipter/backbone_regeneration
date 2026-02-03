@@ -135,7 +135,7 @@ class PytorchLightningModule(pl.LightningModule):
             in_node_nf=self.n_atom_types + 1 + len(base_to_idx) + 1,  # +1 for time embedding, +5 for base types, +1 for has_pair
             hidden_nf=hidden_dim,
             out_node_nf=self.n_atom_types,  # atom types and positions
-            n_layers=self.num_layers
+            num_layers=num_layers
         )
 
         self.train_kappa = CohenKappa(task='multiclass', num_classes=self.n_atom_types)
@@ -312,7 +312,7 @@ class PytorchLightningModule(pl.LightningModule):
 
         self.val_kappa(pred_atom_names_idx, true_atom_names_idx)
 
-        # We want to minimize nrmse and maximize kappa. So we minimize (nrmse - kappa).
+        # We want to minimize rmse and maximize kappa. So we minimize (rmse - kappa).
         combined_score = rmse - self.val_kappa.compute()
 
         self.log_dict({

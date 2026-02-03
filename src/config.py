@@ -16,4 +16,5 @@ RUN_NAME = 'test'
 # TODO: try L1 loss for training only
 # TODO: align windows by nucleic acids and not by centroids
 # TODO: order graph not to predict atom names
-# TODO: Consider ODE sampler over SDE one
+# TODO: consider ODE sampler over SDE one
+# TODO: consider pairwise distance instead of RMSE

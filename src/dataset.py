@@ -1,3 +1,4 @@
+import gzip
 import os
 import os.path as osp
 import shutil
@@ -18,6 +19,7 @@ from tqdm import tqdm
 
 import utils
 from pynamod import CG_Structure
+from pynamod.atomic_analysis.nucleotides_parser import check_if_nucleotide
 
 
 class PyGDataset(Dataset):
@@ -75,30 +77,51 @@ class PyGDataset(Dataset):
                 colour='#b366ff'
             ))
 
+        # Single-threaded downloading for debugging
+        # list(tqdm(map(self.download_file, pdb_ids_to_download), total=len(pdb_ids_to_download), colour='#b366ff'))
+
         tag_path = osp.join(self.processed_dir, self.processed_file_names)
         if osp.exists(tag_path):
             os.remove(tag_path)
 
     def download_file(self, pdb_id):
-        url = f'https://files.rcsb.org/download/{pdb_id}.cif'
-        response = requests.get(url)
+        use_mirror = False
+        if not use_mirror:
+            url = f'https://files.rcsb.org/download/{pdb_id}.cif'
+            response = requests.get(url)
 
-        path = osp.join(self.raw_dir, f'{pdb_id}.cif')
-        open(path, 'wb').write(response.content)
+            path = osp.join(self.raw_dir, f'{pdb_id}.cif')
+            open(path, 'wb').write(response.content)
+        else:
+            print(f'Downloading {pdb_id} from files.wwpdb.org...')
+            url = f'https://files.wwpdb.org/pub/pdb/data/structures/all/mmCIF/{pdb_id.lower()}.cif.gz'
+            response = requests.get(url, stream=True)
+            response.raise_for_status()
+
+            path = osp.join(self.raw_dir, f'{pdb_id}.cif')
+            if url.endswith('.gz'):
+                response.raw.decode_content = True
+                with gzip.GzipFile(fileobj=response.raw) as gz_stream, open(path, 'wb') as out_file:
+                    shutil.copyfileobj(gz_stream, out_file)
+            else:
+                with open(path, 'wb') as out_file:
+                    out_file.write(response.content)
 
     def process(self):
         shutil.rmtree(self.processed_dir)
         os.makedirs(self.processed_dir)
 
-        with ProcessPoolExecutor(max_workers=len(os.sched_getaffinity(0))) as executor:  # type: ignore
-            list(tqdm(
-                executor.map(self.process_file, self.pdb_ids),
-                total=len(self.pdb_ids),
-                colour='#b366ff'
-            ))
-
-        # Single-threaded processing for debugging
-        # list(tqdm(map(self.process_file, self.pdb_ids), total=len(self.pdb_ids), colour='#b366ff'))
+        # Enables single-threaded processing when True
+        debug = True
+        if not debug:
+            with ProcessPoolExecutor(max_workers=len(os.sched_getaffinity(0))) as executor:  # type: ignore
+                list(tqdm(
+                    executor.map(self.process_file, self.pdb_ids),
+                    total=len(self.pdb_ids),
+                    colour='#b366ff'
+                ))
+        else:
+            list(tqdm(map(self.process_file, self.pdb_ids), total=len(self.pdb_ids), colour='#b366ff'))
 
         # Create a completion tag file
         open(osp.join(self.processed_dir, self.processed_file_names), 'w').close()
@@ -149,7 +172,7 @@ class PyGDataset(Dataset):
                 for window_idx in range(len(chain) - self.window_size + 1):
                     window = chain[window_idx: window_idx+self.window_size]
 
-                    # Iterate over nucleotides in a window
+                    # Iterate over nucleotides (with sorted atoms) in a window
                     base_types = []
                     central_mask = []
                     atom_names = []
@@ -163,9 +186,7 @@ class PyGDataset(Dataset):
                         has_pair = utils.has_pair(structure, nucleotide)
 
                         # Iterate over atoms in a nucleotide
-                        nucleotide_universe = structure.u.select_atoms(f'resid {nucleotide.resid} and segid {nucleotide.segid}')
-                        # TODO: print(nucleotide_universe, nucleotide.e_residue, nucleotide.s_residue, sep='\n\n', end='\n\n\n')
-                        for atom in nucleotide_universe:
+                        for atom in nucleotide.e_residue:
                             # Rename some atoms to avoid some key errors and skip hydrogens
                             atom_name = utils.rename_atom(atom.name)
                             if 'H' in atom.name:
@@ -188,8 +209,17 @@ class PyGDataset(Dataset):
                         num_classes=len(utils.atom_to_idx)
                     ).float()
                     pos_tensor = torch.tensor(atom_positions, dtype=torch.float)
-                    pos_center = pos_tensor.mean(dim=0, keepdim=True)
-                    pos_tensor -= pos_center
+
+                    # Align to the central nucleotide's reference frame
+                    central_idx = window[self.window_size // 2].ind
+                    # Get R and origin from pynamod storage
+                    # R: (3, 3), origin: (3,)
+                    ref_frame = structure.dna.nucleotides.ref_frames[central_idx].float()
+                    origin = structure.dna.nucleotides.origins[central_idx].float()
+
+                    # Transform positions: (pos - origin) @ R
+                    pos_tensor = (pos_tensor - origin) @ ref_frame
+
                     central_mask_tensor = torch.tensor(central_mask, dtype=torch.bool)
                     backbone_mask_tensor = torch.tensor(backbone_mask, dtype=torch.bool)
                     has_pair_tensor = torch.tensor(has_pair_list, dtype=torch.bool)
@@ -203,7 +233,8 @@ class PyGDataset(Dataset):
                         x=ohe_atom_names,
                         edge_index=edge_idx,
                         pos=pos_tensor,
-                        pos_center=pos_center,
+                        origin=origin.unsqueeze(0),
+                        ref_frame=ref_frame.unsqueeze(0),
                         central_mask=central_mask_tensor,
                         backbone_mask=backbone_mask_tensor,
                         has_pair=has_pair_tensor,

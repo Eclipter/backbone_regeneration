@@ -74,7 +74,8 @@ def main():
 
     # Initialize trainer
     trainer = pl.Trainer(
-        strategy='auto',
+        # strategy='auto',
+        accelerator='cpu',
         gradient_clip_val=1,
         max_epochs=-1,
         logger=logger,

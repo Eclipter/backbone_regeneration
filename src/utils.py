@@ -133,7 +133,7 @@ def mmcif_to_mda_universe(path):
 
 
 # Cache edge_index per base-type window to avoid rebuilding reference graphs for every window
-@lru_cache(maxsize=4096)
+@lru_cache()
 def get_edge_idx(base_types: tuple):
     all_edges = []
     atom_selections = []
@@ -233,14 +233,21 @@ class VisualizationCallback(pl.Callback):
 
         graph = graph.to(pl_module.device)
 
-        true_pos, true_atom_names_idx, pred_pos, pred_atom_names_idx = pl_module._get_generations(graph)
+        true_pos, pred_pos = pl_module._get_generations(graph)
 
+        # Reconstruct atom_names_idx
+        target_mask = graph.central_mask & graph.backbone_mask
+        atom_names_idx = torch.argmax(graph.x[target_mask], dim=1)
         idx_to_atom = {i: atom for atom, i in atom_to_idx.items()}
-        true_atom_names = [f'true_{idx_to_atom[i.item()]}' for i in true_atom_names_idx]
-        pred_atom_names = [f'pred_{idx_to_atom[i.item()]}' for i in pred_atom_names_idx]
+
+        # Use the same labels for both true and pred since we don't predict atom types
+        atom_names = [f'{idx_to_atom[i.item()]}' for i in atom_names_idx]
+
+        true_labels = [f'true_{name}' for name in atom_names]
+        pred_labels = [f'pred_{name}' for name in atom_names]
 
         all_pos = torch.cat([true_pos, pred_pos], dim=0)
-        all_labels = true_atom_names + pred_atom_names
+        all_labels = true_labels + pred_labels
 
         trainer.logger.experiment.add_embedding(
             all_pos,

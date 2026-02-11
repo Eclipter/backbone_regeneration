@@ -6,7 +6,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.utils import degree
-from torchmetrics.classification import CohenKappa
 
 from utils import atom_to_idx, base_to_idx
 
@@ -100,18 +99,12 @@ def extract(a, t, x_shape):
 
 
 class EGNNDiff(nn.Module):
-    def __init__(self, in_node_nf, hidden_nf, out_node_nf, num_layers, in_edge_nf=0, act_fn=nn.SiLU()):
+    def __init__(self, in_node_nf, hidden_nf, num_layers, act_fn=nn.SiLU()):
         super().__init__()
         self.hidden_nf = hidden_nf
         self.num_layers = num_layers
 
         self.embedding_in = nn.Linear(in_node_nf, self.hidden_nf)
-
-        self.embedding_out = nn.Sequential(
-            nn.Linear(self.hidden_nf, self.hidden_nf),
-            act_fn,
-            nn.Linear(self.hidden_nf, out_node_nf)
-        )
 
         for i in range(0, num_layers):
             self.add_module(f'gcl_{i}', EquivariantConv(self.hidden_nf, act_fn=act_fn))
@@ -120,7 +113,6 @@ class EGNNDiff(nn.Module):
         h = self.embedding_in(h)
         for i in range(0, self.num_layers):
             h, x = self._modules[f'gcl_{i}'](h, x, edge_index, edge_attr=edge_attr)
-        h = self.embedding_out(h)
         return h, x
 
 
@@ -132,15 +124,10 @@ class PytorchLightningModule(pl.LightningModule):
         self.n_atom_types = len(atom_to_idx)
 
         self.gnn = EGNNDiff(
-            in_node_nf=self.n_atom_types + 1 + len(base_to_idx) + 1,  # +1 for time embedding, +5 for base types, +1 for has_pair
+            in_node_nf=self.n_atom_types + 1 + len(base_to_idx) + 1,  # +1 for time embedding, +4 for base types, +1 for has_pair
             hidden_nf=hidden_dim,
-            out_node_nf=self.n_atom_types,  # atom types and positions
             num_layers=num_layers
         )
-
-        self.train_kappa = CohenKappa(task='multiclass', num_classes=self.n_atom_types)
-        self.val_kappa = CohenKappa(task='multiclass', num_classes=self.n_atom_types)
-        self.test_kappa = CohenKappa(task='multiclass', num_classes=self.n_atom_types)
 
         betas = get_beta_schedule('linear', num_timesteps=num_timesteps)
         alphas = 1. - betas
@@ -167,27 +154,15 @@ class PytorchLightningModule(pl.LightningModule):
             test_dataset_path = osp.join(self.trainer.logger.log_dir, 'test_dataset.pt')
             torch.save(self.trainer.datamodule.test_dataset, test_dataset_path)
 
-    def q_sample(self, atom_names_start, pos_start, t, noise_atom_names=None, noise_pos=None):
-        if noise_atom_names is None:
-            noise_atom_names = torch.randn_like(atom_names_start)
+    def q_sample(self, pos_start, t, noise_pos=None):
         if noise_pos is None:
             noise_pos = torch.randn_like(pos_start)
 
-        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, atom_names_start.shape)
-        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, atom_names_start.shape)
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, pos_start.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, pos_start.shape)
 
-        noisy_atom_names = sqrt_alphas_cumprod_t * atom_names_start + sqrt_one_minus_alphas_cumprod_t * noise_atom_names
         noisy_pos = sqrt_alphas_cumprod_t * pos_start + sqrt_one_minus_alphas_cumprod_t * noise_pos
-        return noisy_atom_names, noisy_pos
-
-    def p_mean_variance(self, x, t, model_output):
-        # The model predicts noise, so we need to compute x_start from it
-        sqrt_recip_alphas_cumprod_t = extract(self.sqrt_recip_alphas_cumprod, t, x.shape)
-        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x.shape)
-        pred_x_start = sqrt_recip_alphas_cumprod_t * (x - sqrt_one_minus_alphas_cumprod_t * model_output)
-
-        model_mean, posterior_variance, posterior_log_variance = self.q_posterior_mean_variance(x_start=pred_x_start, x_t=x, t=t)
-        return model_mean, posterior_variance, posterior_log_variance
+        return noisy_pos
 
     def q_posterior_mean_variance(self, x_start, x_t, t):
         posterior_mean = (
@@ -200,18 +175,15 @@ class PytorchLightningModule(pl.LightningModule):
 
     def p_losses(self, batch, t):
         target_mask = batch.central_mask & batch.backbone_mask
-        atom_names_start = batch.x[target_mask]
         pos_start = batch.pos[target_mask]
 
-        noise_atom_names = torch.randn_like(atom_names_start)
         noise_pos = torch.randn_like(pos_start)
-
-        atom_names_noisy, pos_noisy = self.q_sample(atom_names_start, pos_start, t, noise_atom_names=noise_atom_names, noise_pos=noise_pos)
+        pos_noisy = self.q_sample(pos_start, t, noise_pos=noise_pos)
 
         # Create complete graph with noisy target
         h = batch.x.clone()
         pos = batch.pos.clone()
-        h[target_mask] = atom_names_noisy
+        # Use ground truth atom names (conditioning)
         pos[target_mask] = pos_noisy
 
         # Add time embedding, base types, and has_pair information
@@ -219,40 +191,27 @@ class PytorchLightningModule(pl.LightningModule):
         has_pair_expanded = batch.has_pair.float().unsqueeze(1)
         h = torch.cat([h, time_emb, batch.base_types, has_pair_expanded], dim=1)
 
-        h_out, pos_out = self.gnn(h, pos, batch.edge_index)
-
-        # Atom names loss (model predicts noise)
-        pred_atom_names_noise = h_out[target_mask]
-
-        # Denoise the atom names to calculate the loss
-        sqrt_recip_alphas_cumprod_t = extract(self.sqrt_recip_alphas_cumprod, t, atom_names_noisy.shape)
-        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, atom_names_noisy.shape)
-        pred_atom_names_start = sqrt_recip_alphas_cumprod_t * (atom_names_noisy - sqrt_one_minus_alphas_cumprod_t * pred_atom_names_noise)
-
-        true_atom_names_idx = torch.argmax(atom_names_start, dim=1)
-
-        atom_names_loss = F.cross_entropy(pred_atom_names_start, true_atom_names_idx)
+        _, pos_out = self.gnn(h, pos, batch.edge_index)
 
         # Position loss (model predicts x_0)
         pred_pos_start = pos_out[target_mask]
         sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, pos_noisy.shape)
         sqrt_one_minus_alphas_cumprod_t_pos = extract(self.sqrt_one_minus_alphas_cumprod, t, pos_noisy.shape)
+
+        # We want to match the noise
         implied_noise_pos = (pos_noisy - sqrt_alphas_cumprod_t * pred_pos_start) / sqrt_one_minus_alphas_cumprod_t_pos
         pos_loss = torch.sqrt(F.mse_loss(implied_noise_pos, noise_pos))
 
-        # Calculate accuracy for atom names
-        pred_atom_names_idx = torch.argmax(pred_atom_names_start, dim=1)
-
-        return atom_names_loss, pos_loss, pred_atom_names_idx, true_atom_names_idx
+        return pos_loss
 
     @torch.no_grad()
-    def p_sample(self, atom_names_t, pos_t, t, batch):
+    def p_sample(self, pos_t, t, batch):
         target_mask = batch.central_mask & batch.backbone_mask
 
         # Create complete graph with noisy target
         h = batch.x.clone()
         pos = batch.pos.clone()
-        h[target_mask] = atom_names_t
+        # Use ground truth atom names (conditioning)
         pos[target_mask] = pos_t
 
         # Add time embedding, base types, and has_pair information
@@ -260,96 +219,64 @@ class PytorchLightningModule(pl.LightningModule):
         has_pair_expanded = batch.has_pair.float().unsqueeze(1)
         h = torch.cat([h, time_emb, batch.base_types, has_pair_expanded], dim=1)
 
-        h_out, x_out = self.gnn(h, pos, batch.edge_index)
-
-        # Process atom names (model predicts noise)
-        pred_atom_names_noise = h_out[target_mask]
-        model_mean_atom_names, _, model_log_variance_atom_names = self.p_mean_variance(x=atom_names_t, t=t, model_output=pred_atom_names_noise)
+        _, x_out = self.gnn(h, pos, batch.edge_index)
 
         # Process positions (model predicts x_0)
         pred_pos_start = x_out[target_mask]
         model_mean_pos, _, model_log_variance_pos = self.q_posterior_mean_variance(x_start=pred_pos_start, x_t=pos_t, t=t)
 
         if t[0] > 0:
-            noise_atom_names = torch.randn_like(atom_names_t)
             noise_pos = torch.randn_like(pos_t)
         else:
-            noise_atom_names = 0.
             noise_pos = 0.
 
-        pred_atom_names = model_mean_atom_names + (0.5 * model_log_variance_atom_names).exp() * noise_atom_names
         pred_pos = model_mean_pos + (0.5 * model_log_variance_pos).exp() * noise_pos
 
-        return pred_atom_names, pred_pos
+        return pred_pos
 
     def training_step(self, batch, _):
         t = torch.randint(0, self.hparams.num_timesteps, (1,), device=self.device).long()
-        atom_name_loss, pos_loss, pred_atom_names_idx, true_atom_names_idx = self.p_losses(batch, t)
+        loss = self.p_losses(batch, t)
 
-        self.train_kappa(pred_atom_names_idx, true_atom_names_idx)
+        self.log('train_rmse', loss, on_step=False, on_epoch=True, sync_dist=True)
 
-        self.log_dict({
-            'train_loss': atom_name_loss+pos_loss**2,
-            'train_rmse': pos_loss,
-            'train_kappa': self.train_kappa
-        }, on_step=False, on_epoch=True, sync_dist=True)
-        return atom_name_loss + pos_loss
+        return loss
 
     def _get_generations(self, batch):
         target_mask = batch.central_mask & batch.backbone_mask
         true_pos = batch.pos[target_mask]
-        true_atom_names_idx = torch.argmax(batch.x[target_mask], dim=1)
+        pred_pos = self.sample(batch)
 
-        pred_atom_names, pred_pos = self.sample(batch)
-        pred_atom_names_idx = torch.argmax(pred_atom_names, dim=1)
-
-        return true_pos, true_atom_names_idx, pred_pos, pred_atom_names_idx
+        return true_pos, pred_pos
 
     def validation_step(self, batch, _):
-        true_pos, true_atom_names_idx, pred_pos, pred_atom_names_idx = self._get_generations(batch)
+        true_pos, pred_pos = self._get_generations(batch)
 
         rmse = torch.sqrt(F.mse_loss(pred_pos, true_pos))
-
-        self.val_kappa(pred_atom_names_idx, true_atom_names_idx)
-
-        # We want to minimize rmse and maximize kappa. So we minimize (rmse - kappa).
-        combined_score = rmse - self.val_kappa.compute()
-
-        self.log_dict({
-            'val_rmse': rmse,
-            'val_kappa': self.val_kappa,
-            'val_combined_score': combined_score
-        }, on_step=False, on_epoch=True, sync_dist=True)
+        self.log('val_rmse', rmse, on_step=False, on_epoch=True, sync_dist=True)
 
     def test_step(self, batch, _):
-        true_pos, true_atom_names_idx, pred_pos, pred_atom_names_idx = self._get_generations(batch)
+        true_pos, pred_pos = self._get_generations(batch)
 
         rmse = torch.sqrt(F.mse_loss(pred_pos, true_pos))
-
-        self.test_kappa(pred_atom_names_idx, true_atom_names_idx)
-        combined_score = rmse - self.test_kappa.compute()
-
-        self.log_dict({
-            'test_rmse': rmse,
-            'test_kappa': self.test_kappa,
-            'test_combined_score': combined_score
-        }, on_step=False, on_epoch=True, sync_dist=True)
+        self.log('test_rmse', rmse, on_step=False, on_epoch=True, sync_dist=True)
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, betas=(0.9, 0.9))
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, betas=(0.9, 0.999))
 
         scheduler = ReduceLROnPlateau(
             optimizer,
             patience=self.hparams.scheduler_patience,
             cooldown=15,
-            factor=0.5
+            factor=0.5,
+            mode='min'
         )
 
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
                 'scheduler': scheduler,
-                'monitor': 'val_combined_score'
+                'monitor': 'val_rmse'
             },
         }
 
@@ -357,15 +284,13 @@ class PytorchLightningModule(pl.LightningModule):
     def sample(self, batch):
         target_mask = batch.central_mask & batch.backbone_mask
         n_samples = target_mask.sum().item()
-        shape_atom_names = (n_samples, self.n_atom_types)
         shape_pos = (n_samples, 3)
 
         device = self.betas.device
-        atom_names = torch.randn(shape_atom_names, device=device)
         pos = torch.randn(shape_pos, device=device)
 
         for i in reversed(range(0, self.hparams.num_timesteps)):
             t = torch.full((1,), i, device=device, dtype=torch.long)
-            atom_names, pos = self.p_sample(atom_names, pos, t, batch)
+            pos = self.p_sample(pos, t, batch)
 
-        return atom_names, pos
+        return pos

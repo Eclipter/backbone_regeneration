@@ -203,7 +203,7 @@ class PyGDataset(Dataset):
                     edge_idx = utils.get_edge_idx(tuple([nucleotide.restype for nucleotide in window]))
 
                     # Convert features to tensors
-                    ohe_atom_names = F.one_hot(
+                    atom_names_tensor = F.one_hot(
                         torch.tensor(atom_names, dtype=torch.long),
                         num_classes=len(utils.atom_to_idx)
                     ).float()
@@ -229,7 +229,7 @@ class PyGDataset(Dataset):
 
                     # Create a data object
                     data = Data(
-                        x=ohe_atom_names,
+                        x=atom_names_tensor,
                         edge_index=edge_idx,
                         pos=pos_tensor,
                         origin=origin.unsqueeze(0),

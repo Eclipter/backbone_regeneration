@@ -56,15 +56,15 @@ def main():
         run_name = config.RUN_NAME
     else:
         run_name = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')
-    logger = TensorBoardLogger(log_dir, name='', version=run_name, default_hp_metric='test_combined_score')
+    logger = TensorBoardLogger(log_dir, name='', version=run_name, default_hp_metric='test_rmse')
 
     # Initialize callbacks
     checkpoint_callback = ModelCheckpoint(
-        monitor='val_combined_score',
+        monitor='val_rmse',
         save_last=True
     )
     early_stopping_callback = EarlyStopping(
-        monitor='val_combined_score',
+        monitor='val_rmse',
         patience=50,
     )
     swa = StochasticWeightAveraging(
@@ -74,8 +74,7 @@ def main():
 
     # Initialize trainer
     trainer = pl.Trainer(
-        # strategy='auto',
-        accelerator='cpu',
+        strategy='auto',
         gradient_clip_val=1,
         max_epochs=-1,
         logger=logger,

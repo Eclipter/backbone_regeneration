@@ -1,4 +1,5 @@
 import os.path as osp
+import math
 
 import pytorch_lightning as pl
 import torch
@@ -8,6 +9,21 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.utils import degree
 
 from utils import atom_to_idx, base_to_idx
+
+
+class SinusoidalPositionalEmbeddings(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, time):
+        device = time.device
+        half_dim = self.dim // 2
+        embeddings = math.log(10000) / (half_dim - 1)
+        embeddings = torch.exp(torch.arange(half_dim, device=device) * -embeddings)
+        embeddings = time[:, None] * embeddings[None, :]
+        embeddings = torch.cat((embeddings.sin(), embeddings.cos()), dim=-1)
+        return embeddings
 
 
 class EquivariantConv(nn.Module):
@@ -122,9 +138,11 @@ class PytorchLightningModule(pl.LightningModule):
         self.save_hyperparameters()
 
         self.n_atom_types = len(atom_to_idx)
+        self.time_emb_dim = 32
+        self.time_mlp = SinusoidalPositionalEmbeddings(self.time_emb_dim)
 
         self.gnn = EGNNDiff(
-            in_node_nf=self.n_atom_types + 1 + len(base_to_idx) + 1,  # +1 for time embedding, +4 for base types, +1 for has_pair
+            in_node_nf=self.n_atom_types + self.time_emb_dim + len(base_to_idx) + 1,  # + time_emb_dim for time embedding, +4 for base types, +1 for has_pair
             hidden_nf=hidden_dim,
             num_layers=num_layers
         )
@@ -187,7 +205,8 @@ class PytorchLightningModule(pl.LightningModule):
         pos[target_mask] = pos_noisy
 
         # Add time embedding, base types, and has_pair information
-        time_emb = t.repeat(h.size(0), 1)
+        t_emb = self.time_mlp(t)
+        time_emb = t_emb.repeat(h.size(0), 1)
         has_pair_expanded = batch.has_pair.float().unsqueeze(1)
         h = torch.cat([h, time_emb, batch.base_types, has_pair_expanded], dim=1)
 
@@ -215,7 +234,8 @@ class PytorchLightningModule(pl.LightningModule):
         pos[target_mask] = pos_t
 
         # Add time embedding, base types, and has_pair information
-        time_emb = t.repeat(h.size(0), 1)
+        t_emb = self.time_mlp(t)
+        time_emb = t_emb.repeat(h.size(0), 1)
         has_pair_expanded = batch.has_pair.float().unsqueeze(1)
         h = torch.cat([h, time_emb, batch.base_types, has_pair_expanded], dim=1)
 

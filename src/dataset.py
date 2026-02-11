@@ -19,7 +19,6 @@ from tqdm import tqdm
 
 import utils
 from pynamod import CG_Structure
-from pynamod.atomic_analysis.nucleotides_parser import check_if_nucleotide
 
 
 class PyGDataset(Dataset):
@@ -85,7 +84,7 @@ class PyGDataset(Dataset):
             os.remove(tag_path)
 
     def download_file(self, pdb_id):
-        use_mirror = False
+        use_mirror = True
         if not use_mirror:
             url = f'https://files.rcsb.org/download/{pdb_id}.cif'
             response = requests.get(url)
@@ -93,7 +92,6 @@ class PyGDataset(Dataset):
             path = osp.join(self.raw_dir, f'{pdb_id}.cif')
             open(path, 'wb').write(response.content)
         else:
-            print(f'Downloading {pdb_id} from files.wwpdb.org...')
             url = f'https://files.wwpdb.org/pub/pdb/data/structures/all/mmCIF/{pdb_id.lower()}.cif.gz'
             response = requests.get(url, stream=True)
             response.raise_for_status()
@@ -121,6 +119,7 @@ class PyGDataset(Dataset):
                     colour='#b366ff'
                 ))
         else:
+            print('Using single-threaded processing for debugging purposes...')
             list(tqdm(map(self.process_file, self.pdb_ids), total=len(self.pdb_ids), colour='#b366ff'))
 
         # Create a completion tag file
@@ -149,7 +148,7 @@ class PyGDataset(Dataset):
             return
         dna_segids = list(np.unique(nucleic_atoms.segids))
         try:
-            structure.analyze_dna(leading_strands=dna_segids)
+            structure.analyze_dna(leading_strands=dna_segids, use_full_nucleotide=True)
         except:
             return
 
@@ -170,7 +169,7 @@ class PyGDataset(Dataset):
             # Slide over a chain with a window
             try:
                 for window_idx in range(len(chain) - self.window_size + 1):
-                    window = chain[window_idx: window_idx+self.window_size]
+                    window = chain[window_idx: window_idx + self.window_size]
 
                     # Iterate over nucleotides (with sorted atoms) in a window
                     base_types = []
@@ -201,7 +200,7 @@ class PyGDataset(Dataset):
                             has_pair_list.append(has_pair)
 
                     # Collect window features
-                    edge_idx = utils.get_edge_idx((nucleotide.restype for nucleotide in window))
+                    edge_idx = utils.get_edge_idx(tuple([nucleotide.restype for nucleotide in window]))
 
                     # Convert features to tensors
                     ohe_atom_names = F.one_hot(

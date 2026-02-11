@@ -1,7 +1,7 @@
 HIDDEN_DIM = 256
 NUM_LAYERS = 3
 NUM_TIMESTEPS = 200
-BATCH_SIZE = 2**12
+BATCH_SIZE = 2**11
 LR = 5e-4
 
 # Leave only CKPT_PATH = None if you want to run a new experiment
@@ -13,7 +13,6 @@ RUN_NAME = 'test'
 
 # MAJOR:
 # TODO: diffuse inside latent space instead of the euclidean one
-# TODO: encode time positionally
 # TODO: distillate like in paper: https://openreview.net/forum?id=8NuN5UzXLC
 
 # MINOR:

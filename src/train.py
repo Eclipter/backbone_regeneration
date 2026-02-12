@@ -16,16 +16,12 @@ from pytorch_lightning.loggers import TensorBoardLogger
 import config
 from dataset import DNADataModule
 from model import PytorchLightningModule
-from utils import NoUnusedParametersWarningFilter, VisualizationCallback
+from utils import VisualizationCallback
 
 
 def main():
     torch.set_float32_matmul_precision('high')
 
-    # Suppress warnings
-    logging.getLogger('torch.distributed.ddp_model_wrapper').addFilter(
-        NoUnusedParametersWarningFilter()
-    )
     warnings.filterwarnings('ignore', 'The `srun` command is available on your.*')
 
     # Initialize lightning modules

@@ -171,6 +171,12 @@ class PyGDataset(Dataset):
                 for window_idx in range(len(chain) - self.window_size + 1):
                     window = chain[window_idx: window_idx + self.window_size]
 
+                    # Check for continuity of residues to avoid gaps in the chain
+                    resids = [n.e_residue.resids[0] for n in window]
+                    steps = [resids[i+1] - resids[i] for i in range(len(resids)-1)]
+                    if not (all(s == 1 for s in steps) or all(s == -1 for s in steps)):
+                        continue
+
                     # Iterate over nucleotides (with sorted atoms) in a window
                     base_types = []
                     central_mask = []

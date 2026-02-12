@@ -1,4 +1,3 @@
-import logging
 import os
 import tempfile
 from functools import lru_cache
@@ -248,11 +247,6 @@ class VisualizationCallback(pl.Callback):
             metadata=all_labels,
             global_step=trainer.global_step
         )
-
-
-class NoUnusedParametersWarningFilter(logging.Filter):
-    def filter(self, record):
-        return 'find_unused_parameters=True' not in record.getMessage()
 
 
 if __name__ == '__main__':

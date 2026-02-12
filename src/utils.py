@@ -211,12 +211,6 @@ def rename_atom(atom_name):
         return atom_name
 
 
-def repeat_interleave_non_contiguous(repeats, device=None):
-    # Create an array of indices to repeat, e.g., [0, 0, 1, 2, 2, 2] for repeats=[2, 1, 3]
-    indices = torch.cat([torch.full((r,), i, device=device) for i, r in enumerate(repeats)])
-    return indices
-
-
 class VisualizationCallback(pl.Callback):
     @rank_zero_only
     def on_validation_end(self, trainer, pl_module):

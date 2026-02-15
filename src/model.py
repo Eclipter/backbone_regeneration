@@ -212,14 +212,9 @@ class PytorchLightningModule(pl.LightningModule):
 
         _, pos_out = self.gnn(h, pos, batch.edge_index)
 
-        # Position loss (model predicts x_0)
-        pred_pos_start = pos_out[target_mask]
-        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, pos_noisy.shape)
-        sqrt_one_minus_alphas_cumprod_t_pos = extract(self.sqrt_one_minus_alphas_cumprod, t, pos_noisy.shape)
-
-        # We want to match the noise
-        implied_noise_pos = (pos_noisy - sqrt_alphas_cumprod_t * pred_pos_start) / sqrt_one_minus_alphas_cumprod_t_pos
-        pos_loss = torch.sqrt(F.mse_loss(implied_noise_pos, noise_pos))
+        # Position loss (model predicts epsilon directly)
+        pred_noise_pos = pos_out[target_mask]
+        pos_loss = torch.sqrt(F.mse_loss(pred_noise_pos, noise_pos))
 
         return pos_loss
 
@@ -241,8 +236,11 @@ class PytorchLightningModule(pl.LightningModule):
 
         _, x_out = self.gnn(h, pos, batch.edge_index)
 
-        # Process positions (model predicts x_0)
-        pred_pos_start = x_out[target_mask]
+        # Process positions (model predicts epsilon directly)
+        pred_noise_pos = x_out[target_mask]
+        sqrt_recip_alphas_cumprod_t = extract(self.sqrt_recip_alphas_cumprod, t, pos_t.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, pos_t.shape)
+        pred_pos_start = sqrt_recip_alphas_cumprod_t * (pos_t - sqrt_one_minus_alphas_cumprod_t * pred_noise_pos)
         model_mean_pos, _, model_log_variance_pos = self.q_posterior_mean_variance(x_start=pred_pos_start, x_t=pos_t, t=t)
 
         if t[0] > 0:

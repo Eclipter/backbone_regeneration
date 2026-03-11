@@ -6,7 +6,8 @@ import MDAnalysis as mda
 import pytorch_lightning as pl
 import requests
 import torch
-from Bio.PDB import PDBIO, MMCIFParser
+from Bio.PDB.MMCIFParser import MMCIFParser
+from Bio.PDB.PDBIO import PDBIO
 from lightning_fabric.utilities.rank_zero import rank_zero_only
 
 from pynamod.atomic_analysis.nucleotides_parser import build_graph, get_base_u

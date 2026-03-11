@@ -1,10 +1,8 @@
-import logging
 import os
 import os.path as osp
 import shutil
 import subprocess
 import time
-import warnings
 from datetime import datetime
 
 import pytorch_lightning as pl
@@ -21,8 +19,6 @@ from utils import VisualizationCallback
 
 def main():
     torch.set_float32_matmul_precision('high')
-
-    warnings.filterwarnings('ignore', 'The `srun` command is available on your.*')
 
     # Initialize lightning modules
     data_module = DNADataModule(batch_size=config.BATCH_SIZE)
@@ -61,7 +57,7 @@ def main():
     )
     early_stopping_callback = EarlyStopping(
         monitor='val_rmse',
-        patience=50,
+        patience=100,
     )
     swa = StochasticWeightAveraging(
         swa_lrs=0.1*config.LR,
@@ -73,6 +69,7 @@ def main():
         strategy='auto',
         gradient_clip_val=1,
         max_epochs=-1,
+        overfit_batches=1,
         logger=logger,
         callbacks=[
             checkpoint_callback,

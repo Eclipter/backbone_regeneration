@@ -53,7 +53,7 @@ def main():
     pl_logger = logging.getLogger('pytorch_lightning.utilities.rank_zero')
     pl_logger.addFilter(lambda r: 'litlogger' not in r.getMessage())
 
-    logger = TensorBoardLogger(log_dir, name='', version=run_name, default_hp_metric='test_rmse')
+    logger = TensorBoardLogger(log_dir, name='', version=run_name, default_hp_metric=False)
 
     # Initialize callbacks
     checkpoint_callback = ModelCheckpoint(

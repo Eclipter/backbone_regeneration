@@ -288,7 +288,8 @@ class DNADataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
-            persistent_workers=True
+            persistent_workers=True,
+            multiprocessing_context='spawn'
         )  # type: ignore
 
     def val_dataloader(self):
@@ -297,7 +298,8 @@ class DNADataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            persistent_workers=True
+            persistent_workers=True,
+            multiprocessing_context='spawn'
         )  # type: ignore
 
     def test_dataloader(self):
@@ -306,7 +308,8 @@ class DNADataModule(pl.LightningDataModule):
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
-            persistent_workers=True
+            persistent_workers=True,
+            multiprocessing_context='spawn'
         )  # type: ignore
 
 

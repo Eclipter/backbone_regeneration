@@ -1,3 +1,4 @@
+import logging
 import os
 import os.path as osp
 import shutil
@@ -48,6 +49,10 @@ def main():
         run_name = config.RUN_NAME
     else:
         run_name = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')
+
+    pl_logger = logging.getLogger('pytorch_lightning.utilities.rank_zero')
+    pl_logger.addFilter(lambda r: 'litlogger' not in r.getMessage())
+
     logger = TensorBoardLogger(log_dir, name='', version=run_name, default_hp_metric='test_rmse')
 
     # Initialize callbacks

@@ -247,6 +247,10 @@ class VisualizationCallback(pl.Callback):
             metadata=all_labels,
             global_step=trainer.global_step
         )
+        # Save graph used for embedding so visualization can load matching sample
+        graph_cpu = graph.cpu()
+        save_path = os.path.join(trainer.logger.log_dir, 'embedding_graph.pt')
+        torch.save(graph_cpu, save_path)
 
 
 if __name__ == '__main__':

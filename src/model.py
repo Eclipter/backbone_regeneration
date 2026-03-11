@@ -1,5 +1,5 @@
-import os.path as osp
 import math
+import os.path as osp
 
 import pytorch_lightning as pl
 import torch
@@ -128,8 +128,9 @@ class EGNNDiff(nn.Module):
     def forward(self, h, x, edge_index, edge_attr=None):
         h = self.embedding_in(h)
         for i in range(0, self.num_layers):
-            h, x = self._modules[f'gcl_{i}'](h, x, edge_index, edge_attr=edge_attr)
-        return h, x
+            h, x = getattr(self, f'gcl_{i}')(h, x, edge_index, edge_attr=edge_attr)
+        eps = self.predict_epsilon(h, x, edge_index)
+        return h, x, eps
 
 
 class PytorchLightningModule(pl.LightningModule):
@@ -149,7 +150,7 @@ class PytorchLightningModule(pl.LightningModule):
 
         betas = get_beta_schedule('linear', num_timesteps=num_timesteps)
         alphas = 1. - betas
-        alphas_cumprod = torch.cumprod(alphas, axis=0)
+        alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.)
 
         self.register_buffer('betas', betas)
@@ -163,14 +164,31 @@ class PytorchLightningModule(pl.LightningModule):
 
         # For p_sample
         self.register_buffer('posterior_variance', betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod))
-        self.register_buffer('posterior_log_variance_clipped', torch.log(self.posterior_variance.clamp(min=1e-20)))
+        self.register_buffer('posterior_log_variance_clipped', torch.log(getattr(self, 'posterior_variance').clamp(min=1e-20)))
         self.register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         self.register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
+    def _get_target_graph_index(self, batch, target_mask):
+        if hasattr(batch, 'batch') and batch.batch is not None and batch.batch.numel() == batch.x.size(0):
+            return batch.batch[target_mask].long()
+        return torch.zeros(target_mask.sum(), device=target_mask.device, dtype=torch.long)
+
+    def _center_by_graph(self, pos, graph_idx):
+        if pos.numel() == 0:
+            return pos
+        num_graphs = int(graph_idx.max().item()) + 1
+        graph_sum = torch.zeros(num_graphs, pos.size(-1), device=pos.device, dtype=pos.dtype)
+        graph_sum.index_add_(0, graph_idx, pos)
+        graph_count = torch.zeros(num_graphs, 1, device=pos.device, dtype=pos.dtype)
+        graph_count.index_add_(0, graph_idx, torch.ones(pos.size(0), 1, device=pos.device, dtype=pos.dtype))
+        # Keep coordinates in the zero center-of-gravity subspace to prevent global translation drift.
+        graph_mean = graph_sum / graph_count.clamp(min=1.0)
+        return pos - graph_mean[graph_idx]
+
     def on_test_start(self):
         if self.trainer.is_global_zero:
-            test_dataset_path = osp.join(self.trainer.logger.log_dir, 'test_dataset.pt')
-            torch.save(self.trainer.datamodule.test_dataset, test_dataset_path)
+            test_dataset_path = osp.join(getattr(self.trainer.logger, 'log_dir'), 'test_dataset.pt')
+            torch.save(getattr(self.trainer, 'datamodule').test_dataset, test_dataset_path)
 
     def q_sample(self, pos_start, t, noise_pos=None):
         if noise_pos is None:
@@ -253,7 +271,7 @@ class PytorchLightningModule(pl.LightningModule):
         return pred_pos
 
     def training_step(self, batch, _):
-        t = torch.randint(0, self.hparams.num_timesteps, (1,), device=self.device).long()
+        t = torch.randint(0, getattr(self.hparams, 'num_timesteps'), (1,), device=self.device).long()
         loss = self.p_losses(batch, t)
 
         self.log('train_rmse', loss, on_step=False, on_epoch=True, sync_dist=True)
@@ -279,12 +297,12 @@ class PytorchLightningModule(pl.LightningModule):
         rmse = torch.sqrt(F.mse_loss(pred_pos, true_pos))
         self.log('test_rmse', rmse, on_step=False, on_epoch=True, sync_dist=True)
 
-    def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, betas=(0.9, 0.999))
+    def configure_optimizers(self):  # type: ignore[override]
+        optimizer = torch.optim.AdamW(self.parameters(), lr=getattr(self.hparams, 'lr'), betas=(0.9, 0.999))
 
         scheduler = ReduceLROnPlateau(
             optimizer,
-            patience=self.hparams.scheduler_patience,
+            patience=getattr(self.hparams, 'scheduler_patience'),
             cooldown=15,
             factor=0.5,
             mode='min'
@@ -301,13 +319,13 @@ class PytorchLightningModule(pl.LightningModule):
     @torch.no_grad()
     def sample(self, batch):
         target_mask = batch.central_mask & batch.backbone_mask
-        n_samples = target_mask.sum().item()
-        shape_pos = (n_samples, 3)
+        target_graph_idx = self._get_target_graph_index(batch, target_mask)
+        n_samples = int(target_mask.sum().item())
 
-        device = self.betas.device
-        pos = torch.randn(shape_pos, device=device)
+        device = torch.device(getattr(self.betas, 'device'))
+        pos = torch.randn(n_samples, 3, device=device)
 
-        for i in reversed(range(0, self.hparams.num_timesteps)):
+        for i in reversed(range(0, getattr(self.hparams, 'num_timesteps'))):
             t = torch.full((1,), i, device=device, dtype=torch.long)
             pos = self.p_sample(pos, t, batch)
 

@@ -144,6 +144,8 @@ def get_edge_idx(base_types: tuple):
     for base_type in base_types:
         # Use reference nucleotide structures
         sel = get_base_u(base_type)
+        if sel is None:
+            raise ValueError(f'Unknown base type: {base_type}')
         atom_selections.append(sel)
         current_offset += len(sel)
         atom_offsets.append(current_offset)
@@ -214,7 +216,7 @@ def rename_atom(atom_name):
 class VisualizationCallback(pl.Callback):
     @rank_zero_only
     def on_validation_end(self, trainer, pl_module):
-        val_dataloader = trainer.datamodule.val_dataloader()
+        val_dataloader = getattr(trainer, 'datamodule').val_dataloader()
         batch_or_data = next(iter(val_dataloader))
 
         # Handle both Batch and single Data objects
@@ -227,7 +229,7 @@ class VisualizationCallback(pl.Callback):
 
         graph = graph.to(pl_module.device)
 
-        true_pos, pred_pos = pl_module._get_generations(graph)
+        true_pos, pred_pos = getattr(pl_module, '_get_generations')(graph)
 
         # Reconstruct atom_names_idx
         target_mask = graph.central_mask & graph.backbone_mask
@@ -235,7 +237,7 @@ class VisualizationCallback(pl.Callback):
         idx_to_atom = {i: atom for atom, i in atom_to_idx.items()}
 
         # Use the same labels for both true and pred since we don't predict atom types
-        atom_names = [f'{idx_to_atom[i.item()]}' for i in atom_names_idx]
+        atom_names = [f'{idx_to_atom[int(i.item())]}' for i in atom_names_idx]
 
         true_labels = [f'true_{name}' for name in atom_names]
         pred_labels = [f'pred_{name}' for name in atom_names]
@@ -243,14 +245,14 @@ class VisualizationCallback(pl.Callback):
         all_pos = torch.cat([true_pos, pred_pos], dim=0)
         all_labels = true_labels + pred_labels
 
-        trainer.logger.experiment.add_embedding(
+        getattr(trainer.logger, 'experiment').add_embedding(
             all_pos,
             metadata=all_labels,
             global_step=trainer.global_step
         )
         # Save graph used for embedding so visualization can load matching sample
         graph_cpu = graph.cpu()
-        save_path = os.path.join(trainer.logger.log_dir, 'embedding_graph.pt')
+        save_path = os.path.join(str(getattr(trainer.logger, 'log_dir')), 'embedding_graph.pt')
         torch.save(graph_cpu, save_path)
 
 

@@ -4,7 +4,7 @@ import os.path as osp
 import shutil
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
-from typing import Optional
+from typing import Optional, cast
 
 import numpy as np
 import pytorch_lightning as pl
@@ -219,8 +219,8 @@ class PyGDataset(Dataset):
                     central_idx = window[self.window_size // 2].ind
                     # Get R and origin from pynamod storage
                     # R: (3, 3), origin: (3,)
-                    ref_frame = structure.dna.nucleotides.ref_frames[central_idx].float()
-                    origin = structure.dna.nucleotides.origins[central_idx].float()
+                    ref_frame = getattr(structure.dna.nucleotides, 'ref_frames')[central_idx].float()
+                    origin = getattr(structure.dna.nucleotides, 'origins')[central_idx].float()
 
                     # Transform positions: (pos - origin) @ R
                     pos_tensor = (pos_tensor - origin) @ ref_frame
@@ -278,13 +278,13 @@ class DNADataModule(pl.LightningDataModule):
         val_indices = indices[train_val_split:val_test_split]
         test_indices = indices[val_test_split:]
 
-        self.train_dataset = Subset(dataset, train_indices)  # type: ignore
-        self.val_dataset = Subset(dataset, val_indices)  # type: ignore
-        self.test_dataset = Subset(dataset, test_indices)  # type: ignore
+        self.train_dataset: Subset[Data] = Subset(dataset, train_indices)
+        self.val_dataset: Subset[Data] = Subset(dataset, val_indices)
+        self.test_dataset: Subset[Data] = Subset(dataset, test_indices)
 
     def train_dataloader(self):
         return DataLoader(
-            self.train_dataset,
+            cast(Dataset, self.train_dataset),
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
@@ -294,7 +294,7 @@ class DNADataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(
-            self.val_dataset,
+            cast(Dataset, self.val_dataset),
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
@@ -304,7 +304,7 @@ class DNADataModule(pl.LightningDataModule):
 
     def test_dataloader(self):
         return DataLoader(
-            self.test_dataset,
+            cast(Dataset, self.test_dataset),
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,

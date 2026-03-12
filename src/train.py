@@ -4,6 +4,7 @@ import os.path as osp
 import shutil
 import subprocess
 import time
+import warnings
 from datetime import datetime
 
 import pytorch_lightning as pl
@@ -17,11 +18,16 @@ from dataset import DNADataModule
 from model import PytorchLightningModule
 from utils import VisualizationCallback
 
+# Suppress PyTorch FutureWarning about functools.partial in DDP comm hooks (Python 3.13 compatibility)
+warnings.filterwarnings('ignore', category=FutureWarning, module='torch.distributed.algorithms.ddp_comm_hooks')
+
 
 def main():
     torch.set_float32_matmul_precision('high')
 
-    # Initialize lightning modules
+    # A workaround for mlx4 compatibility issues
+    os.environ.setdefault('NCCL_IB_DISABLE', '1')
+
     data_module = DNADataModule(batch_size=config.BATCH_SIZE)
     pl_module = PytorchLightningModule(
         hidden_dim=config.HIDDEN_DIM,

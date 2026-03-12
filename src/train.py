@@ -37,16 +37,16 @@ def main():
 
     # Initialize logger
     log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'logs')
-    if config.CKPT_PATH:
-        config.RUN_NAME = None
+    ckpt_path = None
     if config.RUN_NAME:
-        run_path = osp.join(log_dir, config.RUN_NAME)
-        if osp.exists(run_path):
-            shutil.rmtree(run_path, ignore_errors=True)
-    if config.CKPT_PATH:
-        run_name = config.CKPT_PATH.split('/')[5]
-    elif config.RUN_NAME:
         run_name = config.RUN_NAME
+        if config.START_FROM_LAST_CKPT:
+            candidate = osp.join(log_dir, run_name, 'checkpoints', 'last.ckpt')
+            ckpt_path = candidate if osp.isfile(candidate) else None
+        else:
+            run_path = osp.join(log_dir, run_name)
+            if osp.exists(run_path):
+                shutil.rmtree(run_path, ignore_errors=True)
     else:
         run_name = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')
     pl_logger = logging.getLogger('pytorch_lightning.utilities.rank_zero')
@@ -85,7 +85,7 @@ def main():
     )
 
     # Train and test
-    trainer.fit(pl_module, datamodule=data_module, ckpt_path=config.CKPT_PATH)
+    trainer.fit(pl_module, datamodule=data_module, ckpt_path=ckpt_path)
     trainer.test(datamodule=data_module, ckpt_path='best')
 
 

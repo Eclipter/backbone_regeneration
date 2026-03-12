@@ -69,7 +69,6 @@ def main():
 
     # Initialize trainer
     trainer = pl.Trainer(
-        strategy='auto',
         gradient_clip_val=1,
         max_epochs=-1,
         overfit_batches=1,
@@ -86,7 +85,7 @@ def main():
 
     # Train and test
     trainer.fit(pl_module, datamodule=data_module, ckpt_path=ckpt_path)
-    trainer.test(datamodule=data_module, ckpt_path='best')
+    trainer.test(datamodule=data_module, ckpt_path='best', weights_only=False)
 
 
 if __name__ == '__main__':

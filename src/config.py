@@ -1,15 +1,16 @@
 HIDDEN_DIM = 256
-NUM_LAYERS = 3
+NUM_LAYERS = 5
 NUM_TIMESTEPS = 200
-BATCH_SIZE = 2**11
-LR = 5e-4
+BATCH_SIZE = 2**4
+LR = 1e-5
 
-# Leave only CKPT_PATH = None if you want to run a new experiment
-CKPT_PATH = None
-# CKPT_PATH = '/home/v_sidorov/backbone_regeneration/logs/overfit_dim512_red_on_plateau/checkpoints/last.ckpt'
-
-# Set RUN_NAME if you want to have a custom name for the run instead of the current time. It will be used only if CKPT_PATH is None
+# Set RUN_NAME if you want to have a custom name for the run instead of the current time
+# To run in a folder, set RUN_NAME to "folder/run_name"
+# RUN_NAME = f'overfit1batch_{HIDDEN_DIM}_{NUM_LAYERS}_{NUM_TIMESTEPS}_{LR}'
 RUN_NAME = 'test'
+
+START_FROM_LAST_CKPT = False
+
 
 # MAJOR:
 # TODO: diffuse inside latent space instead of the euclidean one

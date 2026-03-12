@@ -2,8 +2,6 @@ import logging
 import os
 import os.path as osp
 import shutil
-import subprocess
-import time
 import warnings
 from datetime import datetime
 
@@ -39,26 +37,20 @@ def main():
 
     # Initialize logger
     log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'logs')
-    # On rank 0, kill previous tensorboard and remove old logs
-    if os.environ.get('LOCAL_RANK', '0') == '0':
-        subprocess.run('pkill -f tensorboard', shell=True, stdout=subprocess.DEVNULL)
-        time.sleep(1)
     if config.CKPT_PATH:
         config.RUN_NAME = None
     if config.RUN_NAME:
         run_path = osp.join(log_dir, config.RUN_NAME)
         if osp.exists(run_path):
-            shutil.rmtree(run_path)
+            shutil.rmtree(run_path, ignore_errors=True)
     if config.CKPT_PATH:
         run_name = config.CKPT_PATH.split('/')[5]
     elif config.RUN_NAME:
         run_name = config.RUN_NAME
     else:
         run_name = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')
-
     pl_logger = logging.getLogger('pytorch_lightning.utilities.rank_zero')
-    pl_logger.addFilter(lambda r: 'litlogger' not in r.getMessage())
-
+    pl_logger.addFilter(lambda r: 'litlogger' not in r.getMessage())  # Mute LitLogger tip
     logger = TensorBoardLogger(log_dir, name='', version=run_name, default_hp_metric=False)
 
     # Initialize callbacks
@@ -91,15 +83,6 @@ def main():
         enable_progress_bar=False,
         enable_model_summary=False
     )
-
-    # Launch TensorBoard on rank 0
-    if trainer.is_global_zero:
-        subprocess.Popen(
-            ['tensorboard', '--logdir', log_dir, '--port', '6006'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.STDOUT
-        )
-        print(f'\nTensorBoard is running at http://127.0.0.1:6006\n')
 
     # Train and test
     trainer.fit(pl_module, datamodule=data_module, ckpt_path=config.CKPT_PATH)

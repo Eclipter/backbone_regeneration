@@ -1,39 +1,15 @@
 channels:
-  - defaults
   - conda-forge
-  - bioconda
 
 dependencies:
   - pip
   - lightning
   - tensorboard
-  - biopython
 
-### pynamod environments.yml ###
-#
-# name: pynamod
-#
-# channels:
-#   - defaults
-#   - conda-forge
-#   - pip
-#
-# dependencies:
-#   - python=3.13
-#   - pip
-#   - ipykernel
-#   - mdanalysis
-#   - pypdb
-#   - numba
-#   - nglview=3.1.4
-#   - seaborn
-#   - more-itertools
-#   - pytest
-#   - ipywidgets
-#
-#   - pip:
-#       - --index-url https://download.pytorch.org/whl/cu130
-#       - --extra-index-url https://pypi.org/simple
-#       - torch
-#       - torchvision
-#       - pdb2pqr
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu129
+      - --find-links https://data.pyg.org/whl/torch-2.8.0+cu129.html
+      - torch==2.8.*
+      - torchvision==0.23.*
+      - torch_geometric
+      - -e ./pynamod

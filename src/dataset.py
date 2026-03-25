@@ -1,4 +1,5 @@
 import gzip
+import multiprocessing as mp
 import os
 import os.path as osp
 import shutil
@@ -84,7 +85,7 @@ class PyGDataset(Dataset):
             os.remove(tag_path)
 
     def download_file(self, pdb_id):
-        use_mirror = True
+        use_mirror = False
         if not use_mirror:
             url = f'https://files.rcsb.org/download/{pdb_id}.cif'
             response = requests.get(url)
@@ -112,7 +113,10 @@ class PyGDataset(Dataset):
         # Enables single-threaded processing when True
         debug = False
         if not debug:
-            with ProcessPoolExecutor(max_workers=len(os.sched_getaffinity(0))) as executor:  # type: ignore
+            with ProcessPoolExecutor(
+                max_workers=len(os.sched_getaffinity(0)),  # type: ignore
+                mp_context=mp.get_context('spawn'),
+            ) as executor:
                 list(tqdm(
                     executor.map(self.process_file, self.pdb_ids),
                     total=len(self.pdb_ids),

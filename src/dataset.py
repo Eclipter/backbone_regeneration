@@ -217,7 +217,8 @@ class PyGDataset(Dataset):
                         torch.tensor(atom_names, dtype=torch.long),
                         num_classes=len(utils.atom_to_idx)
                     ).float()
-                    pos_tensor = torch.tensor(atom_positions, dtype=torch.float)
+                    # Convert atom positions to a np array before converting to a tensor
+                    pos_tensor = torch.tensor(np.asarray(atom_positions), dtype=torch.float)
 
                     # Align to the central nucleotide's reference frame
                     central_idx = window[self.window_size // 2].ind

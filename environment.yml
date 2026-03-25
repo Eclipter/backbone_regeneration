@@ -3,13 +3,12 @@ channels:
 
 dependencies:
   - pip
-  - lightning
   - tensorboard
 
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu129
       - --find-links https://data.pyg.org/whl/torch-2.8.0+cu129.html
       - torch==2.8.*
-      - torchvision==0.23.*
+      - lightning
       - torch_geometric
       - -e ./pynamod

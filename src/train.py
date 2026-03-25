@@ -45,8 +45,7 @@ def main():
             ckpt_path = candidate if osp.isfile(candidate) else None
         else:
             run_path = osp.join(log_dir, run_name)
-            if osp.exists(run_path):
-                shutil.rmtree(run_path, ignore_errors=True)
+            shutil.rmtree(run_path, ignore_errors=True)
     else:
         run_name = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')
     pl_logger = logging.getLogger('pytorch_lightning.utilities.rank_zero')
@@ -56,35 +55,38 @@ def main():
     # Initialize callbacks
     checkpoint_callback = ModelCheckpoint(
         monitor='val_rmse',
-        save_last=True
+        save_last=True,
+        enable_version_counter=False
     )
     early_stopping_callback = EarlyStopping(
         monitor='val_rmse',
-        patience=100,
+        patience=200,
     )
     swa = StochasticWeightAveraging(
         swa_lrs=0.1*config.LR,
-        swa_epoch_start=50
+        swa_epoch_start=100
     )
 
     # Initialize trainer
     trainer = pl.Trainer(
         gradient_clip_val=1,
         max_epochs=-1,
+        devices=1,
         overfit_batches=1,
         logger=logger,
         callbacks=[
             checkpoint_callback,
-            early_stopping_callback,
-            swa,
+            # early_stopping_callback,
+            # swa,
             VisualizationCallback()
         ],
+        profiler=config.PROFILER,
         enable_progress_bar=False,
         enable_model_summary=False
     )
 
     # Train and test
-    trainer.fit(pl_module, datamodule=data_module, ckpt_path=ckpt_path)
+    trainer.fit(pl_module, datamodule=data_module, ckpt_path=ckpt_path, weights_only=False)
     trainer.test(datamodule=data_module, ckpt_path='best', weights_only=False)
 
 

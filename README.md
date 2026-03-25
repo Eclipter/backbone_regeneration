@@ -5,7 +5,7 @@
 1. Create a new environment with pynamod dependencies:
 
 ```bash
-conda env create --name backbone_regen --file environment.yml
+conda env create --name backbone_regen --file pynamod/environment.yml
 ```
 
 2. Install the project requirements:

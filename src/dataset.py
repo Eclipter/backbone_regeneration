@@ -198,7 +198,8 @@ class PyGDataset(Dataset):
                         for atom in nucleotide.e_residue:
                             # Rename some atoms to avoid some key errors and skip hydrogens
                             atom_name = utils.rename_atom(atom.name)
-                            if 'H' in atom.name:
+                            atom_element = getattr(atom, 'element', None)
+                            if 'H' in atom.name or atom_element in {'H', 'D'}:
                                 continue
 
                             # Collect all features atom-wisely
@@ -223,7 +224,7 @@ class PyGDataset(Dataset):
                     # Align to the central nucleotide's reference frame
                     central_idx = window[self.window_size // 2].ind
                     # Get R and origin from pynamod storage
-                    # R: (3, 3), origin: (3,)
+                    # R: (3, 3), origin: (1, 3)
                     ref_frame = getattr(structure.dna.nucleotides, 'ref_frames')[central_idx].float()
                     origin = getattr(structure.dna.nucleotides, 'origins')[central_idx].float()
 

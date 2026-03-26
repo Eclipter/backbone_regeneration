@@ -7,7 +7,7 @@ import pytorch_lightning as pl
 import requests
 import torch
 from Bio.PDB.MMCIFParser import MMCIFParser
-from Bio.PDB.PDBIO import PDBIO
+from Bio.PDB.PDBIO import PDBIO, Select
 from lightning_fabric.utilities.rank_zero import rank_zero_only
 
 from pynamod.atomic_analysis.nucleotides_parser import build_graph, get_base_u
@@ -115,16 +115,97 @@ def get_pdb_ids():
     return pdb_ids
 
 
+def _pdb_element_field_two_chars(atom):
+    """Return the wwPDB element field using the validated BioPython element."""
+    symbol = (getattr(atom, 'element', None) or '').strip().upper()
+    # MDAnalysis does not recognize deuterium as a separate element in PDB input.
+    if symbol == 'D':
+        symbol = 'H'
+    return f'{symbol[:2]:>2}'
+
+
+def _is_pdb_compatible_residue(residue):
+    """PDB has only three columns for resname; wider hetero names shift all later fields."""
+    return len(residue.resname.strip()) <= 3
+
+
+def _is_pdb_compatible_atom(atom):
+    """Skip atoms with unknown elements because MDAnalysis will emit topology warnings for them."""
+    return (getattr(atom, 'element', None) or '').strip().upper() != 'X'
+
+
+class _PDBCompatibleSelect(Select):
+    def accept_model(self, model):
+        return 1
+
+    def accept_chain(self, chain):
+        return 1
+
+    def accept_residue(self, residue):  # pyright: ignore[reportIncompatibleMethodOverride]
+        return 1 if _is_pdb_compatible_residue(residue) else 0
+
+    def accept_atom(self, atom):  # pyright: ignore[reportIncompatibleMethodOverride]
+        return 1 if _is_pdb_compatible_atom(atom) else 0
+
+
+def _iter_pdb_compatible_atoms(structure):
+    for model in structure:
+        for chain in model:
+            for residue in chain.get_unpacked_list():
+                if not _is_pdb_compatible_residue(residue):
+                    continue
+                for atom in residue.get_unpacked_list():
+                    if _is_pdb_compatible_atom(atom):
+                        yield atom
+
+
+def _rewrite_pdb_for_mdanalysis(pdb_path, structure):
+    """Normalize fixed-width PDB columns so MDAnalysis reads elements and charges correctly."""
+    expected_atoms = list(_iter_pdb_compatible_atoms(structure))
+
+    with open(pdb_path) as f:
+        lines = f.readlines()
+
+    out_lines = []
+    i_atom = 0
+    for line in lines:
+        if line.startswith(('ATOM', 'HETATM')):
+            atom = expected_atoms[i_atom]
+            i_atom += 1
+            row = line.rstrip('\n')
+            if len(row) < 80:
+                row = row + (' ' * (80 - len(row)))
+            else:
+                row = row[:80]
+            elem2 = _pdb_element_field_two_chars(atom)
+            row = row[:76] + elem2 + '  '
+            out_lines.append(row + '\n')
+        else:
+            out_lines.append(line)
+
+    if i_atom != len(expected_atoms):
+        raise RuntimeError('Atom count mismatch when rewriting PDB for MDAnalysis.')
+
+    with open(pdb_path, 'w') as f:
+        f.writelines(out_lines)
+
+
 def mmcif_to_mda_universe(path):
     parser = MMCIFParser(QUIET=True)
     structure = parser.get_structure('struct', path)
+    assert structure is not None
 
     io = PDBIO()
     io.set_structure(structure)
     tmp = tempfile.NamedTemporaryFile(suffix='.pdb', delete=False)
     tmp_pdb = tmp.name
     tmp.close()
-    io.save(tmp_pdb)
+    # Drop records that cannot be represented in fixed-width PDB without corrupting later columns.
+    io.save(tmp_pdb, select=_PDBCompatibleSelect())
+
+    # BioPython lines can be short or have ambiguous element / charge columns; MDAnalysis
+    # then mis-reads resSeq (missing resid), formal charge, and elements. Normalize.
+    _rewrite_pdb_for_mdanalysis(tmp_pdb, structure)
 
     u = mda.Universe(tmp_pdb)
     os.unlink(tmp_pdb)

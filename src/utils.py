@@ -18,6 +18,65 @@ nucleotide_atoms = nucleic_acid_atoms + backbone_atoms
 atom_to_idx = {atom: i for i, atom in enumerate(nucleotide_atoms)}
 base_to_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 
+# DNA backbone torsion quads: (nucl_relative_offset, atom_name) × 4.
+# Convention follows IUPAC: alpha, beta, gamma, delta, epsilon, zeta.
+TORSION_QUADS: list[tuple] = [
+    ((-1, "C3'"), (-1, "O3'"), (0, "P"),    (0, "O5'")),   # alpha
+    ((-1, "O3'"), (0,  "P"),   (0, "O5'"),  (0, "C5'")),   # beta
+    ((0,  "P"),   (0,  "O5'"), (0, "C5'"),  (0, "C4'")),   # gamma
+    ((0,  "O5'"), (0,  "C5'"), (0, "C4'"),  (0, "C3'")),   # delta
+    ((0,  "C5'"), (0,  "C4'"), (0, "C3'"),  (0, "O3'")),   # epsilon
+    ((0,  "C4'"), (0,  "C3'"), (0, "O3'"),  (1, "P")),     # zeta
+]
+# Number of torsion features per nucleotide: 6 torsions × (sin + cos)
+TORSION_FEATURE_DIM = 12
+
+
+def _compute_dihedral_np(p0, p1, p2, p3) -> float:
+    """Dihedral angle in radians for 4 points given as numpy arrays."""
+    import numpy as np
+    b1 = p1 - p0
+    b2 = p2 - p1
+    b3 = p3 - p2
+    b2n = b2 / (np.linalg.norm(b2) + 1e-8)
+    v = b1 - np.dot(b1, b2n) * b2n
+    w = b3 - np.dot(b3, b2n) * b2n
+    x = np.dot(v, w)
+    y = np.dot(np.cross(b2n, v), w)
+    return float(np.arctan2(y, x))
+
+
+def compute_nucleotide_torsion_features(
+    nucl_pos_dicts: list[dict],
+    nucl_idx: int,
+) -> list[float]:
+    """Compute 12 torsion features (sin+cos of 6 backbone torsions) for nucleotide nucl_idx.
+
+    nucl_pos_dicts: list of {atom_name: np.ndarray position} dicts for each nucleotide in window.
+    Returns list of 12 floats; entries for missing torsion quads are 0.
+    """
+    n = len(nucl_pos_dicts)
+    features: list[float] = [0.0] * TORSION_FEATURE_DIM
+    for torsion_idx, quad in enumerate(TORSION_QUADS):
+        coords = []
+        valid = True
+        for (offset, atom_name) in quad:
+            abs_idx = nucl_idx + offset
+            if abs_idx < 0 or abs_idx >= n:
+                valid = False
+                break
+            pos = nucl_pos_dicts[abs_idx].get(atom_name)
+            if pos is None:
+                valid = False
+                break
+            coords.append(pos)
+        if valid:
+            angle = _compute_dihedral_np(*coords)
+            import math
+            features[2 * torsion_idx] = math.sin(angle)
+            features[2 * torsion_idx + 1] = math.cos(angle)
+    return features
+
 
 def get_pdb_ids():
     query = {
@@ -213,6 +272,23 @@ def mmcif_to_mda_universe(path):
     return u
 
 
+def get_edge_type_from_atom_types(edge_index: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+    """Classify edges by type: 0 = intra-nucleotide, 1 = phosphodiester (O3'–P).
+
+    Works on-the-fly from atom one-hot features so no dataset reprocessing is needed.
+    Both directed halves of each phosphodiester bond are labelled 1.
+    """
+    o3_idx = atom_to_idx["O3'"]
+    p_idx = atom_to_idx['P']
+    src_atom = x[edge_index[0]].argmax(dim=1)
+    dst_atom = x[edge_index[1]].argmax(dim=1)
+    is_phosphodiester = (
+        ((src_atom == o3_idx) & (dst_atom == p_idx))
+        | ((src_atom == p_idx) & (dst_atom == o3_idx))
+    )
+    return is_phosphodiester.long()
+
+
 # Cache edge_index per base-type window to avoid rebuilding reference graphs for every window
 def make_edge_index_undirected(edge_index):
     if edge_index.numel() == 0:
@@ -318,7 +394,7 @@ class VisualizationCallback(pl.Callback):
 
         graph = graph.to(pl_module.device)
 
-        true_pos, pred_pos = getattr(pl_module, '_get_generations')(graph)
+        true_pos, pred_pos, _, _ = getattr(pl_module, '_get_generations')(graph)
 
         # Reconstruct atom_names_idx
         target_mask = graph.central_mask & graph.backbone_mask

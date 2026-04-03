@@ -28,6 +28,11 @@ def collect_run_summary(run_dir):
     metrics = {}
     for tag in ['train_rmse', 'train_x0_rmse', 'val_eps_rmse', 'val_rmse', 'test_eps_rmse', 'test_rmse']:
         metrics[tag] = read_scalar_stats(run_dir, tag)
+    # test_gen_rmse is only present when EVAL_FULL_SAMPLING=1
+    try:
+        metrics['test_gen_rmse'] = read_scalar_stats(run_dir, 'test_gen_rmse')
+    except Exception:
+        pass
     return metrics
 
 
@@ -59,25 +64,38 @@ def write_summary(summary_path, session_name, results):
 
 
 def write_markdown(summary_path, session_name, results):
+    has_gen = any('test_gen_rmse' in r['metrics'] for r in results)
+    header = '| scenario | train_rmse min | train_x0_rmse min | val_eps_rmse min | val_rmse min | test_rmse last'
+    if has_gen:
+        header += ' | test_gen_rmse last'
+    header += ' | elapsed_s |'
+    sep = '| --- | ---: | ---: | ---: | ---: | ---:'
+    if has_gen:
+        sep += ' | ---:'
+    sep += ' | ---: |'
     lines = [
         f'# Overfit debug matrix: {session_name}',
         '',
-        '| scenario | train_rmse min | train_x0_rmse min | val_eps_rmse min | val_rmse min | test_rmse last | elapsed_s |',
-        '| --- | ---: | ---: | ---: | ---: | ---: | ---: |',
+        header,
+        sep,
     ]
     for result in results:
         metrics = result['metrics']
-        lines.append(
-            '| {scenario} | {train_rmse:.6f} | {train_x0_rmse:.6f} | {val_eps_rmse:.6f} | {val_rmse:.6f} | {test_rmse:.6f} | {elapsed_s:.1f} |'.format(
+        row = (
+            '| {scenario} | {train_rmse:.6f} | {train_x0_rmse:.6f} | {val_eps_rmse:.6f} | {val_rmse:.6f} | {test_rmse:.6f}'.format(
                 scenario=result['scenario'],
                 train_rmse=metrics['train_rmse']['min'],
                 train_x0_rmse=metrics['train_x0_rmse']['min'],
                 val_eps_rmse=metrics['val_eps_rmse']['min'],
                 val_rmse=metrics['val_rmse']['min'],
                 test_rmse=metrics['test_rmse']['last'],
-                elapsed_s=result['elapsed_s'],
             )
         )
+        if has_gen:
+            gen_val = metrics.get('test_gen_rmse', {}).get('last', float('nan'))
+            row += f' | {gen_val:.6f}'
+        row += f' | {result["elapsed_s"]:.1f} |'
+        lines.append(row)
     with open(summary_path, 'w') as file_obj:
         file_obj.write('\n'.join(lines) + '\n')
 
@@ -104,8 +122,10 @@ def run_scenario(session_name, scenario):
             'TRAIN_LOSS_TYPE': train_loss_type,
             'PREDICTION_TARGET': prediction_target,
             'DEBUG_EVAL_T': '100',
+            'DEBUG_EVAL_SNR': os.getenv('DEBUG_EVAL_SNR', ''),
             'DEBUG_FIXED_T': scenario['debug_fixed_t'],
             'DEBUG_FIXED_NOISE': scenario['debug_fixed_noise'],
+            'EVAL_FULL_SAMPLING': os.getenv('EVAL_FULL_SAMPLING', '0'),
         }
     )
 

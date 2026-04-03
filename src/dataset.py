@@ -44,6 +44,10 @@ class PyGDataset(Dataset):
     def get(self, idx):
         data = torch.load(self.data_list[idx], weights_only=False)
         data.edge_index = utils.make_edge_index_undirected(data.edge_index)
+        # Compute edge types on-the-fly for backward compat with pre-existing .pt files.
+        # edge_attr: 0 = intra-nucleotide bond, 1 = phosphodiester (O3'–P) bond.
+        if not hasattr(data, 'edge_attr') or data.edge_attr is None:
+            data.edge_attr = utils.get_edge_type_from_atom_types(data.edge_index, data.x)
         return data
 
     @property
@@ -183,6 +187,26 @@ class PyGDataset(Dataset):
                     if not (all(s == 1 for s in steps) or all(s == -1 for s in steps)):
                         continue
 
+                    # Build per-nucleotide raw atom position dicts for torsion computation.
+                    # Uses world coordinates (before frame alignment); torsion angles are
+                    # rotation-invariant so the result is identical after alignment.
+                    nucl_pos_dicts = []
+                    for nucleotide in window:
+                        pos_dict = {}
+                        for atom in nucleotide.e_residue:
+                            atom_name = utils.rename_atom(atom.name)
+                            atom_element = getattr(atom, 'element', None)
+                            if 'H' in atom.name or atom_element in {'H', 'D'}:
+                                continue
+                            pos_dict[atom_name] = atom.position
+                        nucl_pos_dicts.append(pos_dict)
+
+                    # Compute 12-dim torsion feature vector per nucleotide
+                    nucl_torsion_feats = [
+                        utils.compute_nucleotide_torsion_features(nucl_pos_dicts, i)
+                        for i in range(len(window))
+                    ]
+
                     # Iterate over nucleotides (with sorted atoms) in a window
                     base_types = []
                     central_mask = []
@@ -190,6 +214,7 @@ class PyGDataset(Dataset):
                     atom_positions = []
                     backbone_mask = []
                     has_pair_list = []
+                    torsion_features_list = []
                     for nucleotide_idx, nucleotide in enumerate(window):
                         # Get nucleotide features
                         base_type = utils.base_to_idx[nucleotide.restype]
@@ -211,6 +236,8 @@ class PyGDataset(Dataset):
                             base_types.append(base_type)
                             central_mask.append(is_central)
                             has_pair_list.append(has_pair)
+                            # All atoms in a nucleotide share the same torsion features
+                            torsion_features_list.append(nucl_torsion_feats[nucleotide_idx])
 
                     # Collect window features
                     edge_idx = utils.get_edge_idx(tuple([nucleotide.restype for nucleotide in window]))
@@ -223,7 +250,12 @@ class PyGDataset(Dataset):
                     # Convert atom positions to a np array before converting to a tensor
                     pos_tensor = torch.tensor(np.asarray(atom_positions), dtype=torch.float)
 
-                    # Align to the central nucleotide's reference frame
+                    # Align to the central nucleotide's reference frame.
+                    # ref_frame/origin are computed by get_base_ref_frame() from the
+                    # nitrogenous base ring atoms only (via graph-isomorphism matching
+                    # against base_graphs[base] = build_graph(mda_str[11:])).
+                    # Backbone atoms (P, O3', etc.) are NOT used for frame construction,
+                    # so there is no data leakage into the diffusion target.
                     central_idx = window[self.window_size // 2].ind
                     # Get R and origin from pynamod storage
                     # R: (3, 3), origin: (1, 3)
@@ -240,6 +272,9 @@ class PyGDataset(Dataset):
                         torch.tensor(base_types, dtype=torch.long),
                         num_classes=len(utils.base_to_idx)
                     ).float()
+                    torsion_features_tensor = torch.tensor(
+                        np.asarray(torsion_features_list), dtype=torch.float
+                    )
 
                     # Create a data object
                     data = Data(
@@ -251,7 +286,8 @@ class PyGDataset(Dataset):
                         central_mask=central_mask_tensor,
                         backbone_mask=backbone_mask_tensor,
                         has_pair=has_pair_tensor,
-                        base_types=base_types_tensor
+                        base_types=base_types_tensor,
+                        torsion_features=torsion_features_tensor,
                     )
 
                     # Save the data object

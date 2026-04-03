@@ -27,11 +27,12 @@ class SinusoidalPositionalEmbeddings(nn.Module):
 
 
 class EquivariantConv(nn.Module):
-    def __init__(self, hidden_nf, act_fn=nn.SiLU()):
+    def __init__(self, hidden_nf, edge_attr_dim=0, act_fn=nn.SiLU()):
         super().__init__()
         self.hidden_nf = hidden_nf
+        self.edge_attr_dim = edge_attr_dim
         self.message_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_nf + 1, hidden_nf),
+            nn.Linear(2 * hidden_nf + 1 + edge_attr_dim, hidden_nf),
             act_fn,
             nn.Linear(hidden_nf, hidden_nf),
             act_fn
@@ -56,7 +57,10 @@ class EquivariantConv(nn.Module):
         # Message passing
         rel_coords = x[row] - x[col]
         dist = torch.norm(rel_coords, p=2, dim=-1, keepdim=True)
-        message_input = torch.cat([h[row], h[col], dist], dim=-1)
+        parts = [h[row], h[col], dist]
+        if edge_attr is not None:
+            parts.append(edge_attr)
+        message_input = torch.cat(parts, dim=-1)
         messages = self.message_mlp(message_input)
 
         # Aggregate messages
@@ -123,6 +127,7 @@ class EGNNDiff(nn.Module):
         eps_directional_head=False,
         eps_use_local_head=True,
         eps_normalize_agg=False,
+        edge_attr_dim=0,
         act_fn=nn.SiLU()
     ):
         super().__init__()
@@ -131,10 +136,12 @@ class EGNNDiff(nn.Module):
         self.eps_directional_head = eps_directional_head
         self.eps_use_local_head = eps_use_local_head
         self.eps_normalize_agg = eps_normalize_agg
+        self.edge_attr_dim = edge_attr_dim
 
         self.embedding_in = nn.Linear(in_node_nf, self.hidden_nf)
+        # rel_coords (3) + dist (1) + optional edge_attr
         self.eps_message_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_nf + 4, hidden_nf),
+            nn.Linear(2 * hidden_nf + 4 + edge_attr_dim, hidden_nf),
             act_fn,
             nn.Linear(hidden_nf, hidden_nf),
             act_fn
@@ -157,14 +164,17 @@ class EGNNDiff(nn.Module):
         )
 
         for i in range(0, num_layers):
-            self.add_module(f'gcl_{i}', EquivariantConv(self.hidden_nf, act_fn=act_fn))
+            self.add_module(f'gcl_{i}', EquivariantConv(self.hidden_nf, edge_attr_dim=edge_attr_dim, act_fn=act_fn))
 
-    def predict_epsilon(self, h, x, edge_index):
+    def predict_epsilon(self, h, x, edge_index, edge_attr=None):
         row, col = edge_index
         rel_coords = x[row] - x[col]
         dist = torch.norm(rel_coords, p=2, dim=-1, keepdim=True)
 
-        message_input = torch.cat([h[row], h[col], rel_coords, dist], dim=-1)
+        parts = [h[row], h[col], rel_coords, dist]
+        if edge_attr is not None:
+            parts.append(edge_attr)
+        message_input = torch.cat(parts, dim=-1)
         eps_messages = self.eps_message_mlp(message_input)
         if self.eps_directional_head:
             rel_dir = rel_coords / (dist + 1e-8)
@@ -186,7 +196,7 @@ class EGNNDiff(nn.Module):
         h = self.embedding_in(h)
         for i in range(0, self.num_layers):
             h, x = getattr(self, f'gcl_{i}')(h, x, edge_index, edge_attr=edge_attr)
-        eps = self.predict_epsilon(h, x, edge_index)
+        eps = self.predict_epsilon(h, x, edge_index, edge_attr=edge_attr)
         return h, x, eps
 
 
@@ -204,10 +214,16 @@ class PytorchLightningModule(pl.LightningModule):
         eps_directional_head=False,
         eps_use_local_head=True,
         eps_normalize_agg=False,
+        use_edge_attr=False,
+        use_torsion_features=False,
         train_t_max=None,
         debug_fixed_t=None,
         debug_fixed_noise=False,
-        debug_eval_t=None
+        debug_eval_t=None,
+        debug_eval_snr=None,
+        eval_full_sampling=False,
+        val_full_sampling=False,
+        val_gen_every_n_epochs=1,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -216,13 +232,18 @@ class PytorchLightningModule(pl.LightningModule):
         self.time_emb_dim = 32
         self.time_mlp = SinusoidalPositionalEmbeddings(self.time_emb_dim)
 
+        # 2-class one-hot (intra=0, phosphodiester=1) when edge types are used
+        edge_attr_dim = 2 if use_edge_attr else 0
+        # 12 = 6 torsions × (sin + cos); zeroed for target atoms during forward pass
+        torsion_dim = 12 if use_torsion_features else 0
         self.gnn = EGNNDiff(
-            in_node_nf=self.n_atom_types + self.time_emb_dim + len(base_to_idx) + 1,  # + time_emb_dim for time embedding, +4 for base types, +1 for has_pair
+            in_node_nf=self.n_atom_types + self.time_emb_dim + len(base_to_idx) + 1 + torsion_dim,  # +4 base types, +1 has_pair, +torsion_dim
             hidden_nf=hidden_dim,
             num_layers=num_layers,
             eps_directional_head=eps_directional_head,
             eps_use_local_head=eps_use_local_head,
-            eps_normalize_agg=eps_normalize_agg
+            eps_normalize_agg=eps_normalize_agg,
+            edge_attr_dim=edge_attr_dim,
         )
 
         betas = get_beta_schedule(beta_schedule, num_timesteps=num_timesteps)
@@ -299,16 +320,31 @@ class PytorchLightningModule(pl.LightningModule):
             raise ValueError('Unsupported t shape.')
         return node_t.long()
 
-    def _build_node_features(self, batch, node_t):
+    def _build_node_features(self, batch, node_t, target_mask=None):
         t_emb = self.time_mlp(node_t.float())
         has_pair_expanded = batch.has_pair.float().unsqueeze(1)
-        return torch.cat([batch.x, t_emb, batch.base_types, has_pair_expanded], dim=1)
+        parts = [batch.x, t_emb, batch.base_types, has_pair_expanded]
+        if getattr(self.hparams, 'use_torsion_features', False):
+            if not hasattr(batch, 'torsion_features') or batch.torsion_features is None:
+                raise RuntimeError(
+                    'use_torsion_features=True but batch has no torsion_features. '
+                    'Delete the processed data folder and rerun dataset processing.'
+                )
+            torsions = batch.torsion_features.clone()
+            if target_mask is not None:
+                # Prevent leakage: target backbone atoms get zeroed torsion features
+                torsions[target_mask] = 0.0
+            parts.append(torsions)
+        return torch.cat(parts, dim=1)
 
     def _predict_noise(self, batch, target_mask, pos_target, node_t):
-        h = self._build_node_features(batch, node_t)
+        h = self._build_node_features(batch, node_t, target_mask=target_mask)
         pos = batch.pos.clone()
         pos[target_mask] = pos_target
-        _, _, eps_out = self.gnn(h, pos, batch.edge_index)
+        edge_attr = None
+        if getattr(self.hparams, 'use_edge_attr', False) and hasattr(batch, 'edge_attr') and batch.edge_attr is not None:
+            edge_attr = F.one_hot(batch.edge_attr.long(), num_classes=2).float()
+        _, _, eps_out = self.gnn(h, pos, batch.edge_index, edge_attr=edge_attr)
         return eps_out[target_mask]
 
     def _get_fixed_eval_noise(self, pos_start):
@@ -318,6 +354,11 @@ class PytorchLightningModule(pl.LightningModule):
         return torch.randn(pos_start.shape, generator=generator, dtype=pos_start.dtype).to(pos_start.device)
 
     def _get_fixed_eval_t(self, device):
+        # SNR-anchored: find t with alpha_bar closest to the requested value
+        eval_snr = getattr(self.hparams, 'debug_eval_snr', None)
+        if eval_snr is not None:
+            t = int((self.alphas_cumprod - eval_snr).abs().argmin().item())
+            return torch.tensor([t], device=device, dtype=torch.long)
         eval_t = getattr(self.hparams, 'debug_eval_t')
         if eval_t is None:
             eval_t = getattr(self.hparams, 'debug_fixed_t')
@@ -419,6 +460,18 @@ class PytorchLightningModule(pl.LightningModule):
 
         return pred_pos
 
+    @torch.no_grad()
+    def p_sample_loop(self, batch):
+        """Full T-step reverse diffusion starting from Gaussian noise."""
+        target_mask = batch.central_mask & batch.backbone_mask
+        true_pos = batch.pos[target_mask]
+        pos_t = torch.randn_like(true_pos)
+        T = getattr(self.hparams, 'num_timesteps')
+        for t_idx in reversed(range(T)):
+            t = torch.tensor([t_idx], device=true_pos.device, dtype=torch.long)
+            pos_t = self.p_sample(pos_t, t, batch)
+        return true_pos, pos_t
+
     def training_step(self, batch, _):
         target_mask = batch.central_mask & batch.backbone_mask
         pos_start = batch.pos[target_mask]
@@ -458,13 +511,20 @@ class PytorchLightningModule(pl.LightningModule):
 
         return true_pos, pred_pos, eps_mse, eps_rmse
 
-    def validation_step(self, batch, _):
+    def validation_step(self, batch, batch_idx):
         true_pos, pred_pos, eps_mse, eps_rmse = self._get_generations(batch)
 
         rmse = torch.sqrt(F.mse_loss(pred_pos, true_pos))
         self.log('val_eps_mse', eps_mse, batch_size=len(batch.pos), on_step=False, on_epoch=True, sync_dist=True)
         self.log('val_eps_rmse', eps_rmse, batch_size=len(batch.pos), on_step=False, on_epoch=True, sync_dist=True)
         self.log('val_rmse', rmse, batch_size=len(batch.pos), on_step=False, on_epoch=True, sync_dist=True)
+        if getattr(self.hparams, 'val_full_sampling', False):
+            every_n = max(1, int(getattr(self.hparams, 'val_gen_every_n_epochs', 1)))
+            if batch_idx == 0 and (self.current_epoch + 1) % every_n == 0:
+                # Only sample the first validation batch to keep reverse-process monitoring affordable.
+                true_gen, gen_pos = self.p_sample_loop(batch)
+                gen_rmse = torch.sqrt(F.mse_loss(gen_pos, true_gen))
+                self.log('val_gen_rmse', gen_rmse, batch_size=len(batch.pos), on_step=False, on_epoch=True, sync_dist=True)
 
     def test_step(self, batch, _):
         true_pos, pred_pos, eps_mse, eps_rmse = self._get_generations(batch)
@@ -473,6 +533,11 @@ class PytorchLightningModule(pl.LightningModule):
         self.log('test_eps_mse', eps_mse, batch_size=len(batch.pos), on_step=False, on_epoch=True, sync_dist=True)
         self.log('test_eps_rmse', eps_rmse, batch_size=len(batch.pos), on_step=False, on_epoch=True, sync_dist=True)
         self.log('test_rmse', rmse, batch_size=len(batch.pos), on_step=False, on_epoch=True, sync_dist=True)
+
+        if getattr(self.hparams, 'eval_full_sampling', False):
+            true_gen, gen_pos = self.p_sample_loop(batch)
+            gen_rmse = torch.sqrt(F.mse_loss(gen_pos, true_gen))
+            self.log('test_gen_rmse', gen_rmse, batch_size=len(batch.pos), on_step=False, on_epoch=True, sync_dist=True)
 
     def configure_optimizers(self):  # type: ignore[override]
         optimizer = torch.optim.AdamW(self.parameters(), lr=getattr(self.hparams, 'lr'), betas=(0.9, 0.999), weight_decay=0)

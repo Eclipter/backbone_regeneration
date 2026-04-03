@@ -54,10 +54,16 @@ def main():
         eps_directional_head=config.EPS_DIRECTIONAL_HEAD,
         eps_use_local_head=config.EPS_USE_LOCAL_HEAD,
         eps_normalize_agg=config.EPS_NORMALIZE_AGG,
+        use_edge_attr=config.USE_EDGE_ATTR,
+        use_torsion_features=config.USE_TORSION_FEATURES,
         train_t_max=config.TRAIN_T_MAX,
         debug_fixed_t=config.DEBUG_FIXED_T,
         debug_fixed_noise=config.DEBUG_FIXED_NOISE,
-        debug_eval_t=config.DEBUG_EVAL_T
+        debug_eval_t=config.DEBUG_EVAL_T,
+        debug_eval_snr=config.DEBUG_EVAL_SNR,
+        eval_full_sampling=config.EVAL_FULL_SAMPLING,
+        val_full_sampling=config.VAL_FULL_SAMPLING,
+        val_gen_every_n_epochs=config.VAL_GEN_EVERY_N_EPOCHS,
     )
 
     # Initialize logger
@@ -76,15 +82,22 @@ def main():
     pl_logger.addFilter(lambda r: 'litlogger' not in r.getMessage())  # Mute LitLogger tip
     logger = TensorBoardLogger(log_dir, name='', version=run_name, default_hp_metric=False)
     use_single_device = config.OVERFIT_SINGLE_SAMPLE and config.DEBUG_SINGLE_DEVICE
+    checkpoint_metric = 'val_rmse'
+    if config.VAL_FULL_SAMPLING and config.VAL_GEN_EVERY_N_EPOCHS == 1:
+        checkpoint_metric = 'val_gen_rmse'
+    strategy = 'auto'
+    if not use_single_device and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        # The model contains mutually exclusive branches, so some parameters stay unused each step.
+        strategy = 'ddp_find_unused_parameters_true'
 
     # Initialize callbacks
     checkpoint_callback = ModelCheckpoint(
-        monitor='val_rmse',
+        monitor=checkpoint_metric,
         save_last=True,
         enable_version_counter=False
     )
     early_stopping_callback = EarlyStopping(
-        monitor='val_rmse',
+        monitor=checkpoint_metric,
         patience=500,
     )
     swa = StochasticWeightAveraging(
@@ -99,6 +112,7 @@ def main():
         overfit_batches=config.OVERFIT_BATCHES,
         accelerator='gpu' if torch.cuda.is_available() else 'cpu',
         devices=1 if use_single_device else 'auto',
+        strategy=strategy,
         logger=logger,
         callbacks=[
             checkpoint_callback,

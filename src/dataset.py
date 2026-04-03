@@ -42,7 +42,9 @@ class PyGDataset(Dataset):
         return len(self.data_list)
 
     def get(self, idx):
-        return torch.load(self.data_list[idx], weights_only=False)
+        data = torch.load(self.data_list[idx], weights_only=False)
+        data.edge_index = utils.make_edge_index_undirected(data.edge_index)
+        return data
 
     @property
     def raw_file_names(self):
@@ -260,14 +262,30 @@ class PyGDataset(Dataset):
 
 
 class DNADataModule(pl.LightningDataModule):
-    def __init__(self, batch_size, train_ratio=0.7, val_ratio=0.2):
+    def __init__(self, batch_size, train_ratio=0.7, val_ratio=0.2, seed=0, overfit_single_sample=False, overfit_sample_index=0):
         super().__init__()
 
         self.batch_size = batch_size
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
+        self.seed = seed
+        self.overfit_single_sample = overfit_single_sample
+        self.overfit_sample_index = overfit_sample_index
 
         self.num_workers = 4
+
+    def _create_dataloader(self, dataset, shuffle):
+        effective_num_workers = 0 if self.overfit_single_sample else self.num_workers
+        dataloader_kwargs: dict[str, object] = dict(
+            dataset=cast(Dataset, dataset),
+            batch_size=self.batch_size,
+            shuffle=shuffle,
+            num_workers=effective_num_workers,
+            persistent_workers=effective_num_workers > 0
+        )
+        if effective_num_workers > 0:
+            dataloader_kwargs['multiprocessing_context'] = 'spawn'
+        return DataLoader(**dataloader_kwargs)  # type: ignore[arg-type]
 
     def prepare_data(self):
         # Download and process data
@@ -276,7 +294,8 @@ class DNADataModule(pl.LightningDataModule):
     def setup(self, stage: Optional[str] = None):
         dataset = PyGDataset()
 
-        indices = np.random.permutation(len(dataset)).tolist()
+        # Use a fixed split so overfit/debug runs stay reproducible across restarts.
+        indices = np.random.default_rng(self.seed).permutation(len(dataset)).tolist()
         train_val_split = int(len(indices) * self.train_ratio)
         val_test_split = int(len(indices) * (self.train_ratio + self.val_ratio))
 
@@ -284,39 +303,24 @@ class DNADataModule(pl.LightningDataModule):
         val_indices = indices[train_val_split:val_test_split]
         test_indices = indices[val_test_split:]
 
+        if self.overfit_single_sample:
+            sample_index = train_indices[self.overfit_sample_index % len(train_indices)]
+            train_indices = [sample_index]
+            val_indices = [sample_index]
+            test_indices = [sample_index]
+
         self.train_dataset: Subset[Data] = Subset(dataset, train_indices)
         self.val_dataset: Subset[Data] = Subset(dataset, val_indices)
         self.test_dataset: Subset[Data] = Subset(dataset, test_indices)
 
     def train_dataloader(self):
-        return DataLoader(
-            cast(Dataset, self.train_dataset),
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=self.num_workers,
-            persistent_workers=True,
-            multiprocessing_context='spawn'
-        )  # type: ignore
+        return self._create_dataloader(self.train_dataset, shuffle=True)
 
     def val_dataloader(self):
-        return DataLoader(
-            cast(Dataset, self.val_dataset),
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            persistent_workers=True,
-            multiprocessing_context='spawn'
-        )  # type: ignore
+        return self._create_dataloader(self.val_dataset, shuffle=False)
 
     def test_dataloader(self):
-        return DataLoader(
-            cast(Dataset, self.test_dataset),
-            batch_size=self.batch_size,
-            shuffle=False,
-            num_workers=self.num_workers,
-            persistent_workers=True,
-            multiprocessing_context='spawn'
-        )  # type: ignore
+        return self._create_dataloader(self.test_dataset, shuffle=False)
 
 
 if __name__ == '__main__':

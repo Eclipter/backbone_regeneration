@@ -214,6 +214,13 @@ def mmcif_to_mda_universe(path):
 
 
 # Cache edge_index per base-type window to avoid rebuilding reference graphs for every window
+def make_edge_index_undirected(edge_index):
+    if edge_index.numel() == 0:
+        return edge_index
+    edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
+    return torch.unique(edge_index.t(), dim=0).t().contiguous()
+
+
 @lru_cache()
 def get_edge_idx(base_types: tuple):
     all_edges = []
@@ -270,7 +277,8 @@ def get_edge_idx(base_types: tuple):
         return torch.empty((2, 0), dtype=torch.long)
 
     edge_index = torch.cat(all_edges).t().contiguous()
-    return edge_index
+    # Keep the reference graph undirected so every bonded pair can exchange messages both ways.
+    return make_edge_index_undirected(edge_index)
 
 
 def has_pair(structure, nucleotide):

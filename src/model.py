@@ -236,11 +236,15 @@ class PytorchLightningModule(pl.LightningModule):
         has_pair_expanded = batch.has_pair.float().unsqueeze(1)
         h = torch.cat([h, time_emb, batch.base_types, has_pair_expanded], dim=1)
 
+        # v-target: v = sqrt_alpha_t * eps - sqrt_one_minus_alpha_t * x0
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, target_t, pos_start.shape)
+        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, target_t, pos_start.shape)
+        v_target = sqrt_alphas_cumprod_t * noise_pos - sqrt_one_minus_alphas_cumprod_t * pos_start
+
         _, pos_out = self.gnn(h, pos, batch.edge_index)
 
-        # Position loss (model predicts epsilon directly)
-        pred_noise_pos = pos_out[target_mask]
-        pos_loss = F.mse_loss(pred_noise_pos, noise_pos)
+        pred_v = pos_out[target_mask]
+        pos_loss = F.mse_loss(pred_v, v_target)
 
         return pos_loss
 
@@ -262,11 +266,11 @@ class PytorchLightningModule(pl.LightningModule):
 
         _, x_out = self.gnn(h, pos, batch.edge_index)
 
-        # Process positions (model predicts epsilon directly)
-        pred_noise_pos = x_out[target_mask]
-        sqrt_recip_alphas_cumprod_t = extract(self.sqrt_recip_alphas_cumprod, t, pos_t.shape)
+        # Recover x0 from v-prediction: x0 = sqrt_alpha_t * x_t - sqrt_one_minus_alpha_t * v
+        pred_v = x_out[target_mask]
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, pos_t.shape)
         sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, pos_t.shape)
-        pred_pos_start = sqrt_recip_alphas_cumprod_t * (pos_t - sqrt_one_minus_alphas_cumprod_t * pred_noise_pos)
+        pred_pos_start = sqrt_alphas_cumprod_t * pos_t - sqrt_one_minus_alphas_cumprod_t * pred_v
         model_mean_pos, _, model_log_variance_pos = self.q_posterior_mean_variance(x_start=pred_pos_start, x_t=pos_t, t=t)
 
         if t[0] > 0:
@@ -318,7 +322,7 @@ class PytorchLightningModule(pl.LightningModule):
         scheduler = ReduceLROnPlateau(
             optimizer,
             patience=getattr(self.hparams, 'scheduler_patience'),
-            cooldown=30,
+            cooldown=20,
             factor=0.5,
             mode='min'
         )

@@ -1,15 +1,15 @@
 HIDDEN_DIM = 256
 NUM_LAYERS = 5
 NUM_TIMESTEPS = 200
-BATCH_SIZE = 2**11
+BATCH_SIZE = 2**9
 LR = 1e-4
 
 # Set RUN_NAME if you want to have a custom name for the run instead of the current time
 # To run in a folder, set RUN_NAME to "folder/run_name"
-RUN_NAME = f'reproduced/{HIDDEN_DIM}_{NUM_LAYERS}_{NUM_TIMESTEPS}_{LR}'
+RUN_NAME = f'different_timesteps/{HIDDEN_DIM}_{NUM_LAYERS}_{NUM_TIMESTEPS}_{LR}'
 # RUN_NAME = 'test'
 
-START_FROM_LAST_CKPT = False
+START_FROM_LAST_CKPT = True
 
 # None | 'simple' | 'advanced'
 PROFILER = 'simple'

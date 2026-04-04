@@ -301,7 +301,8 @@ class PytorchLightningModule(pl.LightningModule):
     def training_step(self, batch, _):
         target_mask = batch.central_mask & batch.backbone_mask
         pos_start = batch.pos[target_mask]
-        t = torch.randint(0, getattr(self.hparams, 'num_timesteps'), (1,), device=self.device).long()
+        num_graphs = getattr(batch, 'num_graphs', 1)
+        t = torch.randint(0, getattr(self.hparams, 'num_timesteps'), (num_graphs,), device=self.device).long()
         node_t = self._expand_node_t(batch, t)
         target_t = node_t[target_mask]
         noise_pos = torch.randn_like(pos_start)
@@ -310,6 +311,7 @@ class PytorchLightningModule(pl.LightningModule):
         mse_loss = F.mse_loss(model_output, noise_pos)
 
         rmse_loss = torch.sqrt(mse_loss)
+        self.log('train_mse', mse_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
         self.log('train_rmse', rmse_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
 
         return mse_loss

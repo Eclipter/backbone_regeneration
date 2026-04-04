@@ -23,9 +23,6 @@ warnings.filterwarnings('ignore', category=FutureWarning, module='torch.distribu
 def main():
     torch.set_float32_matmul_precision('high')
 
-    # A workaround for mlx4 compatibility issues
-    os.environ.setdefault('NCCL_IB_DISABLE', '1')
-
     data_module = DNADataModule(batch_size=config.BATCH_SIZE)
     pl_module = PytorchLightningModule(
         hidden_dim=config.HIDDEN_DIM,
@@ -69,12 +66,15 @@ def main():
         else 'auto'
     )
 
+    num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
+
     # Initialize trainer
     trainer = pl.Trainer(
-        gradient_clip_val=1,
         max_epochs=300,
         # overfit_batches=1,
+        gradient_clip_val=1,
         log_every_n_steps=-1,
+        num_nodes=num_nodes,
         strategy=strategy,
         logger=logger,
         callbacks=[

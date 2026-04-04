@@ -270,11 +270,6 @@ class PytorchLightningModule(pl.LightningModule):
         sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, target_t, pos_noisy.shape).clamp(min=1e-8)
         return (pos_noisy - sqrt_one_minus_alphas_cumprod_t * pred_noise_pos) / sqrt_alphas_cumprod_t
 
-    def _compute_eps_losses(self, pred_noise_pos, noise_pos):
-        eps_mse = F.mse_loss(pred_noise_pos, noise_pos)
-        eps_rmse = torch.sqrt(eps_mse)
-        return eps_mse, eps_rmse
-
     @torch.no_grad()
     def p_sample(self, pos_t, t, batch):
         target_mask = batch.central_mask & batch.backbone_mask
@@ -290,6 +285,18 @@ class PytorchLightningModule(pl.LightningModule):
         pred_pos = model_mean_pos + (0.5 * model_log_variance_pos).exp() * noise_pos * nonzero_mask
 
         return pred_pos
+
+    @torch.no_grad()
+    def p_sample_loop(self, batch):
+        """Full T-step reverse diffusion from Gaussian noise to predicted clean positions."""
+        target_mask = batch.central_mask & batch.backbone_mask
+        true_pos = batch.pos[target_mask]
+        pos_t = torch.randn_like(true_pos)
+        T = getattr(self.hparams, 'num_timesteps')
+        for t_idx in reversed(range(T)):
+            t = torch.tensor([t_idx], device=true_pos.device, dtype=torch.long)
+            pos_t = self.p_sample(pos_t, t, batch)
+        return true_pos, pos_t
 
     def training_step(self, batch, _):
         target_mask = batch.central_mask & batch.backbone_mask
@@ -307,31 +314,14 @@ class PytorchLightningModule(pl.LightningModule):
 
         return mse_loss
 
-    def _get_generations(self, batch):
-        target_mask = batch.central_mask & batch.backbone_mask
-        true_pos = batch.pos[target_mask]
-        eval_t = torch.tensor([max(1, getattr(self.hparams, 'num_timesteps') // 2)], device=batch.pos.device, dtype=torch.long)
-        node_t = self._expand_node_t(batch, eval_t)
-        target_t = node_t[target_mask]
-        generator = torch.Generator(device='cpu')
-        generator.manual_seed(0)
-        noise_pos = torch.randn(true_pos.shape, generator=generator, dtype=true_pos.dtype).to(true_pos.device)
-        pos_noisy = self.q_sample(true_pos, target_t, noise_pos=noise_pos)
-        model_output = self._predict_noise(batch, target_mask, pos_noisy, node_t)
-        pred_pos = self._decode_epsilon_to_x0(pos_noisy, model_output, target_t)
-
-        return true_pos, pred_pos
-
     def validation_step(self, batch, _):
-        true_pos, pred_pos = self._get_generations(batch)
-
-        rmse = torch.sqrt(F.mse_loss(pred_pos, true_pos))
+        true_pos, gen_pos = self.p_sample_loop(batch)
+        rmse = torch.sqrt(F.mse_loss(gen_pos, true_pos))
         self.log('val_rmse', rmse, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
 
     def test_step(self, batch, _):
-        true_pos, pred_pos = self._get_generations(batch)
-
-        rmse = torch.sqrt(F.mse_loss(pred_pos, true_pos))
+        true_pos, gen_pos = self.p_sample_loop(batch)
+        rmse = torch.sqrt(F.mse_loss(gen_pos, true_pos))
         self.log('test_rmse', rmse, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
 
     def configure_optimizers(self):  # type: ignore[override]
@@ -355,14 +345,5 @@ class PytorchLightningModule(pl.LightningModule):
 
     @torch.no_grad()
     def sample(self, batch):
-        target_mask = batch.central_mask & batch.backbone_mask
-        n_samples = int(target_mask.sum().item())
-
-        device = torch.device(getattr(self.betas, 'device'))
-        pos = torch.randn(n_samples, 3, device=device)
-
-        for i in reversed(range(0, getattr(self.hparams, 'num_timesteps'))):
-            t = torch.full((1,), i, device=device, dtype=torch.long)
-            pos = self.p_sample(pos, t, batch)
-
-        return pos
+        _, gen_pos = self.p_sample_loop(batch)
+        return gen_pos

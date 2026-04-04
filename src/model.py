@@ -49,7 +49,7 @@ class EquivariantConv(nn.Module):
         )
         self.ln = nn.LayerNorm(hidden_nf)
 
-    def forward(self, h, x, edge_index, edge_attr=None):
+    def forward(self, h, x, edge_index):
         # h: [N, hidden_nf], x: [N, 3]
         row, col = edge_index
 
@@ -119,22 +119,71 @@ class EGNNDiff(nn.Module):
         super().__init__()
         self.hidden_nf = hidden_nf
         self.num_layers = num_layers
+        self.eps_directional_head = False
+        self.eps_use_local_head = True
+        self.eps_normalize_agg = False
 
         self.embedding_in = nn.Linear(in_node_nf, self.hidden_nf)
-
-        self.gcl_layers = nn.ModuleList(
-            [EquivariantConv(self.hidden_nf, act_fn=act_fn) for _ in range(num_layers)]
+        # rel_coords (3) + dist (1)
+        self.eps_message_mlp = nn.Sequential(
+            nn.Linear(2 * hidden_nf + 4, hidden_nf),
+            act_fn,
+            nn.Linear(hidden_nf, hidden_nf),
+            act_fn
+        )
+        self.eps_coord_mlp = nn.Sequential(
+            nn.Linear(hidden_nf, hidden_nf),
+            act_fn,
+            nn.Linear(hidden_nf, 3)
+        )
+        self.eps_coord_scalar_mlp = nn.Sequential(
+            nn.Linear(hidden_nf, hidden_nf),
+            act_fn,
+            nn.Linear(hidden_nf, 1, bias=False),
+            nn.Tanh()
+        )
+        self.eps_head = nn.Sequential(
+            nn.Linear(hidden_nf + 3, hidden_nf),
+            act_fn,
+            nn.Linear(hidden_nf, 3)
         )
 
-    def forward(self, h, x, edge_index, edge_attr=None):
+        for i in range(0, num_layers):
+            self.add_module(f'gcl_{i}', EquivariantConv(self.hidden_nf, act_fn=act_fn))
+
+    def predict_epsilon(self, h, x, edge_index):
+        row, col = edge_index
+        rel_coords = x[row] - x[col]
+        dist = torch.norm(rel_coords, p=2, dim=-1, keepdim=True)
+
+        message_input = torch.cat([h[row], h[col], rel_coords, dist], dim=-1)
+        eps_messages = self.eps_message_mlp(message_input)
+        if self.eps_directional_head:
+            rel_dir = rel_coords / (dist + 1e-8)
+            eps_update_src = self.eps_coord_scalar_mlp(eps_messages) * rel_dir
+        else:
+            eps_update_src = self.eps_coord_mlp(eps_messages)
+
+        eps = torch.zeros_like(x, dtype=eps_update_src.dtype)
+        index = col.unsqueeze(1).expand_as(eps_update_src)
+        eps.scatter_add_(0, index, eps_update_src)
+        if self.eps_normalize_agg:
+            in_degree = degree(col, num_nodes=x.size(0), dtype=x.dtype).to(x.device).unsqueeze(1)
+            eps = eps / (in_degree + 1.0)
+        if self.eps_use_local_head:
+            eps = eps + self.eps_head(torch.cat([h, x], dim=-1))
+        return eps
+
+    def forward(self, h, x, edge_index):
         h = self.embedding_in(h)
-        for layer in self.gcl_layers:
-            h, x = layer(h, x, edge_index, edge_attr=edge_attr)
-        return h, x
+        for i in range(0, self.num_layers):
+            h, x = getattr(self, f'gcl_{i}')(h, x, edge_index)
+        eps = self.predict_epsilon(h, x, edge_index)
+        return h, x, eps
 
 
 class PytorchLightningModule(pl.LightningModule):
-    def __init__(self, hidden_dim, num_layers, num_timesteps, batch_size, lr, scheduler_patience=30):
+    def __init__(self, hidden_dim, num_layers, num_timesteps, batch_size, lr, beta_schedule='cosine'):
         super().__init__()
         self.save_hyperparameters()
 
@@ -143,12 +192,12 @@ class PytorchLightningModule(pl.LightningModule):
         self.time_mlp = SinusoidalPositionalEmbeddings(self.time_emb_dim)
 
         self.gnn = EGNNDiff(
-            in_node_nf=self.n_atom_types + self.time_emb_dim + len(base_to_idx) + 1,  # + time_emb_dim for time embedding, +4 for base types, +1 for has_pair
+            in_node_nf=self.n_atom_types + self.time_emb_dim + len(base_to_idx) + 1,
             hidden_nf=hidden_dim,
-            num_layers=num_layers
+            num_layers=num_layers,
         )
 
-        betas = get_beta_schedule('cosine', num_timesteps=num_timesteps)
+        betas = get_beta_schedule(beta_schedule, num_timesteps=num_timesteps)
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.)
@@ -160,35 +209,12 @@ class PytorchLightningModule(pl.LightningModule):
         # For q_sample
         self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
         self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
-        self.register_buffer('sqrt_recip_alphas_cumprod', torch.sqrt(1. / alphas_cumprod))
 
         # For p_sample
         self.register_buffer('posterior_variance', betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod))
         self.register_buffer('posterior_log_variance_clipped', torch.log(getattr(self, 'posterior_variance').clamp(min=1e-20)))
         self.register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         self.register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
-
-    def _get_target_graph_index(self, batch, target_mask):
-        if hasattr(batch, 'batch') and batch.batch is not None and batch.batch.numel() == batch.x.size(0):
-            return batch.batch[target_mask].long()
-        return torch.zeros(target_mask.sum(), device=target_mask.device, dtype=torch.long)
-
-    def _get_node_graph_index(self, batch):
-        if hasattr(batch, 'batch') and batch.batch is not None and batch.batch.numel() == batch.x.size(0):
-            return batch.batch.long()
-        return torch.zeros(batch.x.size(0), device=batch.x.device, dtype=torch.long)
-
-    def _center_by_graph(self, pos, graph_idx):
-        if pos.numel() == 0:
-            return pos
-        num_graphs = int(graph_idx.max().item()) + 1
-        graph_sum = torch.zeros(num_graphs, pos.size(-1), device=pos.device, dtype=pos.dtype)
-        graph_sum.index_add_(0, graph_idx, pos)
-        graph_count = torch.zeros(num_graphs, 1, device=pos.device, dtype=pos.dtype)
-        graph_count.index_add_(0, graph_idx, torch.ones(pos.size(0), 1, device=pos.device, dtype=pos.dtype))
-        # Keep coordinates in the zero center-of-gravity subspace to prevent global translation drift.
-        graph_mean = graph_sum / graph_count.clamp(min=1.0)
-        return pos - graph_mean[graph_idx]
 
     def on_test_start(self):
         if self.trainer.is_global_zero:
@@ -214,83 +240,67 @@ class PytorchLightningModule(pl.LightningModule):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def p_losses(self, batch, t):
-        target_mask = batch.central_mask & batch.backbone_mask
-        target_graph_idx = self._get_target_graph_index(batch, target_mask)
-        node_graph_idx = self._get_node_graph_index(batch)
-        pos_start = batch.pos[target_mask]
+    def _expand_node_t(self, batch, t):
+        num_nodes = batch.x.size(0)
+        num_graphs = getattr(batch, 'num_graphs', None)
+        if t.numel() == 1:
+            node_t = t.expand(num_nodes)
+        elif hasattr(batch, 'batch') and num_graphs is not None and t.numel() == num_graphs:
+            node_t = t[batch.batch]
+        elif t.numel() == num_nodes:
+            node_t = t
+        else:
+            raise ValueError('Unsupported t shape.')
+        return node_t.long()
 
-        noise_pos = torch.randn_like(pos_start)
-        target_t = t[target_graph_idx]
-        pos_noisy = self.q_sample(pos_start, target_t, noise_pos=noise_pos)
-
-        # Create complete graph with noisy target
-        h = batch.x.clone()
-        pos = batch.pos.clone()
-        # Use ground truth atom names (conditioning)
-        pos[target_mask] = pos_noisy
-
-        # Add time embedding, base types, and has_pair information
-        t_emb = self.time_mlp(t)
-        time_emb = t_emb[node_graph_idx]
+    def _build_node_features(self, batch, node_t):
+        t_emb = self.time_mlp(node_t.float())
         has_pair_expanded = batch.has_pair.float().unsqueeze(1)
-        h = torch.cat([h, time_emb, batch.base_types, has_pair_expanded], dim=1)
+        return torch.cat([batch.x, t_emb, batch.base_types, has_pair_expanded], dim=1)
 
-        # v-target: v = sqrt_alpha_t * eps - sqrt_one_minus_alpha_t * x0
-        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, target_t, pos_start.shape)
-        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, target_t, pos_start.shape)
-        v_target = sqrt_alphas_cumprod_t * noise_pos - sqrt_one_minus_alphas_cumprod_t * pos_start
+    def _predict_noise(self, batch, target_mask, pos_target, node_t):
+        h = self._build_node_features(batch, node_t)
+        pos = batch.pos.clone()
+        pos[target_mask] = pos_target
+        _, _, eps_out = self.gnn(h, pos, batch.edge_index)
+        return eps_out[target_mask]
 
-        _, pos_out = self.gnn(h, pos, batch.edge_index)
+    def _decode_epsilon_to_x0(self, pos_noisy, pred_noise_pos, target_t):
+        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, target_t, pos_noisy.shape).clamp(min=1e-8)
+        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, target_t, pos_noisy.shape).clamp(min=1e-8)
+        return (pos_noisy - sqrt_one_minus_alphas_cumprod_t * pred_noise_pos) / sqrt_alphas_cumprod_t
 
-        pred_v = pos_out[target_mask]
-        pos_loss = F.mse_loss(pred_v, v_target)
-
-        return pos_loss
+    def _compute_eps_losses(self, pred_noise_pos, noise_pos):
+        eps_mse = F.mse_loss(pred_noise_pos, noise_pos)
+        eps_rmse = torch.sqrt(eps_mse)
+        return eps_mse, eps_rmse
 
     @torch.no_grad()
     def p_sample(self, pos_t, t, batch):
         target_mask = batch.central_mask & batch.backbone_mask
+        node_t = self._expand_node_t(batch, t)
+        target_t = node_t[target_mask]
 
-        # Create complete graph with noisy target
-        h = batch.x.clone()
-        pos = batch.pos.clone()
-        # Use ground truth atom names (conditioning)
-        pos[target_mask] = pos_t
+        model_output = self._predict_noise(batch, target_mask, pos_t, node_t)
+        pred_pos_start = self._decode_epsilon_to_x0(pos_t, model_output, target_t)
+        model_mean_pos, _, model_log_variance_pos = self.q_posterior_mean_variance(x_start=pred_pos_start, x_t=pos_t, t=target_t)
 
-        # Add time embedding, base types, and has_pair information
-        t_emb = self.time_mlp(t)
-        time_emb = t_emb.repeat(h.size(0), 1)
-        has_pair_expanded = batch.has_pair.float().unsqueeze(1)
-        h = torch.cat([h, time_emb, batch.base_types, has_pair_expanded], dim=1)
-
-        _, x_out = self.gnn(h, pos, batch.edge_index)
-
-        # Recover x0 from v-prediction: x0 = sqrt_alpha_t * x_t - sqrt_one_minus_alpha_t * v
-        pred_v = x_out[target_mask]
-        sqrt_alphas_cumprod_t = extract(self.sqrt_alphas_cumprod, t, pos_t.shape)
-        sqrt_one_minus_alphas_cumprod_t = extract(self.sqrt_one_minus_alphas_cumprod, t, pos_t.shape)
-        pred_pos_start = sqrt_alphas_cumprod_t * pos_t - sqrt_one_minus_alphas_cumprod_t * pred_v
-        model_mean_pos, _, model_log_variance_pos = self.q_posterior_mean_variance(x_start=pred_pos_start, x_t=pos_t, t=t)
-
-        if t[0] > 0:
-            noise_pos = torch.randn_like(pos_t)
-        else:
-            noise_pos = 0.
-
-        pred_pos = model_mean_pos + (0.5 * model_log_variance_pos).exp() * noise_pos
+        noise_pos = torch.randn_like(pos_t)
+        nonzero_mask = (target_t > 0).float().unsqueeze(1)
+        pred_pos = model_mean_pos + (0.5 * model_log_variance_pos).exp() * noise_pos * nonzero_mask
 
         return pred_pos
 
     def training_step(self, batch, _):
-        if hasattr(batch, 'num_graphs'):
-            num_graphs = int(batch.num_graphs)
-        else:
-            num_graphs = 1
-        t = torch.randint(0, getattr(self.hparams, 'num_timesteps'), (num_graphs,), device=self.device).long()
-
-        mse_loss = self.p_losses(batch, t)
-        self.log('train_mse', mse_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
+        target_mask = batch.central_mask & batch.backbone_mask
+        pos_start = batch.pos[target_mask]
+        t = torch.randint(0, getattr(self.hparams, 'num_timesteps'), (1,), device=self.device).long()
+        node_t = self._expand_node_t(batch, t)
+        target_t = node_t[target_mask]
+        noise_pos = torch.randn_like(pos_start)
+        pos_noisy = self.q_sample(pos_start, target_t, noise_pos=noise_pos)
+        model_output = self._predict_noise(batch, target_mask, pos_noisy, node_t)
+        mse_loss = F.mse_loss(model_output, noise_pos)
 
         rmse_loss = torch.sqrt(mse_loss)
         self.log('train_rmse', rmse_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
@@ -300,7 +310,15 @@ class PytorchLightningModule(pl.LightningModule):
     def _get_generations(self, batch):
         target_mask = batch.central_mask & batch.backbone_mask
         true_pos = batch.pos[target_mask]
-        pred_pos = self.sample(batch)
+        eval_t = torch.tensor([max(1, getattr(self.hparams, 'num_timesteps') // 2)], device=batch.pos.device, dtype=torch.long)
+        node_t = self._expand_node_t(batch, eval_t)
+        target_t = node_t[target_mask]
+        generator = torch.Generator(device='cpu')
+        generator.manual_seed(0)
+        noise_pos = torch.randn(true_pos.shape, generator=generator, dtype=true_pos.dtype).to(true_pos.device)
+        pos_noisy = self.q_sample(true_pos, target_t, noise_pos=noise_pos)
+        model_output = self._predict_noise(batch, target_mask, pos_noisy, node_t)
+        pred_pos = self._decode_epsilon_to_x0(pos_noisy, model_output, target_t)
 
         return true_pos, pred_pos
 
@@ -321,7 +339,7 @@ class PytorchLightningModule(pl.LightningModule):
 
         scheduler = ReduceLROnPlateau(
             optimizer,
-            patience=getattr(self.hparams, 'scheduler_patience'),
+            patience=30,
             cooldown=20,
             factor=0.5,
             mode='min'
@@ -338,7 +356,6 @@ class PytorchLightningModule(pl.LightningModule):
     @torch.no_grad()
     def sample(self, batch):
         target_mask = batch.central_mask & batch.backbone_mask
-        target_graph_idx = self._get_target_graph_index(batch, target_mask)
         n_samples = int(target_mask.sum().item())
 
         device = torch.device(getattr(self.betas, 'device'))

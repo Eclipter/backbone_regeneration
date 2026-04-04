@@ -294,49 +294,6 @@ def rename_atom(atom_name):
         return atom_name
 
 
-class VisualizationCallback(pl.Callback):
-    @rank_zero_only
-    def on_validation_end(self, trainer, pl_module):
-        val_dataloader = getattr(trainer, 'datamodule').val_dataloader()
-        batch_or_data = next(iter(val_dataloader))
-
-        # Handle both Batch and single Data objects
-        if hasattr(batch_or_data, 'get_example'):
-            # It's a Batch object, get the first graph
-            graph = batch_or_data.get_example(0)
-        else:
-            # It's a single Data object
-            graph = batch_or_data
-
-        graph = graph.to(pl_module.device)
-
-        true_pos, pred_pos = getattr(pl_module, '_get_generations')(graph)
-
-        # Reconstruct atom_names_idx
-        target_mask = graph.central_mask & graph.backbone_mask
-        atom_names_idx = torch.argmax(graph.x[target_mask], dim=1)
-        idx_to_atom = {i: atom for atom, i in atom_to_idx.items()}
-
-        # Use the same labels for both true and pred since we don't predict atom types
-        atom_names = [f'{idx_to_atom[int(i.item())]}' for i in atom_names_idx]
-
-        true_labels = [f'true_{name}' for name in atom_names]
-        pred_labels = [f'pred_{name}' for name in atom_names]
-
-        all_pos = torch.cat([true_pos, pred_pos], dim=0)
-        all_labels = true_labels + pred_labels
-
-        getattr(trainer.logger, 'experiment').add_embedding(
-            all_pos,
-            metadata=all_labels,
-            global_step=trainer.global_step
-        )
-        # Save graph used for embedding so visualization can load matching sample
-        graph_cpu = graph.cpu()
-        save_path = os.path.join(str(getattr(trainer.logger, 'log_dir')), 'embedding_graph.pt')
-        torch.save(graph_cpu, save_path)
-
-
 if __name__ == '__main__':
     pdb_ids = get_pdb_ids()
 

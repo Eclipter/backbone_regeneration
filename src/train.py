@@ -15,7 +15,6 @@ from pytorch_lightning.strategies import DDPStrategy
 import config
 from dataset import DNADataModule
 from model import PytorchLightningModule
-from utils import VisualizationCallback
 
 # Suppress PyTorch FutureWarning about functools.partial in DDP comm hooks (Python 3.13 compatibility)
 warnings.filterwarnings('ignore', category=FutureWarning, module='torch.distributed.algorithms.ddp_comm_hooks')
@@ -81,7 +80,6 @@ def main():
         callbacks=[
             checkpoint_callback,
             # swa,
-            # VisualizationCallback()
         ],
         profiler=config.PROFILER,
         enable_progress_bar=False,

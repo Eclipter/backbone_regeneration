@@ -1,18 +1,18 @@
 HIDDEN_DIM = 256
 NUM_LAYERS = 5
-NUM_TIMESTEPS = 1000
+NUM_TIMESTEPS = 200
 BATCH_SIZE = 2**11
-LR = 1e-3
+LR = 1e-4
 
 # Set RUN_NAME if you want to have a custom name for the run instead of the current time
 # To run in a folder, set RUN_NAME to "folder/run_name"
-RUN_NAME = f'overfit1graph_{HIDDEN_DIM}_{NUM_LAYERS}_{NUM_TIMESTEPS}_{LR}'
-RUN_NAME = 'test'
+RUN_NAME = f'mse/{HIDDEN_DIM}_{NUM_LAYERS}_{NUM_TIMESTEPS}_{LR}'
+# RUN_NAME = 'test'
 
 START_FROM_LAST_CKPT = False
 
 # None | 'simple' | 'advanced'
-PROFILER = None
+PROFILER = 'simple'
 
 # MAJOR:
 # TODO: diffuse inside latent space instead of the euclidean one

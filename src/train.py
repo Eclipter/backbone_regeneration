@@ -7,9 +7,10 @@ from datetime import datetime
 
 import pytorch_lightning as pl
 import torch
-from pytorch_lightning.callbacks import (EarlyStopping, ModelCheckpoint,
+from pytorch_lightning.callbacks import (ModelCheckpoint,
                                          StochasticWeightAveraging)
 from pytorch_lightning.loggers import TensorBoardLogger
+from pytorch_lightning.strategies import DDPStrategy
 
 import config
 from dataset import DNADataModule
@@ -58,25 +59,27 @@ def main():
         save_last=True,
         enable_version_counter=False
     )
-    early_stopping_callback = EarlyStopping(
-        monitor='val_rmse',
-        patience=200,
-    )
     swa = StochasticWeightAveraging(
         swa_lrs=0.1*config.LR,
         swa_epoch_start=100
     )
 
+    strategy = (
+        DDPStrategy(find_unused_parameters=True)
+        if torch.cuda.device_count() > 1
+        else 'auto'
+    )
+
     # Initialize trainer
     trainer = pl.Trainer(
         gradient_clip_val=1,
-        max_epochs=-1,
-        devices=1,
-        overfit_batches=1,
+        max_epochs=400,
+        # overfit_batches=1,
+        log_every_n_steps=-1,
+        strategy=strategy,
         logger=logger,
         callbacks=[
             checkpoint_callback,
-            # early_stopping_callback,
             # swa,
             VisualizationCallback()
         ],

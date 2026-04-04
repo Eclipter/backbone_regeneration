@@ -1,9 +1,12 @@
+name: backbone_regen
+
 channels:
   - conda-forge
 
 dependencies:
   - pip
   - tensorboard
+  - plotly
 
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu129

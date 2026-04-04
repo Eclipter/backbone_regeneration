@@ -73,7 +73,7 @@ def main():
     # Initialize trainer
     trainer = pl.Trainer(
         gradient_clip_val=1,
-        max_epochs=400,
+        max_epochs=300,
         # overfit_batches=1,
         log_every_n_steps=-1,
         strategy=strategy,
@@ -81,7 +81,7 @@ def main():
         callbacks=[
             checkpoint_callback,
             # swa,
-            VisualizationCallback()
+            # VisualizationCallback()
         ],
         profiler=config.PROFILER,
         enable_progress_bar=False,

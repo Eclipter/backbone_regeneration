@@ -1,12 +1,12 @@
 HIDDEN_DIM = 256
 NUM_LAYERS = 5
-NUM_TIMESTEPS = 200
+NUM_TIMESTEPS = 1000
 BATCH_SIZE = 2**11
-LR = 1e-4
+LR = 1e-3
 
 # Set RUN_NAME if you want to have a custom name for the run instead of the current time
 # To run in a folder, set RUN_NAME to "folder/run_name"
-RUN_NAME = f'mse/{HIDDEN_DIM}_{NUM_LAYERS}_{NUM_TIMESTEPS}_{LR}'
+RUN_NAME = f'v_pred/{HIDDEN_DIM}_{NUM_LAYERS}_{NUM_TIMESTEPS}_{LR}'
 # RUN_NAME = 'test'
 
 START_FROM_LAST_CKPT = False

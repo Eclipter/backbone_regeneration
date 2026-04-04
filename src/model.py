@@ -122,15 +122,15 @@ class EGNNDiff(nn.Module):
 
         self.embedding_in = nn.Linear(in_node_nf, self.hidden_nf)
 
-        for i in range(0, num_layers):
-            self.add_module(f'gcl_{i}', EquivariantConv(self.hidden_nf, act_fn=act_fn))
+        self.gcl_layers = nn.ModuleList(
+            [EquivariantConv(self.hidden_nf, act_fn=act_fn) for _ in range(num_layers)]
+        )
 
     def forward(self, h, x, edge_index, edge_attr=None):
         h = self.embedding_in(h)
-        for i in range(0, self.num_layers):
-            h, x = getattr(self, f'gcl_{i}')(h, x, edge_index, edge_attr=edge_attr)
-        eps = self.predict_epsilon(h, x, edge_index)
-        return h, x, eps
+        for layer in self.gcl_layers:
+            h, x = layer(h, x, edge_index, edge_attr=edge_attr)
+        return h, x
 
 
 class PytorchLightningModule(pl.LightningModule):
@@ -148,7 +148,7 @@ class PytorchLightningModule(pl.LightningModule):
             num_layers=num_layers
         )
 
-        betas = get_beta_schedule('linear', num_timesteps=num_timesteps)
+        betas = get_beta_schedule('cosine', num_timesteps=num_timesteps)
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.)
@@ -172,6 +172,11 @@ class PytorchLightningModule(pl.LightningModule):
         if hasattr(batch, 'batch') and batch.batch is not None and batch.batch.numel() == batch.x.size(0):
             return batch.batch[target_mask].long()
         return torch.zeros(target_mask.sum(), device=target_mask.device, dtype=torch.long)
+
+    def _get_node_graph_index(self, batch):
+        if hasattr(batch, 'batch') and batch.batch is not None and batch.batch.numel() == batch.x.size(0):
+            return batch.batch.long()
+        return torch.zeros(batch.x.size(0), device=batch.x.device, dtype=torch.long)
 
     def _center_by_graph(self, pos, graph_idx):
         if pos.numel() == 0:
@@ -211,10 +216,13 @@ class PytorchLightningModule(pl.LightningModule):
 
     def p_losses(self, batch, t):
         target_mask = batch.central_mask & batch.backbone_mask
+        target_graph_idx = self._get_target_graph_index(batch, target_mask)
+        node_graph_idx = self._get_node_graph_index(batch)
         pos_start = batch.pos[target_mask]
 
         noise_pos = torch.randn_like(pos_start)
-        pos_noisy = self.q_sample(pos_start, t, noise_pos=noise_pos)
+        target_t = t[target_graph_idx]
+        pos_noisy = self.q_sample(pos_start, target_t, noise_pos=noise_pos)
 
         # Create complete graph with noisy target
         h = batch.x.clone()
@@ -224,7 +232,7 @@ class PytorchLightningModule(pl.LightningModule):
 
         # Add time embedding, base types, and has_pair information
         t_emb = self.time_mlp(t)
-        time_emb = t_emb.repeat(h.size(0), 1)
+        time_emb = t_emb[node_graph_idx]
         has_pair_expanded = batch.has_pair.float().unsqueeze(1)
         h = torch.cat([h, time_emb, batch.base_types, has_pair_expanded], dim=1)
 
@@ -232,7 +240,7 @@ class PytorchLightningModule(pl.LightningModule):
 
         # Position loss (model predicts epsilon directly)
         pred_noise_pos = pos_out[target_mask]
-        pos_loss = torch.sqrt(F.mse_loss(pred_noise_pos, noise_pos))
+        pos_loss = F.mse_loss(pred_noise_pos, noise_pos)
 
         return pos_loss
 
@@ -271,12 +279,19 @@ class PytorchLightningModule(pl.LightningModule):
         return pred_pos
 
     def training_step(self, batch, _):
-        t = torch.randint(0, getattr(self.hparams, 'num_timesteps'), (1,), device=self.device).long()
-        loss = self.p_losses(batch, t)
+        if hasattr(batch, 'num_graphs'):
+            num_graphs = int(batch.num_graphs)
+        else:
+            num_graphs = 1
+        t = torch.randint(0, getattr(self.hparams, 'num_timesteps'), (num_graphs,), device=self.device).long()
 
-        self.log('train_rmse', loss, on_step=False, on_epoch=True, sync_dist=True)
+        mse_loss = self.p_losses(batch, t)
+        self.log('train_mse', mse_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
 
-        return loss
+        rmse_loss = torch.sqrt(mse_loss)
+        self.log('train_rmse', rmse_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
+
+        return mse_loss
 
     def _get_generations(self, batch):
         target_mask = batch.central_mask & batch.backbone_mask
@@ -289,13 +304,13 @@ class PytorchLightningModule(pl.LightningModule):
         true_pos, pred_pos = self._get_generations(batch)
 
         rmse = torch.sqrt(F.mse_loss(pred_pos, true_pos))
-        self.log('val_rmse', rmse, on_step=False, on_epoch=True, sync_dist=True)
+        self.log('val_rmse', rmse, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
 
     def test_step(self, batch, _):
         true_pos, pred_pos = self._get_generations(batch)
 
         rmse = torch.sqrt(F.mse_loss(pred_pos, true_pos))
-        self.log('test_rmse', rmse, on_step=False, on_epoch=True, sync_dist=True)
+        self.log('test_rmse', rmse, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
 
     def configure_optimizers(self):  # type: ignore[override]
         optimizer = torch.optim.AdamW(self.parameters(), lr=getattr(self.hparams, 'lr'), betas=(0.9, 0.999))
@@ -303,7 +318,7 @@ class PytorchLightningModule(pl.LightningModule):
         scheduler = ReduceLROnPlateau(
             optimizer,
             patience=getattr(self.hparams, 'scheduler_patience'),
-            cooldown=15,
+            cooldown=30,
             factor=0.5,
             mode='min'
         )

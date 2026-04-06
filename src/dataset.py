@@ -3,6 +3,7 @@ import multiprocessing as mp
 import os
 import os.path as osp
 import shutil
+import tempfile
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Optional, cast
@@ -18,6 +19,7 @@ from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
+import config
 import utils
 from pynamod import CG_Structure
 
@@ -66,7 +68,10 @@ class PyGDataset(Dataset):
         pdb_ids_to_download = [
             pdb_id
             for pdb_id in self.pdb_ids
-            if not osp.exists(osp.join(self.raw_dir, f'{pdb_id}.cif'))
+            if (
+                not osp.exists(osp.join(self.raw_dir, f'{pdb_id}.cif'))
+                or osp.getsize(osp.join(self.raw_dir, f'{pdb_id}.cif')) == 0
+            )
         ]
 
         with ThreadPoolExecutor() as executor:
@@ -86,25 +91,53 @@ class PyGDataset(Dataset):
 
     def download_file(self, pdb_id):
         use_mirror = False
+        path = osp.join(self.raw_dir, f'{pdb_id}.cif')
         if not use_mirror:
             url = f'https://files.rcsb.org/download/{pdb_id}.cif'
-            response = requests.get(url)
+            response = requests.get(url, timeout=60)
+            response.raise_for_status()
+            if not response.content:
+                raise ValueError(f'Empty mmCIF response for {pdb_id}')
 
-            path = osp.join(self.raw_dir, f'{pdb_id}.cif')
-            open(path, 'wb').write(response.content)
+            # Write into a temporary file first to avoid leaving empty targets behind.
+            fd, tmp_path = tempfile.mkstemp(dir=self.raw_dir, suffix='.cif.tmp')
+            try:
+                with os.fdopen(fd, 'wb') as out_file:
+                    out_file.write(response.content)
+                os.replace(tmp_path, path)
+            except Exception:
+                if osp.exists(tmp_path):
+                    os.remove(tmp_path)
+                raise
         else:
             url = f'https://files.wwpdb.org/pub/pdb/data/structures/all/mmCIF/{pdb_id.lower()}.cif.gz'
-            response = requests.get(url, stream=True)
+            response = requests.get(url, stream=True, timeout=60)
             response.raise_for_status()
 
-            path = osp.join(self.raw_dir, f'{pdb_id}.cif')
+            fd, tmp_path = tempfile.mkstemp(dir=self.raw_dir, suffix='.cif.tmp')
             if url.endswith('.gz'):
-                response.raw.decode_content = True
-                with gzip.GzipFile(fileobj=response.raw) as gz_stream, open(path, 'wb') as out_file:
-                    shutil.copyfileobj(gz_stream, out_file)
+                try:
+                    response.raw.decode_content = True
+                    with gzip.GzipFile(fileobj=response.raw) as gz_stream, os.fdopen(fd, 'wb') as out_file:
+                        shutil.copyfileobj(gz_stream, out_file)
+                    if osp.getsize(tmp_path) == 0:
+                        raise ValueError(f'Empty mmCIF response for {pdb_id}')
+                    os.replace(tmp_path, path)
+                except Exception:
+                    if osp.exists(tmp_path):
+                        os.remove(tmp_path)
+                    raise
             else:
-                with open(path, 'wb') as out_file:
-                    out_file.write(response.content)
+                try:
+                    with os.fdopen(fd, 'wb') as out_file:
+                        out_file.write(response.content)
+                    if osp.getsize(tmp_path) == 0:
+                        raise ValueError(f'Empty mmCIF response for {pdb_id}')
+                    os.replace(tmp_path, path)
+                except Exception:
+                    if osp.exists(tmp_path):
+                        os.remove(tmp_path)
+                    raise
 
     def process(self):
         shutil.rmtree(self.processed_dir)
@@ -268,6 +301,7 @@ class DNADataModule(pl.LightningDataModule):
         self.val_ratio = val_ratio
 
         self.num_workers = 4
+        self.train_generator = torch.Generator().manual_seed(config.SEED)
 
     def prepare_data(self):
         # Download and process data
@@ -276,7 +310,7 @@ class DNADataModule(pl.LightningDataModule):
     def setup(self, stage: Optional[str] = None):
         dataset = PyGDataset()
 
-        indices = np.random.permutation(len(dataset)).tolist()
+        indices = np.random.default_rng(config.SEED).permutation(len(dataset)).tolist()
         train_val_split = int(len(indices) * self.train_ratio)
         val_test_split = int(len(indices) * (self.train_ratio + self.val_ratio))
 
@@ -293,6 +327,7 @@ class DNADataModule(pl.LightningDataModule):
             cast(Dataset, self.train_dataset),
             batch_size=self.batch_size,
             shuffle=True,
+            generator=self.train_generator,
             num_workers=self.num_workers,
             persistent_workers=True,
             multiprocessing_context='spawn'

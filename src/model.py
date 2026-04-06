@@ -327,11 +327,11 @@ class PytorchLightningModule(pl.LightningModule):
         self.log('test_rmse', rmse, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
 
     def configure_optimizers(self):  # type: ignore[override]
-        optimizer = torch.optim.AdamW(self.parameters(), lr=getattr(self.hparams, 'lr'), betas=(0.9, 0.999))
+        optimizer = torch.optim.AdamW(self.parameters(), lr=getattr(self.hparams, 'lr'))
 
         scheduler = ReduceLROnPlateau(
             optimizer,
-            patience=30,
+            patience=50,
             cooldown=20,
             factor=0.5,
             mode='min'

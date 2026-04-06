@@ -22,6 +22,7 @@ warnings.filterwarnings('ignore', category=FutureWarning, module='torch.distribu
 
 def main():
     torch.set_float32_matmul_precision('high')
+    pl.seed_everything(config.SEED, workers=True)
 
     data_module = DNADataModule(batch_size=config.BATCH_SIZE)
     pl_module = PytorchLightningModule(
@@ -52,6 +53,8 @@ def main():
     # Initialize callbacks
     checkpoint_callback = ModelCheckpoint(
         monitor='val_rmse',
+        every_n_epochs=5,
+        save_top_k=10,
         save_last=True,
         enable_version_counter=False
     )
@@ -70,8 +73,7 @@ def main():
 
     # Initialize trainer
     trainer = pl.Trainer(
-        max_epochs=300,
-        # overfit_batches=1,
+        max_epochs=config.NUM_EPOCHS,
         gradient_clip_val=1,
         log_every_n_steps=-1,
         num_nodes=num_nodes,

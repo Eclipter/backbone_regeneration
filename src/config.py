@@ -10,7 +10,7 @@ LR = 1e-3
 ## Training parameters ##
 SEED = 42
 
-NUM_EPOCHS = 1000
+NUM_EPOCHS = 200
 
 # Set RUN_NAME if you want to have a custom name for the run instead of the current time
 # To run in a folder, set RUN_NAME to "folder/run_name"

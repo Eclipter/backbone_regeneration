@@ -3,12 +3,10 @@ import tempfile
 from functools import lru_cache
 
 import MDAnalysis as mda
-import pytorch_lightning as pl
 import requests
 import torch
 from Bio.PDB.MMCIFParser import MMCIFParser
 from Bio.PDB.PDBIO import PDBIO, Select
-from lightning_fabric.utilities.rank_zero import rank_zero_only
 
 from pynamod.atomic_analysis.nucleotides_parser import build_graph, get_base_u
 

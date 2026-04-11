@@ -75,6 +75,7 @@ def main():
     trainer = pl.Trainer(
         max_epochs=config.NUM_EPOCHS,
         gradient_clip_val=1,
+        precision='16-mixed',
         log_every_n_steps=-1,
         num_nodes=num_nodes,
         strategy=strategy,

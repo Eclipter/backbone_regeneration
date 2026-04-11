@@ -309,22 +309,22 @@ class PytorchLightningModule(pl.LightningModule):
         pos_noisy = self.q_sample(pos_start, target_t, noise_pos=noise_pos)
         model_output = self._predict_noise(batch, target_mask, pos_noisy, node_t)
         rmse_loss = torch.sqrt(F.mse_loss(model_output, noise_pos))
-        self.log('train_rmse', rmse_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
+        self.log('train_rmse_step', rmse_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
 
         return rmse_loss
 
-    # def on_train_epoch_end(self):
-    #     metric = self.trainer.callback_metrics['train_rmse']
-    #     self.logger.experiment.add_scalar('epoch/train_rmse', metric, self.current_epoch)  # type: ignore
+    def on_train_epoch_end(self):
+        metric = self.trainer.callback_metrics['train_rmse_step']
+        self.logger.experiment.add_scalar('train_rmse', metric, self.current_epoch)  # type: ignore
 
     def validation_step(self, batch, _):
         true_pos, gen_pos = self.p_sample_loop(batch)
         rmse = torch.sqrt(F.mse_loss(gen_pos, true_pos))
-        self.log('val_rmse', rmse, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
+        self.log('val_rmse_step', rmse, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
 
-    # def on_validation_epoch_end(self):
-    #     metric = self.trainer.callback_metrics['val_rmse']
-    #     self.logger.experiment.add_scalar('epoch/val_rmse', metric, self.current_epoch)  # type: ignore
+    def on_validation_epoch_end(self):
+        metric = self.trainer.callback_metrics['val_rmse_step']
+        self.logger.experiment.add_scalar('val_rmse', metric, self.current_epoch)  # type: ignore
 
     def test_step(self, batch, _):
         true_pos, gen_pos = self.p_sample_loop(batch)
@@ -336,8 +336,8 @@ class PytorchLightningModule(pl.LightningModule):
 
         scheduler = ReduceLROnPlateau(
             optimizer,
-            patience=30,
-            cooldown=10,
+            patience=20,
+            cooldown=15,
             threshold=0.2
         )
 

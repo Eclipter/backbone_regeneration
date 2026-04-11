@@ -38,17 +38,19 @@ def main():
     ckpt_path = None
     if config.RUN_NAME:
         run_name = config.RUN_NAME
+        run_version = config.RUN_VERSION
         if config.START_FROM_LAST_CKPT:
-            candidate = osp.join(log_dir, run_name, 'checkpoints', 'last.ckpt')
+            candidate = osp.join(log_dir, run_version, 'checkpoints', 'last.ckpt')
             ckpt_path = candidate if osp.isfile(candidate) else None
         else:
-            run_path = osp.join(log_dir, run_name)
+            run_path = osp.join(log_dir, run_name, run_version)
             shutil.rmtree(run_path, ignore_errors=True)
     else:
         run_name = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')
+        run_version = config.RUN_VERSION
     pl_logger = logging.getLogger('pytorch_lightning.utilities.rank_zero')
     pl_logger.addFilter(lambda r: 'litlogger' not in r.getMessage())  # Mute LitLogger tip
-    logger = TensorBoardLogger(log_dir, name='', version=run_name, default_hp_metric=False)
+    logger = TensorBoardLogger(log_dir, name=run_name, version=run_version, default_hp_metric=False)
 
     # Initialize callbacks
     checkpoint_callback = ModelCheckpoint(
@@ -74,7 +76,7 @@ def main():
     # Initialize trainer
     trainer = pl.Trainer(
         max_epochs=config.NUM_EPOCHS,
-        gradient_clip_val=1,
+        # gradient_clip_val=1,
         precision='16-mixed',
         log_every_n_steps=-1,
         num_nodes=num_nodes,

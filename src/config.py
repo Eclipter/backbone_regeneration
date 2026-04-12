@@ -7,21 +7,18 @@ LR = 1e-3
 #########################
 
 
-## Training parameters ##
+##### Run parameters ####
 SEED = 42
 
 NUM_EPOCHS = 100
 
 # Set RUN_NAME if you want to have a custom name for the run instead of the current time
 # To run in a folder, set RUN_NAME to "folder/run_name"
-RUN_NAME = 'v3/no_clip'
+RUN_NAME = 'v3/linear_scheduler'
 # RUN_NAME = 'test'
 RUN_VERSION = f'{HIDDEN_DIM}_{NUM_LAYERS}_{NUM_TIMESTEPS}_{LR}'
 
 START_FROM_LAST_CKPT = True
-
-# None | 'simple' | 'advanced'
-PROFILER = None
 #########################
 
 
@@ -33,7 +30,6 @@ PROFILER = None
 # MINOR:
 # Experiment with StochasticWeightAveraging
 # Experiment with beta schedule
-# Try L1 loss for training only
 # Consider ODE sampler over SDE one
 # Consider pairwise distance instead of RMSE
 ########################

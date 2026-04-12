@@ -33,6 +33,14 @@ def main():
         lr=config.LR
     )
 
+    strategy = (
+        DDPStrategy(find_unused_parameters=True)
+        if torch.cuda.device_count() > 1
+        else 'auto'
+    )
+
+    num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
+
     # Initialize logger
     log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'logs')
     ckpt_path = None
@@ -54,7 +62,8 @@ def main():
 
     # Initialize callbacks
     checkpoint_callback = ModelCheckpoint(
-        monitor='val_rmse',
+        filename='{epoch}',
+        monitor='val_rmse_step',
         every_n_epochs=5,
         save_top_k=10,
         save_last=True,
@@ -65,18 +74,10 @@ def main():
         swa_epoch_start=100
     )
 
-    strategy = (
-        DDPStrategy(find_unused_parameters=True)
-        if torch.cuda.device_count() > 1
-        else 'auto'
-    )
-
-    num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
-
     # Initialize trainer
     trainer = pl.Trainer(
         max_epochs=config.NUM_EPOCHS,
-        # gradient_clip_val=1,
+        gradient_clip_val=1,
         precision='16-mixed',
         log_every_n_steps=-1,
         num_nodes=num_nodes,
@@ -86,7 +87,6 @@ def main():
             checkpoint_callback,
             # swa,
         ],
-        profiler=config.PROFILER,
         enable_progress_bar=False,
         enable_model_summary=False
     )

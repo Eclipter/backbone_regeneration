@@ -195,7 +195,16 @@ class PyGDataset(Dataset):
             structure.dna.nucleotides.segids,  # type: ignore
             structure.dna.nucleotides
         ):
-            nucleotides_by_chain[segid].append(nucleotide)
+            atom_group = getattr(nucleotide, 'e_residue').atoms
+            atom0 = atom_group[0] if len(atom_group) > 0 else None
+            chain_key = ''
+            if atom0 is not None:
+                chain_key = getattr(atom0, 'chainID', '') or getattr(atom0, 'segid', '')
+            if not chain_key:
+                chain_key = segid
+            if not chain_key:
+                continue
+            nucleotides_by_chain[chain_key].append(nucleotide)
 
         # Iterate over chains
         data_idx = 0

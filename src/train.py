@@ -87,7 +87,6 @@ def main():
             checkpoint_callback,
             # swa,
         ],
-        enable_progress_bar=False,
         enable_model_summary=False
     )
 

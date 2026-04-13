@@ -183,7 +183,7 @@ class EGNNDiff(nn.Module):
 
 
 class PytorchLightningModule(pl.LightningModule):
-    def __init__(self, hidden_dim, num_layers, num_timesteps, batch_size, lr, beta_schedule='linear'):
+    def __init__(self, hidden_dim, num_layers, num_timesteps, batch_size, lr, beta_schedule='cosine'):
         super().__init__()
         self.save_hyperparameters()
 
@@ -337,8 +337,6 @@ class PytorchLightningModule(pl.LightningModule):
         scheduler = ReduceLROnPlateau(
             optimizer,
             patience=20,
-            cooldown=15,
-            threshold=0.2
         )
 
         return {

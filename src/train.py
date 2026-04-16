@@ -33,13 +33,13 @@ def main():
         lr=config.LR
     )
 
+    num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
+
     strategy = (
         DDPStrategy(find_unused_parameters=True)
-        if torch.cuda.device_count() > 1
+        if torch.cuda.device_count() > 1 or num_nodes > 1
         else 'auto'
     )
-
-    num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
 
     # Initialize logger
     log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'logs')

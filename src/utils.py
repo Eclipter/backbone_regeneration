@@ -50,7 +50,7 @@ def get_pdb_ids():
                         'attribute': 'entity_poly.rcsb_sample_sequence_length',
                         'operator': 'greater_or_equal',
                         'negation': False,
-                        'value': 3
+                        'value': 5
                     }
                 },
                 {

@@ -2,7 +2,7 @@
 HIDDEN_DIM = 256
 NUM_LAYERS = 5
 NUM_TIMESTEPS = 200
-BATCH_SIZE = 2**12
+BATCH_SIZE = 2**11
 LR = 1e-3
 #########################
 

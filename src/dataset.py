@@ -26,7 +26,7 @@ from pynamod import CG_Structure
 
 class PyGDataset(Dataset):
     def __init__(self):
-        self.window_size = 5
+        self.window_size = 3
 
         self.pdb_ids = utils.get_pdb_ids()
 

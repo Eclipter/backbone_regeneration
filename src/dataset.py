@@ -26,7 +26,7 @@ from pynamod import CG_Structure
 
 class PyGDataset(Dataset):
     def __init__(self):
-        self.window_size = 3
+        self.window_size = 5
 
         self.pdb_ids = utils.get_pdb_ids()
 
@@ -309,7 +309,7 @@ class DNADataModule(pl.LightningDataModule):
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
 
-        self.num_workers = 4
+        self.num_workers = len(os.sched_getaffinity(0))
         self.train_generator = torch.Generator().manual_seed(config.SEED)
 
     def prepare_data(self):

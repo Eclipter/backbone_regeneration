@@ -14,7 +14,7 @@ NUM_EPOCHS = 100
 
 # Set RUN_NAME if you want to have a custom name for the run instead of the current time
 # To run in a folder, set RUN_NAME to "folder/run_name"
-RUN_NAME = 'v4/lr_scheduler'
+RUN_NAME = 'window_size_5/reproduce'
 # RUN_NAME = 'test'
 RUN_VERSION = f'{HIDDEN_DIM}_{NUM_LAYERS}_{NUM_TIMESTEPS}_{LR}'
 

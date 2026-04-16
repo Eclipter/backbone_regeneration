@@ -336,7 +336,8 @@ class PytorchLightningModule(pl.LightningModule):
 
         scheduler = ReduceLROnPlateau(
             optimizer,
-            patience=20,
+            patience=10,
+            threshold=0.1
         )
 
         return {

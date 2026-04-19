@@ -592,38 +592,105 @@ _mode_colors = {'central': 'indigo', 'edge': 'violet'}
 _mode_labels = {'central': 'остов центрального нуклеотида', 'edge': 'остов краевого нуклеотида'}
 _type_cfg = {
     'train': {'tag': 'train_rmse', 'title': 'Функция потерь во время тренировки',
-              'plot_name': 'training_curve.png', 'yscale': 'linear',
-              'ylabel': 'RMSE (Å)'},
+              'plot_name': 'training_curve.png', 'broken': False},
     'val':   {'tag': 'val_rmse',   'title': 'Функция потерь во время валидации',
-              'plot_name': 'validation_curve.png', 'yscale': 'log',
-              'ylabel': 'log(RMSE) (logÅ)'},
+              'plot_name': 'validation_curve.png', 'broken': True},
 }
 
+
 for type, cfg in _type_cfg.items():
-    fig, ax = plt.subplots(figsize=(10, 6))
+    if cfg['broken']:
+        # Derive two breaks from data: one between each curve's starting value,
+        # and one below the lower start down to a fixed visual floor (3 Å).
+        starts = sorted(
+            [float(wide_scalars_per_mode[m][cfg['tag']].dropna().iloc[0]) for m in _mode_list],
+            reverse=True
+        )
+        start_hi, start_lo = starts[0], starts[1]
+        all_vals = np.concatenate([
+            wide_scalars_per_mode[m][cfg['tag']].dropna().to_numpy()
+            for m in _mode_list
+        ])
+        y_min = float(np.nanmin(all_vals))
 
-    ax.tick_params(axis='both', labelsize=15)
-    sns.despine(ax=ax, top=True, right=True)
+        rel = 0.05  # relative padding around each start
+        top_seg = (start_hi * (1 - rel), start_hi * (1 + rel))
+        mid_seg = (start_lo * (1 - rel), start_lo * (1 + rel))
+        bot_seg = (max(0.0, y_min * 0.9), 3.0)
 
-    for target_mode in _mode_list:
-        wide_scalars = wide_scalars_per_mode[target_mode]
-        sns.lineplot(
-            data=wide_scalars,
-            x='epoch',
-            y=cfg['tag'],
-            color=_mode_colors.get(target_mode),
-            linewidth=3,
-            label=_mode_labels.get(target_mode, target_mode),
-            ax=ax
+        # Three stacked subplots sharing x: initial spike of the higher curve,
+        # initial spike of the lower curve, and the converged tail below 3 Å.
+        fig, (ax_top, ax_mid, ax_bot) = plt.subplots(
+            3, 1, figsize=(10, 8), sharex=True,
+            gridspec_kw={'height_ratios': [1, 1, 3], 'hspace': 0.1},
+            layout='constrained'
         )
 
-    ax.set_yscale(cfg['yscale'])
-    ax.set_title(cfg['title'], fontsize=18, fontweight='bold', pad=20)
-    ax.set_xlabel('Эпоха', fontsize=18)
-    ax.set_ylabel(cfg['ylabel'], fontsize=18)
-    ax.legend(fontsize=14)
+        for ax in (ax_top, ax_mid, ax_bot):
+            for target_mode in _mode_list:
+                wide_scalars = wide_scalars_per_mode[target_mode]
+                ax.plot(
+                    wide_scalars.index.to_numpy(),
+                    wide_scalars[cfg['tag']].to_numpy(),
+                    color=_mode_colors.get(target_mode),
+                    linewidth=3,
+                    label=_mode_labels.get(target_mode, target_mode),
+                )
+            ax.tick_params(axis='both', labelsize=15)
+            ax.spines['right'].set_visible(False)
 
-    fig.tight_layout()
+        ax_top.set_ylim(*top_seg)
+        ax_mid.set_ylim(*mid_seg)
+        ax_bot.set_ylim(*bot_seg)
+
+        # Hide spines on the break boundaries.
+        ax_top.spines['top'].set_visible(False)
+        ax_top.spines['bottom'].set_visible(False)
+        ax_top.tick_params(bottom=False, labelbottom=False)
+        ax_mid.spines['top'].set_visible(False)
+        ax_mid.spines['bottom'].set_visible(False)
+        ax_mid.tick_params(bottom=False, labelbottom=False)
+        ax_bot.spines['top'].set_visible(False)
+
+        # Diagonal break markers at both seams.
+        d = 0.5
+        break_kw = dict(
+            marker=[(-1, -d), (1, d)], markersize=12,
+            linestyle='none', color='k', mec='k', mew=1, clip_on=False
+        )
+        ax_top.plot([0, 1], [0, 0], transform=ax_top.transAxes, **break_kw)
+        ax_mid.plot([0, 1], [1, 1], transform=ax_mid.transAxes, **break_kw)
+        ax_mid.plot([0, 1], [0, 0], transform=ax_mid.transAxes, **break_kw)
+        ax_bot.plot([0, 1], [1, 1], transform=ax_bot.transAxes, **break_kw)
+
+        ax_top.set_title(cfg['title'], fontsize=18, fontweight='bold', pad=20)
+        ax_bot.set_xlabel('Эпоха', fontsize=18)
+        fig.supylabel('RMSE (Å)', fontsize=18)
+        ax_top.legend(fontsize=14, loc='upper right')
+    else:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.tick_params(axis='both', labelsize=15)
+        sns.despine(ax=ax, top=True, right=True)
+
+        for target_mode in _mode_list:
+            wide_scalars = wide_scalars_per_mode[target_mode]
+            sns.lineplot(
+                data=wide_scalars,
+                x='epoch',
+                y=cfg['tag'],
+                color=_mode_colors.get(target_mode),
+                linewidth=3,
+                label=_mode_labels.get(target_mode, target_mode),
+                ax=ax
+            )
+
+        ax.set_title(cfg['title'], fontsize=18, fontweight='bold', pad=20)
+        ax.set_xlabel('Эпоха', fontsize=18)
+        ax.set_ylabel('RMSE (Å)', fontsize=18)
+        ax.legend(fontsize=14)
+
+        fig.tight_layout()
+
     for target_mode in _mode_list:
         fig.savefig(
             osp.join(run_dirs[target_mode], cfg['plot_name']),

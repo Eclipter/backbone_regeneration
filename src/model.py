@@ -1,7 +1,7 @@
 import math
 import os.path as osp
 
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -183,8 +183,13 @@ class EGNNDiff(nn.Module):
 
 
 class PytorchLightningModule(pl.LightningModule):
-    def __init__(self, hidden_dim, num_layers, num_timesteps, batch_size, lr, beta_schedule='cosine'):
+    def __init__(self, hidden_dim, num_layers, num_timesteps, batch_size, lr,
+                 lr_scheduler, lr_scheduler_patience, lr_scheduler_threshold,
+                 target_mode, beta_schedule):
         super().__init__()
+        assert target_mode in ('central', 'edge'), (
+            f"target_mode must be 'central' or 'edge', got {target_mode!r}"
+        )
         self.save_hyperparameters()
 
         self.n_atom_types = len(atom_to_idx)
@@ -192,7 +197,8 @@ class PytorchLightningModule(pl.LightningModule):
         self.time_mlp = SinusoidalPositionalEmbeddings(self.time_emb_dim)
 
         self.gnn = EGNNDiff(
-            in_node_nf=self.n_atom_types + self.time_emb_dim + len(base_to_idx) + 1,
+            # + 1 for has_pair, + 1 for is_chain_edge
+            in_node_nf=self.n_atom_types + self.time_emb_dim + len(base_to_idx) + 2,
             hidden_nf=hidden_dim,
             num_layers=num_layers,
         )
@@ -253,10 +259,17 @@ class PytorchLightningModule(pl.LightningModule):
             raise ValueError('Unsupported t shape.')
         return node_t.long()
 
+    def _target_mask(self, batch):
+        mode = getattr(self.hparams, 'target_mode')
+        if mode == 'central':
+            return batch.central_mask & batch.backbone_mask
+        return batch.is_chain_edge & batch.backbone_mask
+
     def _build_node_features(self, batch, node_t):
         t_emb = self.time_mlp(node_t.float())
         has_pair_expanded = batch.has_pair.float().unsqueeze(1)
-        return torch.cat([batch.x, t_emb, batch.base_types, has_pair_expanded], dim=1)
+        is_chain_edge_expanded = batch.is_chain_edge.float().unsqueeze(1)
+        return torch.cat([batch.x, t_emb, batch.base_types, has_pair_expanded, is_chain_edge_expanded], dim=1)
 
     def _predict_noise(self, batch, target_mask, pos_target, node_t):
         h = self._build_node_features(batch, node_t)
@@ -272,7 +285,7 @@ class PytorchLightningModule(pl.LightningModule):
 
     @torch.no_grad()
     def p_sample(self, pos_t, t, batch):
-        target_mask = batch.central_mask & batch.backbone_mask
+        target_mask = self._target_mask(batch)
         node_t = self._expand_node_t(batch, t)
         target_t = node_t[target_mask]
 
@@ -289,7 +302,7 @@ class PytorchLightningModule(pl.LightningModule):
     @torch.no_grad()
     def p_sample_loop(self, batch):
         """Full T-step reverse diffusion from Gaussian noise to predicted clean positions."""
-        target_mask = batch.central_mask & batch.backbone_mask
+        target_mask = self._target_mask(batch)
         true_pos = batch.pos[target_mask]
         pos_t = torch.randn_like(true_pos)
         T = getattr(self.hparams, 'num_timesteps')
@@ -299,7 +312,7 @@ class PytorchLightningModule(pl.LightningModule):
         return true_pos, pos_t
 
     def training_step(self, batch, _):
-        target_mask = batch.central_mask & batch.backbone_mask
+        target_mask = self._target_mask(batch)
         pos_start = batch.pos[target_mask]
         num_graphs = getattr(batch, 'num_graphs', 1)
         t = torch.randint(0, getattr(self.hparams, 'num_timesteps'), (num_graphs,), device=self.device).long()
@@ -308,10 +321,18 @@ class PytorchLightningModule(pl.LightningModule):
         noise_pos = torch.randn_like(pos_start)
         pos_noisy = self.q_sample(pos_start, target_t, noise_pos=noise_pos)
         model_output = self._predict_noise(batch, target_mask, pos_noisy, node_t)
-        rmse_loss = torch.sqrt(F.mse_loss(model_output, noise_pos))
-        self.log('train_rmse_step', rmse_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
+        rmse = torch.sqrt(F.mse_loss(model_output, noise_pos))
+        self.log(
+            'train_rmse_step',
+            rmse,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch.x.size(0),
+            logger=False
+        )
 
-        return rmse_loss
+        return rmse
 
     def on_train_epoch_end(self):
         metric = self.trainer.callback_metrics['train_rmse_step']
@@ -320,7 +341,15 @@ class PytorchLightningModule(pl.LightningModule):
     def validation_step(self, batch, _):
         true_pos, gen_pos = self.p_sample_loop(batch)
         rmse = torch.sqrt(F.mse_loss(gen_pos, true_pos))
-        self.log('val_rmse_step', rmse, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
+        self.log(
+            'val_rmse_step',
+            rmse,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch.x.size(0),
+            logger=False
+        )
 
     def on_validation_epoch_end(self):
         metric = self.trainer.callback_metrics['val_rmse_step']
@@ -329,15 +358,22 @@ class PytorchLightningModule(pl.LightningModule):
     def test_step(self, batch, _):
         true_pos, gen_pos = self.p_sample_loop(batch)
         rmse = torch.sqrt(F.mse_loss(gen_pos, true_pos))
-        self.log('test_rmse', rmse, on_step=False, on_epoch=True, sync_dist=True, batch_size=batch.x.size(0))
+        self.log(
+            'test_rmse',
+            rmse,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=batch.x.size(0)
+        )
 
     def configure_optimizers(self):  # type: ignore
         optimizer = torch.optim.AdamW(self.parameters(), lr=getattr(self.hparams, 'lr'))
 
         scheduler = ReduceLROnPlateau(
             optimizer,
-            patience=10,
-            threshold=0.1
+            patience=getattr(self.hparams, 'lr_scheduler_patience'),
+            threshold=getattr(self.hparams, 'lr_scheduler_threshold')
         )
 
         return {

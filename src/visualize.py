@@ -4,6 +4,7 @@
 # %%
 import os.path as osp
 import random
+from collections import defaultdict
 from glob import glob
 from io import StringIO
 from pathlib import Path
@@ -23,6 +24,8 @@ from Bio.PDB.mmcifio import MMCIFIO
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 from tensorboard.backend.event_processing import event_accumulator
 
+import utils as _utils
+from config import PER_MODE
 from dataset import PyGDataset
 from model import PytorchLightningModule
 
@@ -33,21 +36,32 @@ plt.rcParams['font.family'] = 'DejaVu Sans'
 
 # %%
 log_dir = osp.join('..', 'logs')
-run_filename = osp.join('full_backbone', 'central', 'baseline')
-run_dir = osp.join(log_dir, run_filename)
-ckpt_path = osp.join(run_dir, 'checkpoints', 'last.ckpt')
-test_dataset_path = osp.join(run_dir, 'test_dataset.pt')
-event_files = glob(osp.join(run_dir, 'events.*'))
+target_modes = PER_MODE.keys()
+run_filenames = {}
+run_dirs = {}
+ckpt_paths = {}
+test_dataset_paths = {}
+event_files = {}
+for target_mode in target_modes:
+    run_filenames[target_mode] = osp.join('full_backbone', target_mode, 'baseline')
+    run_dirs[target_mode] = osp.join(log_dir, run_filenames[target_mode])
+    ckpt_paths[target_mode] = osp.join(run_dirs[target_mode], 'checkpoints', 'last.ckpt')
+    test_dataset_paths[target_mode] = osp.join(run_dirs[target_mode], 'test_dataset.pt')
+    event_files[target_mode] = glob(osp.join(run_dirs[target_mode], 'events.*'))
 
-try:
-    test_dataset = torch.load(test_dataset_path, weights_only=False)
-except FileNotFoundError:
-    raise FileNotFoundError(f'File `{test_dataset_path}` not found. Ensure training completed successfully.')
+test_datasets = {}
+for target_mode in target_modes:
+    try:
+        test_datasets[target_mode] = torch.load(test_dataset_paths[target_mode], weights_only=False)
+    except FileNotFoundError:
+        raise FileNotFoundError(f'File `{test_dataset_paths[target_mode]}` not found. Ensure training completed successfully.')
 
-try:
-    model = PytorchLightningModule.load_from_checkpoint(ckpt_path, map_location='cpu').eval()
-except FileNotFoundError:
-    raise FileNotFoundError(f'File `{ckpt_path}` not found. Ensure you ran train.py.')
+models = {}
+for target_mode in target_modes:
+    try:
+        models[target_mode] = PytorchLightningModule.load_from_checkpoint(ckpt_paths[target_mode], map_location='cpu').eval()
+    except FileNotFoundError:
+        raise FileNotFoundError(f'File `{ckpt_paths[target_mode]}` not found. Ensure you ran train.py.')
 
 # %% [markdown]
 # ### Dataset
@@ -502,22 +516,25 @@ plt.show()
 # ### Check optimizer state
 
 # %%
-_ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-print('epoch:', _ck.get('epoch'), '| global_step:', _ck.get('global_step'))
-print('hyper_parameters lr:', (_ck.get('hyper_parameters') or {}).get('lr'))
-for i, _opt in enumerate(_ck.get('optimizer_states', [])):
-    print(f'\noptimizer_states[{i}]')
-    for gi, g in enumerate(_opt['param_groups']):
-        _pg = {k: v for k, v in g.items() if k != 'params'}
-        _pg['n_param_ids'] = len(g['params'])
-        print(f'  param_group[{gi}]:', _pg)
-    _st = _opt.get('state', {})
-    print(f'  state: {len(_st)} tensors with buffers')
-    if _st:
-        _pid0 = next(iter(_st))
-        print(f'  example buffers for param {_pid0}:', {k: tuple(v.shape) if hasattr(v, 'shape') else v for k, v in _st[_pid0].items()})
-for i, sch in enumerate(_ck.get('lr_schedulers') or []):
-    print(f'\nlr_schedulers[{i}]:', {k: v for k, v in sch.items() if k in ('_last_lr', 'last_epoch', 'best', 'num_bad_epochs', 'cooldown_counter', 'factor', 'patience')})
+for target_mode in target_modes:
+    print(f'=== target_mode = {target_mode} ===')
+    _ck = torch.load(ckpt_paths[target_mode], map_location='cpu', weights_only=False)
+    print('epoch:', _ck.get('epoch'), '| global_step:', _ck.get('global_step'))
+    print('hyper_parameters lr:', (_ck.get('hyper_parameters') or {}).get('lr'))
+    for i, _opt in enumerate(_ck.get('optimizer_states', [])):
+        print(f'\noptimizer_states[{i}]')
+        for gi, g in enumerate(_opt['param_groups']):
+            _pg = {k: v for k, v in g.items() if k != 'params'}
+            _pg['n_param_ids'] = len(g['params'])
+            print(f'  param_group[{gi}]:', _pg)
+        _st = _opt.get('state', {})
+        print(f'  state: {len(_st)} tensors with buffers')
+        if _st:
+            _pid0 = next(iter(_st))
+            print(f'  example buffers for param {_pid0}:', {k: tuple(v.shape) if hasattr(v, 'shape') else v for k, v in _st[_pid0].items()})
+    for i, sch in enumerate(_ck.get('lr_schedulers') or []):
+        print(f'\nlr_schedulers[{i}]:', {k: v for k, v in sch.items() if k in ('_last_lr', 'last_epoch', 'best', 'num_bad_epochs', 'cooldown_counter', 'factor', 'patience')})
+    print()
 
 # %% [markdown]
 # ### Training
@@ -544,75 +561,75 @@ def scalars_to_dataframe(ea, tag):
 # New logging: only train_rmse and val_rmse are tracked, step == epoch
 tracked_tags = {'train_rmse', 'val_rmse'}
 
-dfs = []
-for ef in event_files:
-    ea = load_event_accumulator(ef)
-    for tag in ea.Tags()['scalars']:
-        if tag not in tracked_tags:
-            continue
-        df = scalars_to_dataframe(ea, tag)
-        df['tag'] = tag
-        dfs.append(df)
+wide_scalars_per_mode = {}
+for target_mode in target_modes:
+    dfs = []
+    for ef in event_files[target_mode]:
+        ea = load_event_accumulator(ef)
+        for tag in ea.Tags()['scalars']:
+            if tag not in tracked_tags:
+                continue
+            df = scalars_to_dataframe(ea, tag)
+            df['tag'] = tag
+            dfs.append(df)
 
-scalars_by_epoch = pd.concat(dfs, ignore_index=True)[['epoch', 'tag', 'value']] \
-    .reset_index(drop=True)
-# Aggregate duplicates per (epoch, tag): keep the last logged value (handles resumed runs / multiple event files).
-wide_scalars = scalars_by_epoch.pivot_table(
-    index='epoch',
-    columns='tag',
-    values='value',
-    aggfunc='last'
-)
-wide_scalars
+    scalars_by_epoch = pd.concat(dfs, ignore_index=True)[['epoch', 'tag', 'value']] \
+        .reset_index(drop=True)
+    # Aggregate duplicates per (epoch, tag): keep the last logged value (handles resumed runs / multiple event files).
+    wide_scalars_per_mode[target_mode] = scalars_by_epoch.pivot_table(
+        index='epoch',
+        columns='tag',
+        values='value',
+        aggfunc='last'
+    )
+
+wide_scalars_per_mode
 
 
 # %%
-for type in ['train', 'val']:
+_mode_list = list(target_modes)
+_mode_colors = {'central': 'indigo', 'edge': 'violet'}
+_mode_labels = {'central': 'остов центрального нуклеотида', 'edge': 'остов краевого нуклеотида'}
+_type_cfg = {
+    'train': {'tag': 'train_rmse', 'title': 'Функция потерь во время тренировки',
+              'plot_name': 'training_curve.png', 'yscale': 'linear',
+              'ylabel': 'RMSE (Å)'},
+    'val':   {'tag': 'val_rmse',   'title': 'Функция потерь во время валидации',
+              'plot_name': 'validation_curve.png', 'yscale': 'log',
+              'ylabel': 'log(RMSE) (logÅ)'},
+}
+
+for type, cfg in _type_cfg.items():
     fig, ax = plt.subplots(figsize=(10, 6))
 
     ax.tick_params(axis='both', labelsize=15)
     sns.despine(ax=ax, top=True, right=True)
 
-    if type == 'train':
+    for target_mode in _mode_list:
+        wide_scalars = wide_scalars_per_mode[target_mode]
         sns.lineplot(
             data=wide_scalars,
             x='epoch',
-            y='train_rmse',
-            color='indigo',
-            linewidth=3
+            y=cfg['tag'],
+            color=_mode_colors.get(target_mode),
+            linewidth=3,
+            label=_mode_labels.get(target_mode, target_mode),
+            ax=ax
         )
-        plt.title(
-            'Функция потерь во время тренировки',
-            fontsize=18,
-            fontweight='bold',
-            pad=20
-        )
-    else:
-        sns.lineplot(
-            data=wide_scalars,
-            x='epoch',
-            y='val_rmse',
-            color='violet',
-            linewidth=3
-        )
-        plt.title(
-            'Функция потерь во время валидации',
-            fontsize=18,
-            fontweight='bold',
-            pad=20
-        )
-    plt.xlabel('Эпоха', fontsize=18)
-    plt.ylabel('RMSE (Å)', fontsize=18)
 
-    if type == 'train':
-        plot_name = 'training_curve.png'
-    else:
-        plot_name = 'validation_curve.png'
-    plt.savefig(
-        osp.join(run_dir, plot_name),
-        bbox_inches='tight',
-        dpi=300
-    )
+    ax.set_yscale(cfg['yscale'])
+    ax.set_title(cfg['title'], fontsize=18, fontweight='bold', pad=20)
+    ax.set_xlabel('Эпоха', fontsize=18)
+    ax.set_ylabel(cfg['ylabel'], fontsize=18)
+    ax.legend(fontsize=14)
+
+    fig.tight_layout()
+    for target_mode in _mode_list:
+        fig.savefig(
+            osp.join(run_dirs[target_mode], cfg['plot_name']),
+            bbox_inches='tight',
+            dpi=300
+        )
 
     plt.show()
 
@@ -620,284 +637,289 @@ for type in ['train', 'val']:
 # ### Results
 
 # %%
-sample_idx = random.randint(0, len(test_dataset) - 1)
-data = test_dataset[sample_idx].clone()
+# Cache per-mode test path layout so downstream cells can reuse it cheaply.
+test_paths_per_mode: dict[str, list[str]] = {}
+test_pdb_to_local_per_mode: dict[str, dict[str, list[int]]] = {}
+for target_mode in target_modes:
+    test_paths_per_mode[target_mode] = [
+        test_datasets[target_mode].dataset.data_list[i]
+        for i in test_datasets[target_mode].indices
+    ]
+    pdb_to_local: dict[str, list[int]] = defaultdict(list)
+    for local_i, p in enumerate(test_paths_per_mode[target_mode]):
+        pdb_to_local[Path(p).parent.name].append(local_i)
+    test_pdb_to_local_per_mode[target_mode] = pdb_to_local
 
-# Build masks once to express all visualization classes.
-pos_full = data.pos.cpu().numpy()
-central_mask = data.central_mask.cpu().numpy().astype(bool)
-backbone_mask = data.backbone_mask.cpu().numpy().astype(bool)
-side_mask = ~central_mask
-base_mask = ~backbone_mask
-# Mirror the model's internal target mask so indexing of pred_backbone stays consistent
-# (e.g. for target_mode='central' only the central backbone atoms are denoised).
-target_mask = model._target_mask(data).cpu().numpy().astype(bool)
+for target_mode in target_modes:
+    model = models[target_mode]
+    test_dataset = test_datasets[target_mode]
+    test_paths = test_paths_per_mode[target_mode]
+    test_pdb_to_local = test_pdb_to_local_per_mode[target_mode]
 
-edge_index = data.edge_index.cpu().numpy() if data.edge_index is not None else None
-true_backbone = pos_full[target_mask]
+    sample_pdb_id = random.choice(sorted(test_pdb_to_local.keys()))
+    sample_idx = random.choice(test_pdb_to_local[sample_pdb_id])
+    sample_window = int(Path(test_paths[sample_idx]).stem)
+    data = test_dataset[sample_idx].clone()
 
-# Run generation for all backbone atoms in the window.
-with torch.no_grad():
-    pred_backbone_raw = model.sample(data).cpu().numpy()
+    # Build masks once to express all visualization classes.
+    pos_full = data.pos.cpu().numpy()
+    central_mask = data.central_mask.cpu().numpy().astype(bool)
+    backbone_mask = data.backbone_mask.cpu().numpy().astype(bool)
+    side_mask = ~central_mask
+    base_mask = ~backbone_mask
+    # Mirror the model's internal target mask so indexing of pred_backbone stays consistent
+    # (e.g. for target_mode='central' only the central backbone atoms are denoised).
+    target_mask = model._target_mask(data).cpu().numpy().astype(bool)
 
-# Apply translation-only alignment for visualization to remove possible global drift.
-# The model predicts coordinates, while this correction only matches global centroid.
-centroid_shift = true_backbone.mean(axis=0) - pred_backbone_raw.mean(axis=0)
-pred_backbone = pred_backbone_raw + centroid_shift
+    edge_index = data.edge_index.cpu().numpy() if data.edge_index is not None else None
+    true_backbone = pos_full[target_mask]
 
-# In this dataset, positions are already in the true central nucleotide frame:
-# pos_local = (pos_global - origin_true) @ ref_frame_true.
-origin_true = data.origin.squeeze(0).cpu().numpy() if hasattr(data, 'origin') else None
-ref_frame_true = data.ref_frame.squeeze(0).cpu().numpy() if hasattr(data, 'ref_frame') else None
+    # Run generation for all backbone atoms in the window.
+    with torch.no_grad():
+        pred_backbone_raw = model.sample(data).cpu().numpy()
 
-fig = go.Figure()
+    # Apply translation-only alignment for visualization to remove possible global drift.
+    # The model predicts coordinates, while this correction only matches global centroid.
+    centroid_shift = true_backbone.mean(axis=0) - pred_backbone_raw.mean(axis=0)
+    pred_backbone = pred_backbone_raw + centroid_shift
 
-# Draw full true-window bonds with a two-layer style to improve visibility.
-if edge_index is not None:
-    lines_x, lines_y, lines_z = [], [], []
-    for i in range(edge_index.shape[1]):
-        src_idx, dst_idx = int(edge_index[0, i]), int(edge_index[1, i])
-        if src_idx < dst_idx:
-            p1 = pos_full[src_idx]
-            p2 = pos_full[dst_idx]
-            lines_x.extend([p1[0], p2[0], None])
-            lines_y.extend([p1[1], p2[1], None])
-            lines_z.extend([p1[2], p2[2], None])
-    fig.add_trace(go.Scatter3d(
-        x=lines_x,
-        y=lines_y,
-        z=lines_z,
-        mode='lines',
-        line=dict(color='rgba(35, 35, 35, 0.55)', width=6),
-        name='True bonds (window, outline)'
-    ))
-    fig.add_trace(go.Scatter3d(
-        x=lines_x,
-        y=lines_y,
-        z=lines_z,
-        mode='lines',
-        line=dict(color='rgba(210, 210, 210, 0.95)', width=3),
-        name='True bonds (window)'
-    ))
+    # In this dataset, positions are already in the true central nucleotide frame:
+    # pos_local = (pos_global - origin_true) @ ref_frame_true.
+    origin_true = data.origin.squeeze(0).cpu().numpy() if hasattr(data, 'origin') else None
+    ref_frame_true = data.ref_frame.squeeze(0).cpu().numpy() if hasattr(data, 'ref_frame') else None
 
-# Encode three classifications directly in legend and marker style:
-# 1) backbone/base via color
-# 2) central/side via size and edge thickness
-# 3) true/generated via base color palette and outline style
-true_classes = [
-    ('True | Central | Backbone', central_mask & backbone_mask, '#d62728', 8, 0.96, 1.2),
-    ('True | Central | Base', central_mask & base_mask, '#2ca02c', 7, 0.94, 1.0),
-    ('True | Side | Backbone', side_mask & backbone_mask, '#ff9896', 7, 0.9, 1.0),
-]
+    fig = go.Figure()
 
-for name, mask, color, size, opacity, edge_width in true_classes:
-    if np.any(mask):
-        pts = pos_full[mask]
+    # Draw full true-window bonds with a two-layer style to improve visibility.
+    if edge_index is not None:
+        lines_x, lines_y, lines_z = [], [], []
+        for i in range(edge_index.shape[1]):
+            src_idx, dst_idx = int(edge_index[0, i]), int(edge_index[1, i])
+            if src_idx < dst_idx:
+                p1 = pos_full[src_idx]
+                p2 = pos_full[dst_idx]
+                lines_x.extend([p1[0], p2[0], None])
+                lines_y.extend([p1[1], p2[1], None])
+                lines_z.extend([p1[2], p2[2], None])
         fig.add_trace(go.Scatter3d(
-            x=pts[:, 0],
-            y=pts[:, 1],
-            z=pts[:, 2],
-            mode='markers',
-            marker=dict(
-                size=size,
-                color=color,
-                opacity=opacity,
-                symbol='circle',
-                line=dict(width=edge_width, color='rgba(20, 20, 20, 0.65)')
-            ),
-            name=name
+            x=lines_x,
+            y=lines_y,
+            z=lines_z,
+            mode='lines',
+            line=dict(color='rgba(35, 35, 35, 0.55)', width=6),
+            name='True bonds (window, outline)'
+        ))
+        fig.add_trace(go.Scatter3d(
+            x=lines_x,
+            y=lines_y,
+            z=lines_z,
+            mode='lines',
+            line=dict(color='rgba(210, 210, 210, 0.95)', width=3),
+            name='True bonds (window)'
         ))
 
-# Draw side-base atoms separately at the top layer so they are not visually lost.
-side_base_mask = side_mask & base_mask
-if np.any(side_base_mask):
-    side_base_pts = pos_full[side_base_mask]
+    # Encode three classifications directly in legend and marker style:
+    # 1) backbone/base via color
+    # 2) central/side via size and edge thickness
+    # 3) true/generated via base color palette and outline style
+    true_classes = [
+        ('True | Central | Backbone', central_mask & backbone_mask, '#d62728', 8, 0.96, 1.2),
+        ('True | Central | Base', central_mask & base_mask, '#2ca02c', 7, 0.94, 1.0),
+        ('True | Side | Backbone', side_mask & backbone_mask, '#ff9896', 7, 0.9, 1.0),
+    ]
+
+    for name, mask, color, size, opacity, edge_width in true_classes:
+        if np.any(mask):
+            pts = pos_full[mask]
+            fig.add_trace(go.Scatter3d(
+                x=pts[:, 0],
+                y=pts[:, 1],
+                z=pts[:, 2],
+                mode='markers',
+                marker=dict(
+                    size=size,
+                    color=color,
+                    opacity=opacity,
+                    symbol='circle',
+                    line=dict(width=edge_width, color='rgba(20, 20, 20, 0.65)')
+                ),
+                name=name
+            ))
+
+    # Draw side-base atoms separately at the top layer so they are not visually lost.
+    side_base_mask = side_mask & base_mask
+    if np.any(side_base_mask):
+        side_base_pts = pos_full[side_base_mask]
+        fig.add_trace(go.Scatter3d(
+            x=side_base_pts[:, 0],
+            y=side_base_pts[:, 1],
+            z=side_base_pts[:, 2],
+            mode='markers',
+            marker=dict(
+                size=9,
+                color='#6acb3d',
+                opacity=0.98,
+                symbol='circle',
+                line=dict(width=1.4, color='rgba(15, 55, 10, 0.95)')
+            ),
+            name='True | Side | Base'
+        ))
+
     fig.add_trace(go.Scatter3d(
-        x=side_base_pts[:, 0],
-        y=side_base_pts[:, 1],
-        z=side_base_pts[:, 2],
+        x=pred_backbone[:, 0],
+        y=pred_backbone[:, 1],
+        z=pred_backbone[:, 2],
         mode='markers',
         marker=dict(
             size=9,
-            color='#6acb3d',
-            opacity=0.98,
+            color='#1f77b4',
+            opacity=0.97,
             symbol='circle',
-            line=dict(width=1.4, color='rgba(15, 55, 10, 0.95)')
+            line=dict(width=2.4, color='rgba(10, 10, 10, 0.9)')
         ),
-        name='True | Side | Base'
+        name='Generated | Backbone'
     ))
 
-fig.add_trace(go.Scatter3d(
-    x=pred_backbone[:, 0],
-    y=pred_backbone[:, 1],
-    z=pred_backbone[:, 2],
-    mode='markers',
-    marker=dict(
-        size=9,
-        color='#1f77b4',
-        opacity=0.97,
-        symbol='circle',
-        line=dict(width=2.4, color='rgba(10, 10, 10, 0.9)')
-    ),
-    name='Generated | Backbone'
-))
+    # Build generated bonds by reusing central-backbone topology from the true graph.
+    if edge_index is not None:
+        target_indices = np.where(target_mask)[0]
+        target_global_to_local = {g: i for i, g in enumerate(target_indices)}
+        gen_bonds_x, gen_bonds_y, gen_bonds_z = [], [], []
+        for i in range(edge_index.shape[1]):
+            src_idx, dst_idx = int(edge_index[0, i]), int(edge_index[1, i])
+            if src_idx in target_global_to_local and dst_idx in target_global_to_local and src_idx < dst_idx:
+                p1 = pred_backbone[target_global_to_local[src_idx]]
+                p2 = pred_backbone[target_global_to_local[dst_idx]]
+                gen_bonds_x.extend([p1[0], p2[0], None])
+                gen_bonds_y.extend([p1[1], p2[1], None])
+                gen_bonds_z.extend([p1[2], p2[2], None])
+        if len(gen_bonds_x) > 0:
+            fig.add_trace(go.Scatter3d(
+                x=gen_bonds_x,
+                y=gen_bonds_y,
+                z=gen_bonds_z,
+                mode='lines',
+                line=dict(color='rgba(8, 65, 140, 0.95)', width=6),
+                name='Generated bonds (topology from true graph)'
+            ))
 
-# Build generated bonds by reusing central-backbone topology from the true graph.
-if edge_index is not None:
-    target_indices = np.where(target_mask)[0]
-    target_global_to_local = {g: i for i, g in enumerate(target_indices)}
-    gen_bonds_x, gen_bonds_y, gen_bonds_z = [], [], []
-    for i in range(edge_index.shape[1]):
-        src_idx, dst_idx = int(edge_index[0, i]), int(edge_index[1, i])
-        if src_idx in target_global_to_local and dst_idx in target_global_to_local and src_idx < dst_idx:
-            p1 = pred_backbone[target_global_to_local[src_idx]]
-            p2 = pred_backbone[target_global_to_local[dst_idx]]
-            gen_bonds_x.extend([p1[0], p2[0], None])
-            gen_bonds_y.extend([p1[1], p2[1], None])
-            gen_bonds_z.extend([p1[2], p2[2], None])
-    if len(gen_bonds_x) > 0:
+    # Add pairwise GT->generated correspondence lines (same atom order as target_mask indexing).
+    if true_backbone.shape[0] == pred_backbone.shape[0]:
+        corr_x, corr_y, corr_z = [], [], []
+        for i in range(true_backbone.shape[0]):
+            p_true = true_backbone[i]
+            p_pred = pred_backbone[i]
+            corr_x.extend([p_true[0], p_pred[0], None])
+            corr_y.extend([p_true[1], p_pred[1], None])
+            corr_z.extend([p_true[2], p_pred[2], None])
         fig.add_trace(go.Scatter3d(
-            x=gen_bonds_x,
-            y=gen_bonds_y,
-            z=gen_bonds_z,
+            x=corr_x,
+            y=corr_y,
+            z=corr_z,
             mode='lines',
-            line=dict(color='rgba(8, 65, 140, 0.95)', width=6),
-            name='Generated bonds (topology from true graph)'
+            line=dict(color='rgba(10, 25, 50, 0.82)', width=6, dash='dot'),
+            name='True -> Generated links (outline)'
+        ))
+        fig.add_trace(go.Scatter3d(
+            x=corr_x,
+            y=corr_y,
+            z=corr_z,
+            mode='lines',
+            line=dict(color='rgba(40, 170, 255, 0.98)', width=3, dash='dot'),
+            name='True -> Generated links'
         ))
 
-# Add pairwise GT->generated correspondence lines (same atom order as target_mask indexing).
-if true_backbone.shape[0] == pred_backbone.shape[0]:
-    corr_x, corr_y, corr_z = [], [], []
-    for i in range(true_backbone.shape[0]):
-        p_true = true_backbone[i]
-        p_pred = pred_backbone[i]
-        corr_x.extend([p_true[0], p_pred[0], None])
-        corr_y.extend([p_true[1], p_pred[1], None])
-        corr_z.extend([p_true[2], p_pred[2], None])
+    # Scale the displayed frame to current sample extent while keeping the origin fixed.
+    all_points = np.vstack([pos_full, pred_backbone])
+    radius = float(np.max(np.linalg.norm(all_points, axis=1)))
+    axis_len = max(4.0, radius * 1.15)
+
     fig.add_trace(go.Scatter3d(
-        x=corr_x,
-        y=corr_y,
-        z=corr_z,
-        mode='lines',
-        line=dict(color='rgba(10, 25, 50, 0.82)', width=6, dash='dot'),
-        name='True -> Generated links (outline)'
+        x=[0, axis_len], y=[0, 0], z=[0, 0], mode='lines',
+        line=dict(color='red', width=5), showlegend=False, name='Frame X'
     ))
     fig.add_trace(go.Scatter3d(
-        x=corr_x,
-        y=corr_y,
-        z=corr_z,
-        mode='lines',
-        line=dict(color='rgba(40, 170, 255, 0.98)', width=3, dash='dot'),
-        name='True -> Generated links'
+        x=[0, 0], y=[0, axis_len], z=[0, 0], mode='lines',
+        line=dict(color='green', width=5), showlegend=False, name='Frame Y'
+    ))
+    fig.add_trace(go.Scatter3d(
+        x=[0, 0], y=[0, 0], z=[0, axis_len], mode='lines',
+        line=dict(color='blue', width=5), showlegend=False, name='Frame Z'
     ))
 
-# Scale the displayed frame to current sample extent while keeping the origin fixed.
-all_points = np.vstack([pos_full, pred_backbone])
-radius = float(np.max(np.linalg.norm(all_points, axis=1)))
-axis_len = max(4.0, radius * 1.15)
+    fig.add_trace(go.Cone(
+        x=[axis_len], y=[0], z=[0], u=[1], v=[0], w=[0],
+        showscale=False, colorscale=[[0, 'red'], [1, 'red']],
+        sizemode='absolute', sizeref=0.45, anchor='tail', name='Frame X arrow'
+    ))
+    fig.add_trace(go.Cone(
+        x=[0], y=[axis_len], z=[0], u=[0], v=[1], w=[0],
+        showscale=False, colorscale=[[0, 'green'], [1, 'green']],
+        sizemode='absolute', sizeref=0.45, anchor='tail', name='Frame Y arrow'
+    ))
+    fig.add_trace(go.Cone(
+        x=[0], y=[0], z=[axis_len], u=[0], v=[0], w=[1],
+        showscale=False, colorscale=[[0, 'blue'], [1, 'blue']],
+        sizemode='absolute', sizeref=0.45, anchor='tail', name='Frame Z arrow'
+    ))
 
-fig.add_trace(go.Scatter3d(
-    x=[0, axis_len], y=[0, 0], z=[0, 0], mode='lines',
-    line=dict(color='red', width=5), showlegend=False, name='Frame X'
-))
-fig.add_trace(go.Scatter3d(
-    x=[0, 0], y=[0, axis_len], z=[0, 0], mode='lines',
-    line=dict(color='green', width=5), showlegend=False, name='Frame Y'
-))
-fig.add_trace(go.Scatter3d(
-    x=[0, 0], y=[0, 0], z=[0, axis_len], mode='lines',
-    line=dict(color='blue', width=5), showlegend=False, name='Frame Z'
-))
+    fig.add_trace(go.Scatter3d(
+        x=[axis_len, 0.3, 0, 0],
+        y=[0.3, axis_len, 0.3, 0],
+        z=[0, 0, axis_len, 0.25],
+        mode='text',
+        text=['X', 'Y', 'Z', '(0, 0, 0)'],
+        textposition=['middle right', 'middle right', 'top center', 'top center'],
+        textfont=dict(size=14, color='black'),
+        showlegend=False
+    ))
 
-fig.add_trace(go.Cone(
-    x=[axis_len], y=[0], z=[0], u=[1], v=[0], w=[0],
-    showscale=False, colorscale=[[0, 'red'], [1, 'red']],
-    sizemode='absolute', sizeref=0.45, anchor='tail', name='Frame X arrow'
-))
-fig.add_trace(go.Cone(
-    x=[0], y=[axis_len], z=[0], u=[0], v=[1], w=[0],
-    showscale=False, colorscale=[[0, 'green'], [1, 'green']],
-    sizemode='absolute', sizeref=0.45, anchor='tail', name='Frame Y arrow'
-))
-fig.add_trace(go.Cone(
-    x=[0], y=[0], z=[axis_len], u=[0], v=[0], w=[1],
-    showscale=False, colorscale=[[0, 'blue'], [1, 'blue']],
-    sizemode='absolute', sizeref=0.45, anchor='tail', name='Frame Z arrow'
-))
+    fig.update_layout(
+        title=(
+            f'Results: run={run_filenames[target_mode]}, '
+            f'pdb_id={sample_pdb_id}, window={sample_window}'
+        ),
+        scene=dict(
+            xaxis=dict(visible=False),
+            yaxis=dict(visible=False),
+            zaxis=dict(visible=False),
+            aspectmode='data'
+        ),
+        width=1300,
+        height=850,
+        margin=dict(r=10, l=10, b=10, t=50),
+        legend=dict(itemsizing='constant')
+    )
 
-fig.add_trace(go.Scatter3d(
-    x=[axis_len, 0.3, 0, 0],
-    y=[0.3, axis_len, 0.3, 0],
-    z=[0, 0, axis_len, 0.25],
-    mode='text',
-    text=['X', 'Y', 'Z', '(0, 0, 0)'],
-    textposition=['middle right', 'middle right', 'top center', 'top center'],
-    textfont=dict(size=14, color='black'),
-    showlegend=False
-))
-
-fig.update_layout(
-    title=f'Results: run={run_filename}, sample={sample_idx}',
-    scene=dict(
-        xaxis=dict(visible=False),
-        yaxis=dict(visible=False),
-        zaxis=dict(visible=False),
-        aspectmode='data'
-    ),
-    width=1300,
-    height=850,
-    margin=dict(r=10, l=10, b=10, t=50),
-    legend=dict(itemsizing='constant')
-)
-
-fig.show()
+    fig.show()
 
 # %% [markdown]
 # ### Inference
 
 # %%
-original_full_graph = test_dataset[0]
-
-# Derive nucleotide_mask from central_mask (atoms ordered: left=0, central=1, right=2)
-cm = original_full_graph.central_mask
-nuc_id = torch.zeros(cm.shape[0], dtype=torch.long, device=cm.device)
-nuc_id[cm] = 1
-passed_central = False
-for i in range(len(cm)):
-    if cm[i]:
-        passed_central = True
-    elif passed_central:
-        nuc_id[i] = 2
-original_full_graph.nucleotide_mask = nuc_id
-
-is_left = original_full_graph.nucleotide_mask == 0
-is_central = original_full_graph.central_mask
-is_right = original_full_graph.nucleotide_mask == 2
-window_backbone_mask = original_full_graph.backbone_mask
-
-# Generate backbone positions (model uses full graph, returns positions only)
-generated_pos = model.sample(original_full_graph)
-
-# Shift the whole window backbone to the local frame origin for display.
-original_centroid = original_full_graph.pos[original_full_graph.central_mask].mean(dim=0)
-generated_pos = generated_pos + original_centroid
-
-# %%
-idx_to_atom = {0: 'C', 1: 'N', 2: 'O', 3: 'P'}
+# Map atom vocabulary index back to its canonical atom name / chemical element so
+# that the resulting CIF files carry meaningful atom metadata.
+_idx_to_atom_name = {v: k for k, v in _utils.atom_to_idx.items()}
 
 
-def graph_to_cif_string(atom_types, pos):
-    structure = Structure.Structure('generated_structure')
+def _atom_element(atom_name: str) -> str:
+    # Element is the first alphabetic character, except standalone phosphorus.
+    return 'P' if atom_name == 'P' else atom_name[0]
+
+
+def graph_to_cif_string(atom_types, pos, structure_name='structure'):
+    structure = Structure.Structure(structure_name)
     model = PDBModel.Model(0)
     chain = Chain.Chain('A')
     residue = Residue.Residue((' ', 1, ' '), 'UNK', ' ')
 
     for i, (atom_type_idx, coord) in enumerate(zip(atom_types, pos)):
-        atom_name = idx_to_atom.get(atom_type_idx, 'X')
-        unique_atom_name = f'{atom_name}{i+1}'
+        atom_name = _idx_to_atom_name.get(int(atom_type_idx), 'X')
+        element = _atom_element(atom_name)
+        unique_atom_name = f'{atom_name}_{i+1}'
         atom = Atom.Atom(
             name=unique_atom_name, coord=coord, bfactor=0, occupancy=1.0, altloc=' ',
-            fullname=unique_atom_name, serial_number=i+1, element=atom_name.strip()
+            fullname=unique_atom_name, serial_number=i+1, element=element
         )
         residue.add(atom)
 
@@ -912,29 +934,65 @@ def graph_to_cif_string(atom_types, pos):
     return cif_io.getvalue()
 
 
-# Use the same target mask as the model to keep atom types and positions aligned
-gen_target_mask = model._target_mask(original_full_graph)
-generated_subgraph = original_full_graph.subgraph(gen_target_mask)
-generated_atom_types = torch.argmax(generated_subgraph.x, dim=1).cpu().numpy()
-generated_cif_data = graph_to_cif_string(generated_atom_types, generated_pos.cpu().numpy())
+for target_mode in target_modes:
+    model = models[target_mode]
+    test_dataset = test_datasets[target_mode]
+    test_paths = test_paths_per_mode[target_mode]
+    test_pdb_to_local = test_pdb_to_local_per_mode[target_mode]
 
-orig_atom_types = generated_atom_types
-orig_pos = (generated_subgraph.pos + original_centroid).cpu().numpy()
-original_cif_data = graph_to_cif_string(orig_atom_types, orig_pos)
+    inference_pdb_id = random.choice(sorted(test_pdb_to_local.keys()))
+    inference_local_indices = sorted(
+        test_pdb_to_local[inference_pdb_id],
+        key=lambda i: int(Path(test_paths[i]).stem)
+    )
+    print(f'[{target_mode}] Reconstructing backbone for structure {inference_pdb_id}: '
+          f'{len(inference_local_indices)} windows')
 
-# %%
-# Localized molecular viewer labels for Russian audience.
-view = py3Dmol.view(width=800, height=400, linked=False, viewergrid=(1, 2))
+    all_generated_pos: list[torch.Tensor] = []
+    all_true_pos: list[torch.Tensor] = []
+    all_atom_types: list[torch.Tensor] = []
+    for local_i in inference_local_indices:
+        window = test_dataset[local_i].clone()
+        mask = model._target_mask(window)
 
-view.addModel(generated_cif_data, 'cif', viewer=(0, 0))
-view.setStyle({'stick': {}}, viewer=(0, 0))
-view.addLabel('Generated structure', {'fontColor': 'black', 'backgroundColor': 'lightgray', 'backgroundOpacity': 0.8}, viewer=(0, 0))
+        with torch.no_grad():
+            gen_local = model.sample(window)
 
-view.addModel(original_cif_data, 'cif', viewer=(0, 1))
-view.setStyle({'stick': {}}, viewer=(0, 1))
-view.addLabel('Original structure', {'fontColor': 'black', 'backgroundColor': 'lightgray', 'backgroundOpacity': 0.8}, viewer=(0, 1))
+        # Invert the dataset's local transform pos_local = (pos_global - origin) @ R
+        # via pos_global = pos_local @ R.T + origin to recover global coordinates
+        ref_frame = window.ref_frame.squeeze(0).float()
+        origin = window.origin.squeeze(0).float()
+        gen_global = gen_local.float() @ ref_frame.T + origin
+        true_global = window.pos[mask].float() @ ref_frame.T + origin
 
-view.zoomTo()
-view.show()
+        all_generated_pos.append(gen_global)
+        all_true_pos.append(true_global)
+        all_atom_types.append(torch.argmax(window.x[mask], dim=1))
 
-# %%
+    generated_pos = torch.cat(all_generated_pos, dim=0).cpu().numpy()
+    original_pos = torch.cat(all_true_pos, dim=0).cpu().numpy()
+    atom_types = torch.cat(all_atom_types, dim=0).cpu().numpy()
+
+    generated_cif_data = graph_to_cif_string(atom_types, generated_pos, 'generated_structure')
+    original_cif_data = graph_to_cif_string(atom_types, original_pos, 'original_structure')
+
+    view = py3Dmol.view(width=800, height=400, linked=False, viewergrid=(1, 2))
+
+    view.addModel(generated_cif_data, 'cif', viewer=(0, 0))
+    view.setStyle({'stick': {}, 'sphere': {'scale': 0.25}}, viewer=(0, 0))
+    view.addLabel(
+        f'Generated backbone [{target_mode}] ({inference_pdb_id})',
+        {'fontColor': 'black', 'backgroundColor': 'lightgray', 'backgroundOpacity': 0.8},
+        viewer=(0, 0)
+    )
+
+    view.addModel(original_cif_data, 'cif', viewer=(0, 1))
+    view.setStyle({'stick': {}, 'sphere': {'scale': 0.25}}, viewer=(0, 1))
+    view.addLabel(
+        f'Original backbone [{target_mode}] ({inference_pdb_id})',
+        {'fontColor': 'black', 'backgroundColor': 'lightgray', 'backgroundOpacity': 0.8},
+        viewer=(0, 1)
+    )
+
+    view.zoomTo()
+    view.show()

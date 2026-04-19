@@ -4,15 +4,16 @@ import os.path as osp
 import shutil
 import warnings
 from datetime import datetime
+from itertools import product
 
-import pytorch_lightning as pl
+import lightning.pytorch as pl
 import torch
-from pytorch_lightning.callbacks import (ModelCheckpoint,
+from lightning.pytorch.callbacks import (ModelCheckpoint,
                                          StochasticWeightAveraging)
-from pytorch_lightning.loggers import TensorBoardLogger
-from pytorch_lightning.strategies import DDPStrategy
+from lightning.pytorch.loggers import TensorBoardLogger
+from lightning.pytorch.strategies import DDPStrategy
 
-import config
+from config import BASE, EXPERIMENTS, PER_MODE, RUN_NAME, SEED
 from dataset import DNADataModule
 from model import PytorchLightningModule
 
@@ -20,21 +21,48 @@ from model import PytorchLightningModule
 warnings.filterwarnings('ignore', category=FutureWarning, module='torch.distributed.algorithms.ddp_comm_hooks')
 
 
-def main():
-    torch.set_float32_matmul_precision('high')
-    pl.seed_everything(config.SEED, workers=True)
+def _make_run_version(cfg, baseline):
+    # Short, unique version: only the fields that differ from the per-mode baseline.
+    diff = {k: cfg[k] for k in cfg if k in baseline and cfg[k] != baseline[k]}
+    return '_'.join(f'{k}={v}' for k, v in diff.items()) or 'baseline'
 
-    data_module = DNADataModule(batch_size=config.BATCH_SIZE)
+
+def _get_run_paths(cfg):
+    log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'logs')
+
+    run_version = cfg['RUN_VERSION']
+    if cfg['RUN_NAME']:
+        run_name = cfg['RUN_NAME']
+        if cfg['START_FROM_LAST_CKPT']:
+            candidate = osp.join(log_dir, run_name, run_version, 'checkpoints', 'last.ckpt')
+            ckpt_path = candidate if osp.isfile(candidate) else None
+        else:
+            shutil.rmtree(osp.join(log_dir, run_name, run_version), ignore_errors=True)
+            ckpt_path = None
+    else:
+        run_name = f"{datetime.now().strftime('%Y.%m.%d_%H:%M:%S')}_{cfg['TARGET_MODE']}"
+        ckpt_path = None
+    return log_dir, run_name, run_version, ckpt_path
+
+
+def train_one(cfg):
+    pl.seed_everything(SEED, workers=True)
+
+    data_module = DNADataModule(batch_size=cfg['BATCH_SIZE'], target_mode=cfg['TARGET_MODE'])
     pl_module = PytorchLightningModule(
-        hidden_dim=config.HIDDEN_DIM,
-        num_layers=config.NUM_LAYERS,
-        num_timesteps=config.NUM_TIMESTEPS,
-        batch_size=config.BATCH_SIZE,
-        lr=config.LR
+        hidden_dim=cfg['HIDDEN_DIM'],
+        num_layers=cfg['NUM_LAYERS'],
+        num_timesteps=cfg['NUM_TIMESTEPS'],
+        batch_size=cfg['BATCH_SIZE'],
+        lr=cfg['LR'],
+        lr_scheduler=cfg['LR_SCHEDULER'],
+        lr_scheduler_patience=cfg['LR_SCHEDULER_PATIENCE'],
+        lr_scheduler_threshold=cfg['LR_SCHEDULER_THRESHOLD'],
+        beta_schedule=cfg['BETA_SCHEDULE'],
+        target_mode=cfg['TARGET_MODE']
     )
 
     num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
-
     strategy = (
         DDPStrategy(find_unused_parameters=True)
         if torch.cuda.device_count() > 1 or num_nodes > 1
@@ -42,22 +70,7 @@ def main():
     )
 
     # Initialize logger
-    log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'logs')
-    ckpt_path = None
-    if config.RUN_NAME:
-        run_name = config.RUN_NAME
-        run_version = config.RUN_VERSION
-        if config.START_FROM_LAST_CKPT:
-            candidate = osp.join(log_dir, run_version, 'checkpoints', 'last.ckpt')
-            ckpt_path = candidate if osp.isfile(candidate) else None
-        else:
-            run_path = osp.join(log_dir, run_name, run_version)
-            shutil.rmtree(run_path, ignore_errors=True)
-    else:
-        run_name = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')
-        run_version = config.RUN_VERSION
-    pl_logger = logging.getLogger('pytorch_lightning.utilities.rank_zero')
-    pl_logger.addFilter(lambda r: 'litlogger' not in r.getMessage())  # Mute LitLogger tip
+    log_dir, run_name, run_version, ckpt_path = _get_run_paths(cfg)
     logger = TensorBoardLogger(log_dir, name=run_name, version=run_version, default_hp_metric=False)
 
     # Initialize callbacks
@@ -69,14 +82,15 @@ def main():
         save_last=True,
         enable_version_counter=False
     )
-    swa = StochasticWeightAveraging(
-        swa_lrs=0.1*config.LR,
-        swa_epoch_start=100
-    )
+    if cfg['SWA']:
+        swa = StochasticWeightAveraging(
+            swa_lrs=cfg['SWA_LR'],
+            swa_epoch_start=cfg['SWA_EPOCH_START']
+        )
 
     # Initialize trainer
     trainer = pl.Trainer(
-        max_epochs=config.NUM_EPOCHS,
+        max_epochs=cfg['NUM_EPOCHS'],
         gradient_clip_val=1,
         precision='16-mixed',
         log_every_n_steps=-1,
@@ -85,14 +99,38 @@ def main():
         logger=logger,
         callbacks=[
             checkpoint_callback,
-            # swa,
+            *([swa] if cfg['SWA'] else [])  # type: ignore
         ],
         enable_model_summary=False
     )
 
     # Train and test
     trainer.fit(pl_module, datamodule=data_module, ckpt_path=ckpt_path, weights_only=False)
-    trainer.test(datamodule=data_module, ckpt_path='best', weights_only=False)
+    if trainer.is_global_zero:
+        test_trainer = pl.Trainer(
+            devices=1,
+            num_nodes=1,
+            logger=trainer.logger,
+            precision=trainer.precision,
+        )
+        test_trainer.test(pl_module, datamodule=data_module, ckpt_path='best', weights_only=False)
+
+
+def main():
+    torch.set_float32_matmul_precision('high')
+
+    # Mute a litlogger advertisement
+    logging.getLogger('lightning.pytorch.utilities.rank_zero').addFilter(
+        lambda r: 'litlogger' not in r.getMessage().lower()
+    )
+
+    # Cartesian product: every experiment is run for every target_mode
+    for exp, mode in product(EXPERIMENTS, PER_MODE):
+        baseline = {**BASE, **PER_MODE[mode]}
+        run_cfg = {**baseline, **exp, 'TARGET_MODE': mode}
+        run_cfg['RUN_NAME'] = RUN_NAME.format(target_mode=mode) if RUN_NAME else ''
+        run_cfg['RUN_VERSION'] = _make_run_version(run_cfg, baseline)
+        train_one(run_cfg)
 
 
 if __name__ == '__main__':

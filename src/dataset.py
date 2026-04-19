@@ -8,8 +8,8 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from typing import Optional, cast
 
+import lightning.pytorch as pl
 import numpy as np
-import pytorch_lightning as pl
 import requests
 import torch
 import torch.nn.functional as F
@@ -19,9 +19,12 @@ from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-import config
 import utils
+from config import SEED
 from pynamod import CG_Structure
+
+PBAR_COLOR = '#B366FF'
+EDGE_CACHE_NAME = 'edge_windows.txt'
 
 
 class PyGDataset(Dataset):
@@ -79,11 +82,16 @@ class PyGDataset(Dataset):
                 executor.map(self.download_file, pdb_ids_to_download),
                 total=len(pdb_ids_to_download),
                 desc='Downloading mmCIF files',
-                colour='#b366ff'
+                colour=PBAR_COLOR
             ))
 
         # Single-threaded downloading for debugging
-        # list(tqdm(map(self.download_file, pdb_ids_to_download), total=len(pdb_ids_to_download), colour='#b366ff'))
+        # list(tqdm(
+        #     map(self.download_file, pdb_ids_to_download),
+        #     total=len(pdb_ids_to_download),
+        #     desc='Downloading mmCIF files',
+        #     colour=PBAR_COLOR
+        # ))
 
         tag_path = osp.join(self.processed_dir, self.processed_file_names)
         if osp.exists(tag_path):
@@ -145,19 +153,32 @@ class PyGDataset(Dataset):
 
         # Enables single-threaded processing when True
         debug = False
+
+        edge_paths: list[str] = []
         if not debug:
             with ProcessPoolExecutor(
                 max_workers=len(os.sched_getaffinity(0)),  # type: ignore
                 mp_context=mp.get_context('spawn'),
             ) as executor:
-                list(tqdm(
+                for per_file_edges in tqdm(
                     executor.map(self.process_file, self.pdb_ids),
                     total=len(self.pdb_ids),
-                    colour='#b366ff'
-                ))
+                    colour=PBAR_COLOR
+                ):
+                    edge_paths.extend(per_file_edges)
         else:
             print('Using single-threaded processing for debugging purposes...')
-            list(tqdm(map(self.process_file, self.pdb_ids), total=len(self.pdb_ids), colour='#b366ff'))
+            for per_file_edges in tqdm(
+                map(self.process_file, self.pdb_ids),
+                total=len(self.pdb_ids),
+                colour=PBAR_COLOR
+            ):
+                edge_paths.extend(per_file_edges)
+
+        # Persist the edge-windows cache
+        edge_paths.sort()
+        with open(osp.join(self.processed_dir, EDGE_CACHE_NAME), 'w') as f:
+            f.write('\n'.join(edge_paths))
 
         # Create a completion tag file
         open(osp.join(self.processed_dir, self.processed_file_names), 'w').close()
@@ -168,6 +189,9 @@ class PyGDataset(Dataset):
         print(f'\n{len(structure_folders)} structures were fetched, {len(empty_folders)} were skipped')
 
     def process_file(self, pdb_id):
+        edge_paths: list[str] = []
+        print(2)
+
         # Create a folder for the processed data objects
         pdb_id_processed_dir = osp.join(self.processed_dir, pdb_id)
         os.makedirs(pdb_id_processed_dir, exist_ok=True)
@@ -177,17 +201,17 @@ class PyGDataset(Dataset):
         try:
             structure = CG_Structure(mdaUniverse=utils.mmcif_to_mda_universe(raw_path))
         except:
-            return
+            return edge_paths
 
         # Analyze DNA chains
         nucleic_atoms = structure.u.select_atoms('nucleic')  # type: ignore
         if len(nucleic_atoms) == 0:
-            return
+            return edge_paths
         dna_segids = list(np.unique(nucleic_atoms.segids))
         try:
             structure.analyze_dna(leading_strands=dna_segids, use_full_nucleotide=True)
         except:
-            return
+            return edge_paths
 
         # Group nucleotides by chains
         nucleotides_by_chain = defaultdict(list)
@@ -230,11 +254,15 @@ class PyGDataset(Dataset):
                     atom_positions = []
                     backbone_mask = []
                     has_pair_list = []
+                    is_chain_edge_list = []
                     for nucleotide_idx, nucleotide in enumerate(window):
                         # Get nucleotide features
                         base_type = utils.base_to_idx[nucleotide.restype]
                         is_central = nucleotide_idx == self.window_size // 2
                         has_pair = utils.has_pair(structure, nucleotide)
+                        # Chain endpoint flag: true iff the nucleotide is the first/last in its chain.
+                        position_in_chain = window_idx + nucleotide_idx
+                        is_chain_edge = position_in_chain == 0 or position_in_chain == len(chain) - 1
 
                         # Iterate over atoms in a nucleotide
                         for atom in nucleotide.e_residue:
@@ -251,6 +279,7 @@ class PyGDataset(Dataset):
                             base_types.append(base_type)
                             central_mask.append(is_central)
                             has_pair_list.append(has_pair)
+                            is_chain_edge_list.append(is_chain_edge)
 
                     # Collect window features
                     edge_idx = utils.get_edge_idx(tuple([nucleotide.restype for nucleotide in window]))
@@ -276,6 +305,7 @@ class PyGDataset(Dataset):
                     central_mask_tensor = torch.tensor(central_mask, dtype=torch.bool)
                     backbone_mask_tensor = torch.tensor(backbone_mask, dtype=torch.bool)
                     has_pair_tensor = torch.tensor(has_pair_list, dtype=torch.bool)
+                    is_chain_edge_tensor = torch.tensor(is_chain_edge_list, dtype=torch.bool)
                     base_types_tensor = F.one_hot(
                         torch.tensor(base_types, dtype=torch.long),
                         num_classes=len(utils.base_to_idx)
@@ -291,35 +321,66 @@ class PyGDataset(Dataset):
                         central_mask=central_mask_tensor,
                         backbone_mask=backbone_mask_tensor,
                         has_pair=has_pair_tensor,
+                        is_chain_edge=is_chain_edge_tensor,
                         base_types=base_types_tensor
                     )
 
                     # Save the data object
-                    torch.save(data, osp.join(pdb_id_processed_dir, f'{data_idx}.pt'))
+                    save_path = osp.join(pdb_id_processed_dir, f'{data_idx}.pt')
+                    torch.save(data, save_path)
+                    if any(is_chain_edge_list):
+                        edge_paths.append(save_path)
                     data_idx += 1
             except (KeyError, SelectionError):
                 continue
 
+        return edge_paths
+
 
 class DNADataModule(pl.LightningDataModule):
-    def __init__(self, batch_size, train_ratio=0.7, val_ratio=0.2):
+    def __init__(self, batch_size, train_ratio=0.7, val_ratio=0.2, target_mode='central'):
         super().__init__()
 
         self.batch_size = batch_size
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
+        self.target_mode = target_mode
 
         self.num_workers = len(os.sched_getaffinity(0))
-        self.train_generator = torch.Generator().manual_seed(config.SEED)
+        self.train_generator = torch.Generator().manual_seed(SEED)
 
     def prepare_data(self):
-        # Download and process data
-        PyGDataset()
+        dataset = PyGDataset()
+
+        if self.target_mode == 'edge':
+            cache_path = osp.join(dataset.processed_dir, EDGE_CACHE_NAME)
+            if not osp.exists(cache_path):
+                with ThreadPoolExecutor() as executor:
+                    flags = list(tqdm(
+                        executor.map(self._window_has_chain_edge, dataset.data_list),
+                        total=len(dataset.data_list),
+                        desc='Filtering edge windows',
+                        colour=PBAR_COLOR
+                    ))
+                kept = [p for p, keep in zip(dataset.data_list, flags) if keep]
+                tmp_path = cache_path + '.tmp'
+                with open(tmp_path, 'w') as f:
+                    f.write('\n'.join(kept))
+                os.replace(tmp_path, cache_path)
+
+    @staticmethod
+    def _window_has_chain_edge(path):
+        return bool(torch.load(path, weights_only=False).is_chain_edge.any().item())
 
     def setup(self, stage: Optional[str] = None):
         dataset = PyGDataset()
 
-        indices = np.random.default_rng(config.SEED).permutation(len(dataset)).tolist()
+        if self.target_mode == 'edge':
+            cache_path = osp.join(dataset.processed_dir, EDGE_CACHE_NAME)
+            with open(cache_path) as f:
+                dataset.data_list = [line for line in f.read().splitlines() if line]
+
+        indices = np.random.default_rng(SEED).permutation(len(dataset)).tolist()
         train_val_split = int(len(indices) * self.train_ratio)
         val_test_split = int(len(indices) * (self.train_ratio + self.val_ratio))
 

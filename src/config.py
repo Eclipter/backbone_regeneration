@@ -27,7 +27,7 @@ EXPERIMENTS = [
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'full_backbone/{target_mode}'
+RUN_NAME = 'structure_wise_split/{target_mode}'
 
 SEED = 42
 

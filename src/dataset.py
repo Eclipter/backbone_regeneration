@@ -338,7 +338,7 @@ class PyGDataset(Dataset):
 
 
 class DNADataModule(pl.LightningDataModule):
-    def __init__(self, batch_size, train_ratio=0.7, val_ratio=0.2, target_mode='central'):
+    def __init__(self, target_mode, batch_size, train_ratio=0.7, val_ratio=0.2):
         super().__init__()
 
         self.batch_size = batch_size
@@ -380,13 +380,28 @@ class DNADataModule(pl.LightningDataModule):
             with open(cache_path) as f:
                 dataset.data_list = [line for line in f.read().splitlines() if line]
 
-        indices = np.random.default_rng(SEED).permutation(len(dataset)).tolist()
-        train_val_split = int(len(indices) * self.train_ratio)
-        val_test_split = int(len(indices) * (self.train_ratio + self.val_ratio))
+        # Structure-wise split: group windows by their parent PDB directory so
+        # that all windows from a single structure end up in the same subset
+        indices_by_structure: dict[str, list[int]] = defaultdict(list)
+        for idx, path in enumerate(dataset.data_list):
+            pdb_id = osp.basename(osp.dirname(path))
+            indices_by_structure[pdb_id].append(idx)
 
-        train_indices = indices[:train_val_split]
-        val_indices = indices[train_val_split:val_test_split]
-        test_indices = indices[val_test_split:]
+        pdb_ids = sorted(indices_by_structure.keys())
+        rng = np.random.default_rng(SEED)
+        rng.shuffle(pdb_ids)
+
+        n_structures = len(pdb_ids)
+        train_val_split = int(n_structures * self.train_ratio)
+        val_test_split = int(n_structures * (self.train_ratio + self.val_ratio))
+
+        train_pdb_ids = pdb_ids[:train_val_split]
+        val_pdb_ids = pdb_ids[train_val_split:val_test_split]
+        test_pdb_ids = pdb_ids[val_test_split:]
+
+        train_indices = [i for pdb_id in train_pdb_ids for i in indices_by_structure[pdb_id]]
+        val_indices = [i for pdb_id in val_pdb_ids for i in indices_by_structure[pdb_id]]
+        test_indices = [i for pdb_id in test_pdb_ids for i in indices_by_structure[pdb_id]]
 
         self.train_dataset: Subset[Data] = Subset(dataset, train_indices)
         self.val_dataset: Subset[Data] = Subset(dataset, val_indices)

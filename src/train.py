@@ -84,7 +84,7 @@ def train_one(cfg):
     )
     if cfg['SWA']:
         swa = StochasticWeightAveraging(
-            swa_lrs=cfg['SWA_LR'],
+            swa_lrs=cfg['SWA_LR']*cfg['LR'],
             swa_epoch_start=cfg['SWA_EPOCH_START']
         )
 
@@ -106,22 +106,15 @@ def train_one(cfg):
 
     # Train and test
     trainer.fit(pl_module, datamodule=data_module, ckpt_path=ckpt_path, weights_only=False)
-    if trainer.is_global_zero:
-        test_trainer = pl.Trainer(
-            devices=1,
-            num_nodes=1,
-            logger=trainer.logger,
-            precision=trainer.precision,
-        )
-        test_trainer.test(pl_module, datamodule=data_module, ckpt_path='best', weights_only=False)
+    trainer.test(pl_module, ckpt_path='best', weights_only=False)
 
 
 def main():
     torch.set_float32_matmul_precision('high')
 
-    # Mute a litlogger advertisement
+    # Mute litmodels / litlogger advertisements from Lightning
     logging.getLogger('lightning.pytorch.utilities.rank_zero').addFilter(
-        lambda r: 'litlogger' not in r.getMessage().lower()
+        lambda r: not any(s in r.getMessage().lower() for s in ('litmodels', 'litlogger'))
     )
 
     # Cartesian product: every experiment is run for every target_mode

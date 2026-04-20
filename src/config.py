@@ -23,11 +23,11 @@ PER_MODE = {
 # Each experiment is run for every target_mode from PER_MODE above
 EXPERIMENTS = [
     {},  # baseline (matches BASE)
-    {'SWA': True},
+    {'LR_SCHEDULER': None, 'SWA': True},
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'structure_wise_split/{target_mode}'
+RUN_NAME = 'fixed_swa/{target_mode}'
 
 SEED = 42
 

@@ -12,8 +12,6 @@ import lightning.pytorch as pl
 import numpy as np
 import requests
 import torch
-import torch.nn.functional as F
-from MDAnalysis.exceptions import SelectionError
 from torch.utils.data import Subset
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
@@ -21,7 +19,6 @@ from tqdm import tqdm
 
 import utils
 from config import SEED
-from pynamod import CG_Structure
 
 PBAR_COLOR = '#B366FF'
 EDGE_CACHE_NAME = 'edge_windows.txt'
@@ -190,149 +187,30 @@ class PyGDataset(Dataset):
 
     def process_file(self, pdb_id):
         edge_paths: list[str] = []
-        print(2)
 
         # Create a folder for the processed data objects
         pdb_id_processed_dir = osp.join(self.processed_dir, pdb_id)
         os.makedirs(pdb_id_processed_dir, exist_ok=True)
 
-        # Create CG_Structure
+        # Load the mmCIF, run pynamod's DNA analysis, and materialise windows
         raw_path = osp.join(self.raw_dir, f'{pdb_id}.cif')
         try:
-            structure = CG_Structure(mdaUniverse=utils.mmcif_to_mda_universe(raw_path))
+            structure, chain_records = utils.parse_dna(
+                raw_path, use_full_nucleotide=True, window_size=self.window_size,
+            )
         except:
             return edge_paths
 
-        # Analyze DNA chains
-        nucleic_atoms = structure.u.select_atoms('nucleic')  # type: ignore
-        if len(nucleic_atoms) == 0:
-            return edge_paths
-        dna_segids = list(np.unique(nucleic_atoms.segids))
-        try:
-            structure.analyze_dna(leading_strands=dna_segids, use_full_nucleotide=True)
-        except:
-            return edge_paths
-
-        # Group nucleotides by chains
-        nucleotides_by_chain = defaultdict(list)
-        for segid, nucleotide in zip(
-            structure.dna.nucleotides.segids,  # type: ignore
-            structure.dna.nucleotides
-        ):
-            atom_group = getattr(nucleotide, 'e_residue').atoms
-            atom0 = atom_group[0] if len(atom_group) > 0 else None
-            chain_key = ''
-            if atom0 is not None:
-                chain_key = getattr(atom0, 'chainID', '') or getattr(atom0, 'segid', '')
-            if not chain_key:
-                chain_key = segid
-            if not chain_key:
-                continue
-            nucleotides_by_chain[chain_key].append(nucleotide)
-
-        # Iterate over chains
+        # Iterate over chains, then over windows
         data_idx = 0
-        for chain in nucleotides_by_chain.values():
-            if len(chain) < self.window_size:
-                continue
-
-            # Slide over a chain with a window
-            try:
-                for window_idx in range(len(chain) - self.window_size + 1):
-                    window = chain[window_idx: window_idx + self.window_size]
-
-                    # Check for continuity of residues to avoid gaps in the chain
-                    resids = [n.e_residue.resids[0] for n in window]
-                    steps = [resids[i+1] - resids[i] for i in range(len(resids)-1)]
-                    if not (all(s == 1 for s in steps) or all(s == -1 for s in steps)):
-                        continue
-
-                    # Iterate over nucleotides (with sorted atoms) in a window
-                    base_types = []
-                    central_mask = []
-                    atom_names = []
-                    atom_positions = []
-                    backbone_mask = []
-                    has_pair_list = []
-                    is_chain_edge_list = []
-                    for nucleotide_idx, nucleotide in enumerate(window):
-                        # Get nucleotide features
-                        base_type = utils.base_to_idx[nucleotide.restype]
-                        is_central = nucleotide_idx == self.window_size // 2
-                        has_pair = utils.has_pair(structure, nucleotide)
-                        # Chain endpoint flag: true iff the nucleotide is the first/last in its chain.
-                        position_in_chain = window_idx + nucleotide_idx
-                        is_chain_edge = position_in_chain == 0 or position_in_chain == len(chain) - 1
-
-                        # Iterate over atoms in a nucleotide
-                        for atom in nucleotide.e_residue:
-                            # Rename some atoms to avoid some key errors and skip hydrogens
-                            atom_name = utils.rename_atom(atom.name)
-                            atom_element = getattr(atom, 'element', None)
-                            if 'H' in atom.name or atom_element in {'H', 'D'}:
-                                continue
-
-                            # Collect all features atom-wisely
-                            atom_names.append(utils.atom_to_idx[atom_name])
-                            atom_positions.append(atom.position)
-                            backbone_mask.append(1 if atom_name in utils.backbone_atoms else 0)
-                            base_types.append(base_type)
-                            central_mask.append(is_central)
-                            has_pair_list.append(has_pair)
-                            is_chain_edge_list.append(is_chain_edge)
-
-                    # Collect window features
-                    edge_idx = utils.get_edge_idx(tuple([nucleotide.restype for nucleotide in window]))
-
-                    # Convert features to tensors
-                    atom_names_tensor = F.one_hot(
-                        torch.tensor(atom_names, dtype=torch.long),
-                        num_classes=len(utils.atom_to_idx)
-                    ).float()
-                    # Convert atom positions to a np array before converting to a tensor
-                    pos_tensor = torch.tensor(np.asarray(atom_positions), dtype=torch.float)
-
-                    # Align to the central nucleotide's reference frame
-                    central_idx = window[self.window_size // 2].ind
-                    # Get R and origin from pynamod storage
-                    # R: (3, 3), origin: (1, 3)
-                    ref_frame = getattr(structure.dna.nucleotides, 'ref_frames')[central_idx].float()
-                    origin = getattr(structure.dna.nucleotides, 'origins')[central_idx].float()
-
-                    # Transform positions: (pos - origin) @ R
-                    pos_tensor = (pos_tensor - origin) @ ref_frame
-
-                    central_mask_tensor = torch.tensor(central_mask, dtype=torch.bool)
-                    backbone_mask_tensor = torch.tensor(backbone_mask, dtype=torch.bool)
-                    has_pair_tensor = torch.tensor(has_pair_list, dtype=torch.bool)
-                    is_chain_edge_tensor = torch.tensor(is_chain_edge_list, dtype=torch.bool)
-                    base_types_tensor = F.one_hot(
-                        torch.tensor(base_types, dtype=torch.long),
-                        num_classes=len(utils.base_to_idx)
-                    ).float()
-
-                    # Create a data object
-                    data = Data(
-                        x=atom_names_tensor,
-                        edge_index=edge_idx,
-                        pos=pos_tensor,
-                        origin=origin.unsqueeze(0),
-                        ref_frame=ref_frame.unsqueeze(0),
-                        central_mask=central_mask_tensor,
-                        backbone_mask=backbone_mask_tensor,
-                        has_pair=has_pair_tensor,
-                        is_chain_edge=is_chain_edge_tensor,
-                        base_types=base_types_tensor
-                    )
-
-                    # Save the data object
-                    save_path = osp.join(pdb_id_processed_dir, f'{data_idx}.pt')
-                    torch.save(data, save_path)
-                    if any(is_chain_edge_list):
-                        edge_paths.append(save_path)
-                    data_idx += 1
-            except (KeyError, SelectionError):
-                continue
+        for _, _, windows in chain_records:
+            for _, _, data in windows:
+                # Save the data object
+                save_path = osp.join(pdb_id_processed_dir, f'{data_idx}.pt')
+                torch.save(data, save_path)
+                if bool(data.is_chain_edge.any().item()):
+                    edge_paths.append(save_path)
+                data_idx += 1
 
         return edge_paths
 

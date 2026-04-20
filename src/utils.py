@@ -1,13 +1,19 @@
 import os
 import tempfile
+from collections import defaultdict
 from functools import lru_cache
 
 import MDAnalysis as mda
+import numpy as np
 import requests
 import torch
+import torch.nn.functional as F
 from Bio.PDB.MMCIFParser import MMCIFParser
 from Bio.PDB.PDBIO import PDBIO, Select
+from MDAnalysis.exceptions import SelectionError
+from torch_geometric.data import Data
 
+from pynamod import CG_Structure
 from pynamod.atomic_analysis.nucleotides_parser import build_graph, get_base_u
 
 backbone_atoms = ["C1'", "C2'", "C3'", "C4'", "C5'", "OP1", "OP2", "P", "O3'", "O4'", "O5'"]
@@ -290,6 +296,174 @@ def rename_atom(atom_name):
     else:
         atom_name = atom_name.replace('A', '').replace('B', '')
         return atom_name
+
+
+# Heavy atom = not hydrogen by name and not hydrogen/deuterium by element
+def _is_heavy_atom(atom):
+    return 'H' not in atom.name and getattr(atom, 'element', None) not in {'H', 'D'}
+
+
+# (atom_name, position) pairs for heavy atoms in the experimental residue, in input order
+def default_atoms_provider(nucleotide):
+    return [(rename_atom(a.name), a.position) for a in nucleotide.e_residue if _is_heavy_atom(a)]
+
+
+def inference_atoms_provider(nucleotide):
+    """Canonical heavy atoms of the nucleotide; fill positions from the experimental residue
+    when present, zeros otherwise. Backbone atoms are always zero-initialised at inference
+    time and get replaced by Gaussian noise in the reverse diffusion loop.
+    """
+    exp_positions = dict(default_atoms_provider(nucleotide))
+    atoms = []
+    for atom in get_base_u(nucleotide.restype):  # type: ignore
+        if not _is_heavy_atom(atom):
+            continue
+        atom_name = rename_atom(atom.name)
+        atoms.append((atom_name, exp_positions.get(atom_name, np.zeros(3, dtype=np.float32))))
+    return atoms
+
+
+def _build_window_data(window, window_idx, chain_len, structure, window_size, atoms_provider):
+    """Build a PyG Data object for a single window of consecutive nucleotides.
+
+    atoms_provider controls where per-atom (name, position) pairs come from. Defaults
+    to iterating `nucleotide.e_residue` (used at training time); inference can pass a
+    reference-based provider when backbone atoms are missing from the input.
+    """
+    base_types = []
+    central_mask = []
+    atom_names = []
+    atom_positions = []
+    backbone_mask = []
+    has_pair_list = []
+    is_chain_edge_list = []
+    for nucleotide_idx, nucleotide in enumerate(window):
+        base_type = base_to_idx[nucleotide.restype]
+        is_central = nucleotide_idx == window_size // 2
+        nt_has_pair = has_pair(structure, nucleotide)
+        position_in_chain = window_idx + nucleotide_idx
+        is_chain_edge = position_in_chain == 0 or position_in_chain == chain_len - 1
+
+        for atom_name, atom_position in atoms_provider(nucleotide):
+            atom_names.append(atom_to_idx[atom_name])
+            atom_positions.append(atom_position)
+            backbone_mask.append(1 if atom_name in backbone_atoms else 0)
+            base_types.append(base_type)
+            central_mask.append(is_central)
+            has_pair_list.append(nt_has_pair)
+            is_chain_edge_list.append(is_chain_edge)
+
+    edge_idx = get_edge_idx(tuple([nucleotide.restype for nucleotide in window]))
+
+    atom_names_tensor = F.one_hot(
+        torch.tensor(atom_names, dtype=torch.long),
+        num_classes=len(atom_to_idx)
+    ).float()
+    pos_tensor = torch.tensor(np.asarray(atom_positions), dtype=torch.float)
+
+    # Align to the central nucleotide's reference frame
+    central_idx = window[window_size // 2].ind
+    # Get R and origin from pynamod storage
+    # R: (3, 3), origin: (1, 3)
+    ref_frame = getattr(structure.dna.nucleotides, 'ref_frames')[central_idx].float()
+    origin = getattr(structure.dna.nucleotides, 'origins')[central_idx].float()
+
+    # Transform positions: (pos - origin) @ R
+    pos_tensor = (pos_tensor - origin) @ ref_frame
+
+    central_mask_tensor = torch.tensor(central_mask, dtype=torch.bool)
+    backbone_mask_tensor = torch.tensor(backbone_mask, dtype=torch.bool)
+    has_pair_tensor = torch.tensor(has_pair_list, dtype=torch.bool)
+    is_chain_edge_tensor = torch.tensor(is_chain_edge_list, dtype=torch.bool)
+    base_types_tensor = F.one_hot(
+        torch.tensor(base_types, dtype=torch.long),
+        num_classes=len(base_to_idx)
+    ).float()
+
+    return Data(
+        x=atom_names_tensor,
+        edge_index=edge_idx,
+        pos=pos_tensor,
+        origin=origin.unsqueeze(0),
+        ref_frame=ref_frame.unsqueeze(0),
+        central_mask=central_mask_tensor,
+        backbone_mask=backbone_mask_tensor,
+        has_pair=has_pair_tensor,
+        is_chain_edge=is_chain_edge_tensor,
+        base_types=base_types_tensor,
+    )
+
+
+def parse_dna(path, use_full_nucleotide, window_size=3, atoms_provider=default_atoms_provider):
+    """Read a PDB/mmCIF file, run pynamod DNA analysis, group nucleotides by chain,
+    slide sliding windows, and build PyG Data objects for every contiguous window.
+
+    Returns:
+        structure: the `CG_Structure` with `analyze_dna` applied.
+        chain_records: list of (chain_key, chain, windows) where `chain` is the list of
+            pynamod nucleotides grouped by chainID (fallback to segid), and `windows` is
+            a list of (window, window_idx, data) for every window of `window_size`
+            consecutive residues (gapped windows are skipped). `data` is the PyG Data
+            object built with `atoms_provider`.
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.pdb':
+        universe = mda.Universe(path)
+    elif ext in ('.cif', '.mmcif'):
+        universe = mmcif_to_mda_universe(path)
+    else:
+        raise ValueError(f'Unsupported input format: {ext!r} (expected .pdb/.cif/.mmcif)')
+
+    structure = CG_Structure(mdaUniverse=universe)
+    nucleic_atoms = structure.u.select_atoms('nucleic')  # type: ignore
+    if len(nucleic_atoms) == 0:
+        raise RuntimeError(f'No nucleic atoms found in {path}.')
+    dna_segids = list(np.unique(nucleic_atoms.segids))
+    structure.analyze_dna(leading_strands=dna_segids, use_full_nucleotide=use_full_nucleotide)
+
+    # Group nucleotides by chains
+    nucleotides_by_chain = defaultdict(list)
+    for segid, nucleotide in zip(
+        structure.dna.nucleotides.segids,  # type: ignore
+        structure.dna.nucleotides
+    ):
+        atom_group = getattr(nucleotide, 'e_residue').atoms
+        atom0 = atom_group[0] if len(atom_group) > 0 else None
+        chain_key = ''
+        if atom0 is not None:
+            chain_key = getattr(atom0, 'chainID', '') or getattr(atom0, 'segid', '')
+        if not chain_key:
+            chain_key = segid
+        if not chain_key:
+            continue
+        nucleotides_by_chain[chain_key].append(nucleotide)
+
+    # Build per-chain windows (skipping short chains and non-contiguous windows).
+    # KeyError/SelectionError inside a chain abort the rest of that chain, matching
+    # the original training-time behaviour.
+    chain_records = []
+    for chain_key, chain in nucleotides_by_chain.items():
+        windows: list = []
+        if len(chain) >= window_size:
+            try:
+                for window_idx in range(len(chain) - window_size + 1):
+                    window = chain[window_idx: window_idx + window_size]
+
+                    # Check for continuity of residues to avoid gaps in the chain
+                    resids = [n.e_residue.resids[0] for n in window]
+                    steps = [resids[i+1] - resids[i] for i in range(len(resids)-1)]
+                    if not (all(s == 1 for s in steps) or all(s == -1 for s in steps)):
+                        continue
+
+                    data = _build_window_data(
+                        window, window_idx, len(chain), structure, window_size, atoms_provider,
+                    )
+                    windows.append((window, window_idx, data))
+            except (KeyError, SelectionError):
+                pass
+        chain_records.append((chain_key, chain, windows))
+
+    return structure, chain_records
 
 
 if __name__ == '__main__':

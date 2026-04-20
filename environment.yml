@@ -7,6 +7,7 @@ dependencies:
   - pip
   - tensorboard
   - plotly
+  - onnx
 
   - pip:
       - --extra-index-url https://download.pytorch.org/whl/cu129

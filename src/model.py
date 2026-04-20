@@ -6,7 +6,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
-from torch_geometric.utils import degree
 
 from utils import atom_to_idx, base_to_idx
 
@@ -51,7 +50,7 @@ class EquivariantConv(nn.Module):
 
     def forward(self, h, x, edge_index):
         # h: [N, hidden_nf], x: [N, 3]
-        row, col = edge_index
+        row, col = edge_index[0], edge_index[1]
 
         # Message passing
         rel_coords = x[row] - x[col]
@@ -73,8 +72,8 @@ class EquivariantConv(nn.Module):
         coord_update.scatter_add_(0, index, coord_update_src)
 
         # Normalize coordinate updates by the number of incoming messages to prevent explosion
-        num_nodes = x.size(0)
-        in_degree = degree(col, num_nodes=num_nodes, dtype=x.dtype).to(x.device).unsqueeze(1)
+        ones = torch.ones(col.size(0), device=x.device, dtype=x.dtype)
+        in_degree = torch.zeros(x.size(0), device=x.device, dtype=x.dtype).scatter_add(0, col, ones).unsqueeze(1)
         x_new = x + coord_update / (in_degree + 1.0)
 
         # Update features
@@ -152,7 +151,7 @@ class EGNNDiff(nn.Module):
             self.add_module(f'gcl_{i}', EquivariantConv(self.hidden_nf, act_fn=act_fn))
 
     def predict_epsilon(self, h, x, edge_index):
-        row, col = edge_index
+        row, col = edge_index[0], edge_index[1]
         rel_coords = x[row] - x[col]
         dist = torch.norm(rel_coords, p=2, dim=-1, keepdim=True)
 
@@ -168,7 +167,8 @@ class EGNNDiff(nn.Module):
         index = col.unsqueeze(1).expand_as(eps_update_src)
         eps.scatter_add_(0, index, eps_update_src)
         if self.eps_normalize_agg:
-            in_degree = degree(col, num_nodes=x.size(0), dtype=x.dtype).to(x.device).unsqueeze(1)
+            ones = torch.ones(col.size(0), device=x.device, dtype=x.dtype)
+            in_degree = torch.zeros(x.size(0), device=x.device, dtype=x.dtype).scatter_add(0, col, ones).unsqueeze(1)
             eps = eps / (in_degree + 1.0)
         if self.eps_use_local_head:
             eps = eps + self.eps_head(torch.cat([h, x], dim=-1))

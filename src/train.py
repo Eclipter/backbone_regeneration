@@ -106,7 +106,7 @@ def train_one(cfg):
 
     # Train and test
     trainer.fit(pl_module, datamodule=data_module, ckpt_path=ckpt_path, weights_only=False)
-    trainer.test(pl_module, ckpt_path='best', weights_only=False)
+    trainer.test(pl_module, datamodule=data_module, ckpt_path='best', weights_only=False)
 
 
 def main():

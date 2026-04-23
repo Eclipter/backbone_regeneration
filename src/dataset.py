@@ -13,7 +13,7 @@ import numpy as np
 import requests
 import torch
 from torch.utils.data import Sampler
-from torch_geometric.data import Data, Dataset
+from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 

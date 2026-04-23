@@ -21,6 +21,7 @@ from Bio.PDB import Atom, Chain
 from Bio.PDB import Model as PDBModel
 from Bio.PDB import Residue, Structure
 from Bio.PDB.mmcifio import MMCIFIO
+from IPython.display import display
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 from tensorboard.backend.event_processing import event_accumulator
 
@@ -28,14 +29,14 @@ import utils as _utils
 from dataset import PyGDataset
 from model import PytorchLightningModule
 
-plt.rcParams['font.family'] = 'DejaVu Sans'
+plt.rcParams['font.family'] = 'Nunito'
 
 # %% [markdown]
 # ### Load model and dataset
 
 # %%
 log_dir = osp.join('..', 'logs')
-run_filename = osp.join('unified_model', 'baseline')
+run_filename = osp.join('fixed_swa', 'central', 'baseline')
 run_dir = osp.join(log_dir, run_filename)
 ckpt_path = osp.join(run_dir, 'checkpoints', 'last.ckpt')
 test_dataset_path = osp.join(run_dir, 'test_dataset.pt')
@@ -80,8 +81,8 @@ fig.add_trace(go.Scatter3d(
     y=non_central_pos[:, 1],
     z=non_central_pos[:, 2],
     mode='markers',
-    marker=dict(size=3, color='blue', opacity=0.5),
-    name='Neighbors'
+    marker=dict(size=5, color='#B366FF', opacity=0.5),
+    name='Соседние нуклеотиды'
 ))
 
 # Central atoms
@@ -90,8 +91,8 @@ fig.add_trace(go.Scatter3d(
     y=central_atoms_pos[:, 1],
     z=central_atoms_pos[:, 2],
     mode='markers',
-    marker=dict(size=5, color='red', opacity=1.0),
-    name='Central Nucleotide'
+    marker=dict(size=10, color='red', opacity=1.0),
+    name='Центральный нуклеотид'
 ))
 
 # Add bonds
@@ -108,7 +109,7 @@ if edge_index is not None:
         x=lines_x, y=lines_y, z=lines_z,
         mode='lines',
         line=dict(color='gray', width=2),
-        name='Bonds'
+        name='Связи'
     ))
 
 # --- CUSTOM AXES (ARROWS) ---
@@ -190,6 +191,22 @@ palette = {
     'feature': '#F0F8FF'
 }
 
+# hidden_dim = int(model.hparams.hidden_dim)
+# num_layers = int(model.hparams.num_layers)
+# time_emb_dim = int(model.time_emb_dim)
+# n_atom_types = int(model.n_atom_types)
+# n_base_types = len(_utils.base_to_idx)
+# n_chain_end_classes = int(_utils.N_CHAIN_END_CLASSES)
+# input_feature_dim = int(model.gnn.embedding_in.in_features)
+
+hidden_dim = 256
+num_layers = 5
+time_emb_dim = 32
+n_atom_types = 27
+n_base_types = 4
+n_chain_end_classes = 2
+input_feature_dim = 256 + 32 + 4 + 2 + 2
+
 
 def draw_box(x, y, width, height, title, desc, desc_align, color):
     ax.add_patch(FancyBboxPatch(
@@ -252,137 +269,150 @@ main_height = MAX_Y * 0.1
 arrow_length = MAX_Y * 0.05
 
 detail_x = MAX_X * 0.7
-detail_y = MAX_Y * 0.68
+detail_y = MAX_Y * 0.72
 detail_width = MAX_X * 0.22
+step_stride = main_height + arrow_length
+
+input_y = main_y
+prep_y = main_y - step_stride
+embed_y = main_y - 2 * step_stride
+egnn_y = main_y - 3 * step_stride
+eps_y = main_y - 4 * step_stride
+output_y = main_y - 5 * step_stride
 
 # Input
 draw_box(
     main_x,
-    main_y,
+    input_y,
     main_width,
     main_height,
     r'Входные данные ($x_t$)',
-    r'• $h \in \mathbb{R}^{N \times 27}$ (типы атомов)' + '\n' +
-    r'• $x \in \mathbb{R}^{N \times 3}$ (координаты)' + '\n' +
-    r'• $\text{матрица смежности} \in \mathbb{Z}^{2 \times E}$ (связи)' + '\n' +
-    r'• $t$ (шаг диффузии)',
+    fr'• $h \in \mathbb{{R}}^{{N \times {n_atom_types}}}$ (типы атомов)' + '\n' +
+    r'• $x \in \mathbb{R}^{N \times 3}$ (координаты окна)' + '\n' +
+    r'• $x_t^{\mathrm{target}} \in \mathbb{R}^{M \times 3}$ (зашумленные backbone)' + '\n' +
+    r'• $\mathrm{edge\_index} \in \mathbb{Z}^{2 \times E}$, $t$',
     'left',
     palette['input']
 )
 draw_arrow(
     main_x + main_width/2,
-    main_y-MAX_Y*0.01,
+    input_y-MAX_Y*0.01,
     main_x + main_width/2,
-    main_y-MAX_Y*0.04
+    input_y-MAX_Y*0.04
 )
 
-# Feature augmentation
+# Input preparation
 draw_box(
     main_x,
-    main_y-(main_height+arrow_length),
+    prep_y,
     main_width,
     main_height,
-    'Добавление признаков',
-    'дублируем $t$ для каждого узла,\nдобавляем метки азотистого\nоснования и спаренность\n' +
-    r'итоговые признаки: $\mathbb{R}^{N \times 30}$',
+    'Подготовка входа',
+    r'строим $\mathrm{target\_mask} = \mathrm{is\_target} \wedge \mathrm{backbone\_mask}$' + '\n' +
+    r'разворачиваем $t$ по узлам, считаем' + '\n' +
+    r'синусоидальный embedding и подставляем' + '\n' +
+    fr'в граф только $x_t^{{\mathrm{{target}}}}$, итог: $\mathbb{{R}}^{{N \times {input_feature_dim}}}$',
     'left',
     palette['pre']
 )
 draw_arrow(
     detail_x,
-    MAX_Y*0.76,
+    prep_y + main_height*0.55,
     main_x + main_width*1.05,
-    MAX_Y*0.76
+    prep_y + main_height*0.55
 )
 draw_box(
     main_x+main_width+MAX_X*0.1,
-    main_y-(main_height+arrow_length),
+    prep_y,
     main_width*1.1,
     main_height,
-    'Дополнительные признаки',
-    r'• Метка азотистого основания $\in \{0, 1, 2, 3\}^N$' + '\n' +
-    r'• Метка спаренности нуклеотида $\in \{0, 1\}^N$',
+    'Собираемые признаки',
+    fr'• one-hot атома: ${n_atom_types}$, embedding времени: ${time_emb_dim}$' + '\n' +
+    fr'• тип основания: ${n_base_types}$, has pair: $1$' + '\n' +
+    fr'• chain-end class: ${n_chain_end_classes}$, is_target: $1$',
     'left',
     palette['embed']
 )
 draw_arrow(
     main_x + main_width/2,
-    main_y-(main_height+arrow_length)*2+MAX_Y*0.04,
+    prep_y-MAX_Y*0.01,
     main_x + main_width/2,
-    main_y-(main_height+arrow_length)*2+MAX_Y*0.04-arrow_length
+    prep_y-MAX_Y*0.04
 )
 
 # Embedding
 draw_box(
     main_x,
-    main_y-(main_height+arrow_length)*2,
+    embed_y,
     main_width,
     main_height,
     'Входной MLP слой',
-    r'линейный слой: $30 \rightarrow 512$' + '\n' +
+    fr'линейный слой: ${input_feature_dim} \rightarrow {hidden_dim}$' + '\n' +
     'SiLU активация\n' +
-    r'координаты: $\mathbb{R}^{N \times 3}$ (неизменны)',
+    r'координаты и ребра передаем' + '\n' +
+    r'дальше без изменения формы',
     'left',
     palette['embed']
 )
 draw_arrow(
     main_x + main_width/2,
-    MAX_Y*0.54,
+    embed_y-MAX_Y*0.01,
     main_x + main_width/2,
-    MAX_Y*0.51
+    embed_y-MAX_Y*0.04
 )
 
 # Equivariant blocks
 draw_box(
     main_x,
-    main_y-(main_height+arrow_length)*3,
+    egnn_y,
     main_width,
     main_height,
-    'EGNN',
-    'SE(3)-эквивариантная свертка (7x):\n' +
+    'EGNN backbone',
+    fr'SE(3)-эквивариантная свертка ({num_layers}x):' + '\n' +
     '• Сообщения по ребрам\n' +
     '• Агрегирование по узлам\n' +
-    '• Обновление (нормировка) координат\n' +
+    '• Обновление координат\n' +
     '• Обновление признаков',
     'left',
     palette['equiv']
 )
 draw_arrow(
     main_x + main_width/2,
-    MAX_Y*0.39,
+    egnn_y-MAX_Y*0.01,
     main_x + main_width/2,
-    MAX_Y*0.36
+    egnn_y-MAX_Y*0.04
 )
 
-# Output embedding
+# Noise head and DDPM decode
 draw_box(
     main_x,
-    main_y-(main_height+arrow_length)*4,
+    eps_y,
     main_width,
     main_height,
-    'Выходной MLP слой',
-    r'$\text{MLP}(512) \rightarrow 512 \rightarrow 27$' + '\n' +
-    'предсказываем шум типов' + '\n' +
-    r'и $x_0$ для координат',
+    r'$\epsilon$-голова + DDPM шаг',
+    r'из финальных $h, x$ считаем' + '\n' +
+    r'$\epsilon_\theta(x_t, t)$ только для цели' + '\n' +
+    r'восстанавливаем $\hat{x}_0$ и параметры' + '\n' +
+    r'$q(x_{t-1} \mid x_t, \hat{x}_0)$',
     'left',
     palette['output']
 )
 draw_arrow(
     main_x + main_width/2,
-    MAX_Y*0.24,
+    eps_y-MAX_Y*0.01,
     main_x + main_width/2,
-    MAX_Y*0.21
+    eps_y-MAX_Y*0.04
 )
 
 # Output
 draw_box(
     main_x,
-    main_y-(main_height+arrow_length)*5,
+    output_y,
     main_width,
     main_height,
     r'Выходные данные ($x_{t-1}$)',
-    r'$h_{\text{out}} \in \mathbb{R}^{N \times 27}$ (логиты типов атомов)' + '\n' +
-    r'$x_{\text{out}} \in \mathbb{R}^{N \times 3}$ (предсказанные координаты)',
+    r'$x_{t-1}^{\mathrm{target}} \in \mathbb{R}^{M \times 3}$ (новые позиции цели)' + '\n' +
+    r'контекстные атомы окна остаются фиксированными',
     'left',
     palette['output']
 )
@@ -391,18 +421,21 @@ draw_box(
 detail_steps = [
     ('Относительные координаты',
      r'$\vec{r}_{ij} = x_i - x_j$' + '\n' + r'$d_{ij} = \|\vec{r}_{ij}\|$'),
-    ('Сообщения',
+    ('Инвариантные сообщения',
      r'$m_{ij} = \text{MLP}([h_i, h_j, d_{ij}])$'),
     ('Агрегация',
-     r'$\bar{m}_i = \sum_j m_{ij}$'),
+     r'$\bar{m}_i = \sum_j m_{ji}$'),
     ('Обновление координат',
-     r'$\Delta x_i = \sum_j m_{ij} \frac{\vec{r}_{ij}}{d_{ij} + \epsilon}$'),
+     r'$\Delta x_i = \sum_j \phi_x(m_{ji}) \frac{\vec{r}_{ji}}{d_{ji} + \epsilon}$'),
     ('Обновление признаков',
-     '$h_i := h_i + MLP([h_i, m_i])+LayerNorm$')
+     r'$h_i := \mathrm{LayerNorm}(h_i + \text{MLP}([h_i, \bar{m}_i]))$'),
+    (r'Предсказание $\epsilon$',
+     r'$\epsilon_i = \sum_j \phi_\epsilon(m_{ji}) \frac{\vec{r}_{ji}}{d_{ji} + \epsilon}$')
 ]
 
-detail_palette_steps = ['#FCE4EC', '#F3E5F5', '#E8F5E9', '#FFF8E1', '#E0F2F1']
-step_height = 2
+detail_palette_steps = ['#FCE4EC', '#F3E5F5', '#E8F5E9', '#FFF8E1', '#E0F2F1', '#E3F2FD']
+step_height = 1.8
+detail_box_height = step_height - 0.55
 
 for idx, (step_title, step_desc) in enumerate(detail_steps):
     y = detail_y - (idx + 1) * step_height
@@ -410,7 +443,7 @@ for idx, (step_title, step_desc) in enumerate(detail_steps):
         detail_x,
         y,
         detail_width,
-        step_height - 0.75,
+        detail_box_height,
         step_title,
         step_desc,
         'center',
@@ -428,17 +461,20 @@ for idx, (step_title, step_desc) in enumerate(detail_steps):
         ))
 
 
-# ============ Lines connecting EGNN block to its details ============
-egnn_y_bottom = MAX_Y * 0.4
-egnn_height = MAX_Y * 0.1
+# ============ Lines connecting core blocks to their details ============
+egnn_height = main_height
 egnn_x_right = main_x + main_width + MAX_X*0.02
-egnn_y_center = egnn_y_bottom + egnn_height/2
+egnn_y_center = egnn_y + egnn_height/2
+
+eps_height = main_height
+eps_x_right = main_x + main_width + MAX_X*0.02
+eps_y_center = eps_y + eps_height/2
 
 rel_coords_y_bottom = detail_y - step_height
-rel_coords_height = step_height - 0.75
+rel_coords_height = detail_box_height
 rel_coords_y_top = rel_coords_y_bottom + rel_coords_height
 
-update_feat_y_bottom = detail_y - 5*step_height
+eps_detail_y_bottom = detail_y - len(detail_steps)*step_height
 
 # Line to top block
 ax.add_patch(FancyArrowPatch(
@@ -450,19 +486,19 @@ ax.add_patch(FancyArrowPatch(
 
 # Line to bottom block
 ax.add_patch(FancyArrowPatch(
-    (egnn_x_right, egnn_y_center),
-    (detail_x - MAX_X*0.02, update_feat_y_bottom),
+    (eps_x_right, eps_y_center),
+    (detail_x - MAX_X*0.02, eps_detail_y_bottom),
     linewidth=2,
     arrowstyle='-'  # Draw a line, not an arrow
 ))
 
 
 # ============ Diffusion arrow ============
-out_block_y = MAX_Y * 0.09
+out_block_y = output_y
 out_block_x_center = main_x + main_width/2
 
-in_block_y = MAX_Y * 0.86
-in_block_height = MAX_Y * 0.1
+in_block_y = input_y
+in_block_height = main_height
 in_block_top_y = in_block_y + in_block_height
 in_block_x_center = main_x + main_width/2
 
@@ -488,7 +524,7 @@ ax.add_patch(FancyArrowPatch(
 ax.text(
     1.2,
     MAX_Y/2,
-    r'$x_{t-1} \rightarrow x_t \text{ (t раз)}$',
+    r'$x_t^{\mathrm{target}} \rightarrow x_{t-1}^{\mathrm{target}}$' + '\n' + r'$(T \text{ шагов DDPM})$',
     fontsize=15,
     rotation=90,
     ha='center',
@@ -543,13 +579,13 @@ def scalars_to_dataframe(ea, tag):
     return pd.DataFrame(rows, columns=['epoch', 'value'])
 
 
-# New logging: only train_rmse and val_rmse are tracked, step == epoch
+# Unified-model logging: only train_rmse and val_rmse are tracked, step == epoch
 tracked_tags = {'train_rmse', 'val_rmse'}
 
 dfs = []
 for ef in event_files:
     ea = load_event_accumulator(ef)
-    for tag in ea.Tags()['scalars']:
+    for tag in ea.Tags()['scalars']:  # type: ignore
         if tag not in tracked_tags:
             continue
         df = scalars_to_dataframe(ea, tag)
@@ -566,99 +602,46 @@ wide_scalars = scalars_by_epoch.pivot_table(
     aggfunc='last'
 )
 
-wide_scalars
+with pd.option_context('display.max_rows', 10):
+    display(wide_scalars)
 
 
 # %%
-_curve_color = 'indigo'
-_curve_label = 'остов центрального + краевого нуклеотидов'
-_type_cfg = {
-    'train': {'tag': 'train_rmse', 'title': 'Функция потерь во время тренировки',
-              'plot_name': 'training_curve.png', 'broken': False},
-    'val':   {'tag': 'val_rmse',   'title': 'Функция потерь во время валидации',
-              'plot_name': 'validation_curve.png', 'broken': True},
-}
+fig, ax = plt.subplots(figsize=(10, 6))
+ax.tick_params(axis='both', labelsize=15)
+sns.despine(ax=ax, top=True, right=True)
 
+values = wide_scalars['train_rmse'].dropna()
+ax.plot(
+    values.index.to_numpy(),
+    values.to_numpy(),
+    color='indigo',
+    linewidth=3,
+    label='Тренировка',
+)
+values = wide_scalars['val_rmse'].dropna()
+ax.plot(
+    values.index.to_numpy(),
+    values.to_numpy(),
+    color='#B366FF',
+    linewidth=3,
+    label='Валидация',
+)
 
-for type, cfg in _type_cfg.items():
-    values = wide_scalars[cfg['tag']].dropna().to_numpy()
-    if cfg['broken']:
-        # Break the y-axis between the initial spike and the converged tail below 3 Å.
-        start_val = float(values[0])
-        y_min = float(np.nanmin(values))
+# Log scale keeps both the validation spike and the converged regime readable on one axis.
+ax.set_yscale('log')
+ax.set_xlabel('Эпоха', fontsize=18)
+ax.set_ylabel('RMSE (Å)', fontsize=18)
+ax.legend(fontsize=14)
 
-        rel = 0.05  # relative padding around the start value
-        top_seg = (start_val * (1 - rel), start_val * (1 + rel))
-        bot_seg = (max(0.0, y_min * 0.9), 3.0)
+fig.tight_layout()
+fig.savefig(
+    osp.join(run_dir, 'train.png'),
+    bbox_inches='tight',
+    dpi=300
+)
 
-        fig, (ax_top, ax_bot) = plt.subplots(
-            2, 1, figsize=(10, 7), sharex=True,
-            gridspec_kw={'height_ratios': [1, 3], 'hspace': 0.1},
-            layout='constrained'
-        )
-
-        for ax in (ax_top, ax_bot):
-            ax.plot(
-                wide_scalars.index.to_numpy(),
-                wide_scalars[cfg['tag']].to_numpy(),
-                color=_curve_color,
-                linewidth=3,
-                label=_curve_label,
-            )
-            ax.tick_params(axis='both', labelsize=15)
-            ax.spines['right'].set_visible(False)
-
-        ax_top.set_ylim(*top_seg)
-        ax_bot.set_ylim(*bot_seg)
-
-        # Hide spines on the break boundaries.
-        ax_top.spines['top'].set_visible(False)
-        ax_top.spines['bottom'].set_visible(False)
-        ax_top.tick_params(bottom=False, labelbottom=False)
-        ax_bot.spines['top'].set_visible(False)
-
-        # Diagonal break markers at the seam.
-        d = 0.5
-        break_kw = dict(
-            marker=[(-1, -d), (1, d)], markersize=12,
-            linestyle='none', color='k', mec='k', mew=1, clip_on=False
-        )
-        ax_top.plot([0, 1], [0, 0], transform=ax_top.transAxes, **break_kw)
-        ax_bot.plot([0, 1], [1, 1], transform=ax_bot.transAxes, **break_kw)
-
-        ax_top.set_title(cfg['title'], fontsize=18, fontweight='bold', pad=20)
-        ax_bot.set_xlabel('Эпоха', fontsize=18)
-        fig.supylabel('RMSE (Å)', fontsize=18)
-        ax_top.legend(fontsize=14, loc='upper right')
-    else:
-        fig, ax = plt.subplots(figsize=(10, 6))
-        ax.tick_params(axis='both', labelsize=15)
-        sns.despine(ax=ax, top=True, right=True)
-
-        sns.lineplot(
-            data=wide_scalars,
-            x='epoch',
-            y=cfg['tag'],
-            color=_curve_color,
-            linewidth=3,
-            label=_curve_label,
-            ax=ax
-        )
-
-        ax.set_title(cfg['title'], fontsize=18, fontweight='bold', pad=20)
-        ax.set_xlabel('Эпоха', fontsize=18)
-        ax.set_ylabel('RMSE (Å)', fontsize=18)
-        ax.legend(fontsize=14)
-
-        fig.tight_layout()
-
-    fig.savefig(
-        osp.join(run_dir, cfg['plot_name']),
-        bbox_inches='tight',
-        dpi=300
-    )
-
-    plt.show()
+plt.show()
 
 # %% [markdown]
 # ### Results

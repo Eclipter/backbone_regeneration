@@ -4,7 +4,6 @@ import os.path as osp
 import shutil
 import warnings
 from datetime import datetime
-from itertools import product
 
 import lightning.pytorch as pl
 import torch
@@ -13,7 +12,7 @@ from lightning.pytorch.callbacks import (ModelCheckpoint,
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning.pytorch.strategies import DDPStrategy
 
-from config import BASE, EXPERIMENTS, PER_MODE, RUN_NAME, SEED
+from config import BASE, EXPERIMENTS, RUN_NAME, SEED
 from dataset import DNADataModule
 from model import PytorchLightningModule
 
@@ -22,7 +21,7 @@ warnings.filterwarnings('ignore', category=FutureWarning, module='torch.distribu
 
 
 def _make_run_version(cfg, baseline):
-    # Short, unique version: only the fields that differ from the per-mode baseline.
+    # Short, unique version: only the fields that differ from the shared baseline.
     diff = {k: cfg[k] for k in cfg if k in baseline and cfg[k] != baseline[k]}
     return '_'.join(f'{k}={v}' for k, v in diff.items()) or 'baseline'
 
@@ -40,7 +39,7 @@ def _get_run_paths(cfg):
             shutil.rmtree(osp.join(log_dir, run_name, run_version), ignore_errors=True)
             ckpt_path = None
     else:
-        run_name = f"{datetime.now().strftime('%Y.%m.%d_%H:%M:%S')}_{cfg['TARGET_MODE']}"
+        run_name = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')
         ckpt_path = None
     return log_dir, run_name, run_version, ckpt_path
 
@@ -48,7 +47,7 @@ def _get_run_paths(cfg):
 def train_one(cfg):
     pl.seed_everything(SEED, workers=True)
 
-    data_module = DNADataModule(target_mode=cfg['TARGET_MODE'], batch_size=cfg['BATCH_SIZE'])
+    data_module = DNADataModule(batch_size=cfg['BATCH_SIZE'])
     pl_module = PytorchLightningModule(
         hidden_dim=cfg['HIDDEN_DIM'],
         num_layers=cfg['NUM_LAYERS'],
@@ -59,7 +58,6 @@ def train_one(cfg):
         lr_scheduler_patience=cfg['LR_SCHEDULER_PATIENCE'],
         lr_scheduler_threshold=cfg['LR_SCHEDULER_THRESHOLD'],
         beta_schedule=cfg['BETA_SCHEDULE'],
-        target_mode=cfg['TARGET_MODE']
     )
 
     num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
@@ -117,12 +115,10 @@ def main():
         lambda r: not any(s in r.getMessage().lower() for s in ('litmodels', 'litlogger'))
     )
 
-    # Cartesian product: every experiment is run for every target_mode
-    for exp, mode in product(EXPERIMENTS, PER_MODE):
-        baseline = {**BASE, **PER_MODE[mode]}
-        run_cfg = {**baseline, **exp, 'TARGET_MODE': mode}
-        run_cfg['RUN_NAME'] = RUN_NAME.format(target_mode=mode) if RUN_NAME else ''
-        run_cfg['RUN_VERSION'] = _make_run_version(run_cfg, baseline)
+    for exp in EXPERIMENTS:
+        run_cfg = {**BASE, **exp}
+        run_cfg['RUN_NAME'] = RUN_NAME
+        run_cfg['RUN_VERSION'] = _make_run_version(run_cfg, BASE)
         train_one(run_cfg)
 
 

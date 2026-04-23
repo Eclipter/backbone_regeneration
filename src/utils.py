@@ -22,6 +22,12 @@ nucleotide_atoms = nucleic_acid_atoms + backbone_atoms
 atom_to_idx = {atom: i for i, atom in enumerate(nucleotide_atoms)}
 base_to_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 
+# 3-class one-hot for where a nucleotide sits in its chain
+CHAIN_END_CLASS_INTERNAL = 0
+CHAIN_END_CLASS_5_PRIME = 1
+CHAIN_END_CLASS_3_PRIME = 2
+N_CHAIN_END_CLASSES = 3
+
 
 def get_pdb_ids():
     query = {
@@ -284,6 +290,27 @@ def has_pair(structure, nucleotide):
     return nucleotide.ind in lead_idxs+lag_idxs
 
 
+def reframe_positions_to_atom(data, atom_idx):
+    """Re-express `data.pos` (stored in the central nucleotide's local frame) into
+    the local frame of the nucleotide that owns atom `atom_idx`. Mutates `data`.
+
+    Training stores coordinates as pos_local = (pos_world - o_c) @ R_c, where
+    (R_c, o_c) is the central nucleotide's ref frame / origin. To switch to
+    another nucleotide's frame (R_k, o_k), undo the central transform and apply
+    the new one: pos_new = (pos_local @ R_c.T + o_c - o_k) @ R_k.
+    """
+    central_atom_idx = int(data.central_mask.nonzero(as_tuple=False)[0].item())
+    if atom_idx == central_atom_idx:
+        return data
+    central_frame = data.ref_frames[central_atom_idx]
+    central_origin = data.origins[central_atom_idx]
+    new_frame = data.ref_frames[atom_idx]
+    new_origin = data.origins[atom_idx]
+    pos_world = data.pos @ central_frame.T + central_origin
+    data.pos = (pos_world - new_origin) @ new_frame
+    return data
+
+
 def rename_atom(atom_name):
     if atom_name == 'O1P':
         return 'OP1'
@@ -323,12 +350,16 @@ def inference_atoms_provider(nucleotide):
     return atoms
 
 
-def _build_window_data(window, window_idx, chain_len, structure, window_size, atoms_provider):
+def _build_window_data(window, window_idx, chain_len, chain_direction, structure, window_size, atoms_provider):
     """Build a PyG Data object for a single window of consecutive nucleotides.
 
     atoms_provider controls where per-atom (name, position) pairs come from. Defaults
     to iterating `nucleotide.e_residue` (used at training time); inference can pass a
     reference-based provider when backbone atoms are missing from the input.
+
+    chain_direction is +1 when the list order of the chain goes 5'->3' (resids
+    ascending), -1 when it goes 3'->5' (lagging strand, resids descending). Used to
+    decide whether `position_in_chain == 0` is the 5' or the 3' terminus.
     """
     base_types = []
     central_mask = []
@@ -336,13 +367,28 @@ def _build_window_data(window, window_idx, chain_len, structure, window_size, at
     atom_positions = []
     backbone_mask = []
     has_pair_list = []
-    is_chain_edge_list = []
+    chain_end_class_list = []
+    atom_ref_frames = []
+    atom_origins = []
+
+    ref_frames_all = getattr(structure.dna.nucleotides, 'ref_frames')
+    origins_all = getattr(structure.dna.nucleotides, 'origins')
+
     for nucleotide_idx, nucleotide in enumerate(window):
         base_type = base_to_idx[nucleotide.restype]
         is_central = nucleotide_idx == window_size // 2
         nt_has_pair = has_pair(structure, nucleotide)
         position_in_chain = window_idx + nucleotide_idx
-        is_chain_edge = position_in_chain == 0 or position_in_chain == chain_len - 1
+        # Map list-order endpoints to 5'/3' using chain_direction
+        if position_in_chain == 0:
+            chain_end_class = CHAIN_END_CLASS_5_PRIME if chain_direction >= 0 else CHAIN_END_CLASS_3_PRIME
+        elif position_in_chain == chain_len - 1:
+            chain_end_class = CHAIN_END_CLASS_3_PRIME if chain_direction >= 0 else CHAIN_END_CLASS_5_PRIME
+        else:
+            chain_end_class = CHAIN_END_CLASS_INTERNAL
+
+        nt_ref_frame = ref_frames_all[nucleotide.ind].float()
+        nt_origin = origins_all[nucleotide.ind].float()
 
         for atom_name, atom_position in atoms_provider(nucleotide):
             atom_names.append(atom_to_idx[atom_name])
@@ -351,7 +397,9 @@ def _build_window_data(window, window_idx, chain_len, structure, window_size, at
             base_types.append(base_type)
             central_mask.append(is_central)
             has_pair_list.append(nt_has_pair)
-            is_chain_edge_list.append(is_chain_edge)
+            chain_end_class_list.append(chain_end_class)
+            atom_ref_frames.append(nt_ref_frame)
+            atom_origins.append(nt_origin)
 
     edge_idx = get_edge_idx(tuple([nucleotide.restype for nucleotide in window]))
 
@@ -361,20 +409,21 @@ def _build_window_data(window, window_idx, chain_len, structure, window_size, at
     ).float()
     pos_tensor = torch.tensor(np.asarray(atom_positions), dtype=torch.float)
 
-    # Align to the central nucleotide's reference frame
-    central_idx = window[window_size // 2].ind
-    # Get R and origin from pynamod storage
-    # R: (3, 3), origin: (1, 3)
-    ref_frame = getattr(structure.dna.nucleotides, 'ref_frames')[central_idx].float()
-    origin = getattr(structure.dna.nucleotides, 'origins')[central_idx].float()
+    central_ind = window[window_size // 2].ind
+    central_ref_frame = ref_frames_all[central_ind].float()
+    central_origin = origins_all[central_ind].float()
+    pos_tensor = (pos_tensor - central_origin) @ central_ref_frame
 
-    # Transform positions: (pos - origin) @ R
-    pos_tensor = (pos_tensor - origin) @ ref_frame
+    ref_frames_tensor = torch.stack(atom_ref_frames, dim=0)
+    origins_tensor = torch.stack(atom_origins, dim=0)
 
     central_mask_tensor = torch.tensor(central_mask, dtype=torch.bool)
     backbone_mask_tensor = torch.tensor(backbone_mask, dtype=torch.bool)
     has_pair_tensor = torch.tensor(has_pair_list, dtype=torch.bool)
-    is_chain_edge_tensor = torch.tensor(is_chain_edge_list, dtype=torch.bool)
+    chain_end_class_long = torch.tensor(chain_end_class_list, dtype=torch.long)
+    chain_end_class_tensor = F.one_hot(chain_end_class_long, num_classes=N_CHAIN_END_CLASSES).float()
+    # 1D mask (not == on one-hot rows, which would be shape [N, num_classes])
+    is_chain_edge_tensor = chain_end_class_long != CHAIN_END_CLASS_INTERNAL
     base_types_tensor = F.one_hot(
         torch.tensor(base_types, dtype=torch.long),
         num_classes=len(base_to_idx)
@@ -384,12 +433,13 @@ def _build_window_data(window, window_idx, chain_len, structure, window_size, at
         x=atom_names_tensor,
         edge_index=edge_idx,
         pos=pos_tensor,
-        origin=origin.unsqueeze(0),
-        ref_frame=ref_frame.unsqueeze(0),
+        ref_frames=ref_frames_tensor,
+        origins=origins_tensor,
         central_mask=central_mask_tensor,
         backbone_mask=backbone_mask_tensor,
         has_pair=has_pair_tensor,
         is_chain_edge=is_chain_edge_tensor,
+        chain_end_class=chain_end_class_tensor,
         base_types=base_types_tensor,
     )
 
@@ -445,6 +495,12 @@ def parse_dna(path, use_full_nucleotide, window_size=3, atoms_provider=default_a
     for chain_key, chain in nucleotides_by_chain.items():
         windows: list = []
         if len(chain) >= window_size:
+            # Infer chain direction (5'->3' vs 3'->5') from endpoint resids.
+            # Standard PDB/mmCIF numbering increases along 5'->3', so a lagging
+            # strand whose list order is reversed shows up as direction == -1.
+            first_resid = chain[0].e_residue.resids[0]
+            last_resid = chain[-1].e_residue.resids[0]
+            chain_direction = 1 if last_resid >= first_resid else -1
             try:
                 for window_idx in range(len(chain) - window_size + 1):
                     window = chain[window_idx: window_idx + window_size]
@@ -456,7 +512,8 @@ def parse_dna(path, use_full_nucleotide, window_size=3, atoms_provider=default_a
                         continue
 
                     data = _build_window_data(
-                        window, window_idx, len(chain), structure, window_size, atoms_provider,
+                        window, window_idx, len(chain), chain_direction,
+                        structure, window_size, atoms_provider,
                     )
                     windows.append((window, window_idx, data))
             except (KeyError, SelectionError):

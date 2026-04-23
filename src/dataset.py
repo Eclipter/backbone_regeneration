@@ -12,7 +12,7 @@ import lightning.pytorch as pl
 import numpy as np
 import requests
 import torch
-from torch.utils.data import Subset
+from torch.utils.data import Sampler
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
@@ -172,7 +172,8 @@ class PyGDataset(Dataset):
             ):
                 edge_paths.extend(per_file_edges)
 
-        # Persist the edge-windows cache
+        # Persist the edge-windows cache so the sampler can classify windows
+        # without having to load every Data file at setup time.
         edge_paths.sort()
         with open(osp.join(self.processed_dir, EDGE_CACHE_NAME), 'w') as f:
             f.write('\n'.join(edge_paths))
@@ -188,24 +189,21 @@ class PyGDataset(Dataset):
     def process_file(self, pdb_id):
         edge_paths: list[str] = []
 
-        # Create a folder for the processed data objects
         pdb_id_processed_dir = osp.join(self.processed_dir, pdb_id)
         os.makedirs(pdb_id_processed_dir, exist_ok=True)
 
         # Load the mmCIF, run pynamod's DNA analysis, and materialise windows
         raw_path = osp.join(self.raw_dir, f'{pdb_id}.cif')
         try:
-            structure, chain_records = utils.parse_dna(
+            _, chain_records = utils.parse_dna(
                 raw_path, use_full_nucleotide=True, window_size=self.window_size,
             )
         except:
             return edge_paths
 
-        # Iterate over chains, then over windows
         data_idx = 0
         for _, _, windows in chain_records:
             for _, _, data in windows:
-                # Save the data object
                 save_path = osp.join(pdb_id_processed_dir, f'{data_idx}.pt')
                 torch.save(data, save_path)
                 if bool(data.is_chain_edge.any().item()):
@@ -215,48 +213,120 @@ class PyGDataset(Dataset):
         return edge_paths
 
 
+class WindowTargetDataset(torch.utils.data.Dataset):
+    """Exposes (window, target_type) virtual samples on top of PyGDataset.
+
+    Every window contributes a central-target sample. Edge windows additionally
+    contribute an edge-target sample, so the unified model can be trained on
+    both tasks from the same backing windows. The `is_target` per-atom mask
+    attached to each emitted Data tells the model which atoms to denoise.
+    """
+
+    CENTRAL = 0
+    EDGE = 1
+
+    def __init__(self, base: 'PyGDataset', window_indices: list[int], is_edge_flags: list[bool]):
+        assert len(window_indices) == len(is_edge_flags)
+        self.base = base
+        # virtual_entries[i] = (window_idx_in_base, target_type)
+        self.virtual_entries: list[tuple[int, int]] = []
+        self.central_virtual: list[int] = []
+        self.edge_virtual: list[int] = []
+        for w_idx, is_edge in zip(window_indices, is_edge_flags):
+            self.central_virtual.append(len(self.virtual_entries))
+            self.virtual_entries.append((w_idx, self.CENTRAL))
+            if is_edge:
+                self.edge_virtual.append(len(self.virtual_entries))
+                self.virtual_entries.append((w_idx, self.EDGE))
+
+    def __len__(self):
+        return len(self.virtual_entries)
+
+    def __getitem__(self, i):
+        w_idx, target_type = self.virtual_entries[i]
+        data = self.base.get(w_idx).clone()
+        if target_type == self.CENTRAL:
+            data.is_target = data.central_mask.clone()
+        else:
+            data.is_target = data.is_chain_edge.clone()
+            # For edge-target samples, express positions in the edge nucleotide's
+            # own reference frame instead of the central one.
+            edge_flat = data.is_chain_edge.view(-1)
+            edge_atom_idx = int(torch.where(edge_flat)[0][0].item())
+            utils.reframe_positions_to_atom(data, edge_atom_idx)
+        return data
+
+
+class EdgeCentralTargetSampler(Sampler[int]):
+    """Weighted sampler yielding edge-target and central-target virtual entries
+    in a fixed ratio (default 1:2).
+
+    Note: the ratio is applied at the *target* level. Edge-target samples come
+    only from edge windows; central-target samples come from any window, which
+    matches the "edge window can be used to reconstruct the central backbone
+    too, but not vice versa" requirement.
+    """
+
+    def __init__(
+        self,
+        dataset: WindowTargetDataset,
+        edge_weight: float = 1.0,
+        central_weight: float = 2.0,
+        num_samples: Optional[int] = None,
+        generator: Optional[torch.Generator] = None,
+    ):
+        num_edge = len(dataset.edge_virtual)
+        num_central = len(dataset.central_virtual)
+
+        weights = torch.zeros(len(dataset), dtype=torch.double)
+        if num_edge > 0:
+            weights[dataset.edge_virtual] = edge_weight / num_edge
+        if num_central > 0:
+            weights[dataset.central_virtual] = central_weight / num_central
+
+        self.weights = weights
+        self.num_samples = num_samples if num_samples is not None else len(dataset)
+        self.generator = generator
+
+    def __iter__(self):
+        idx = torch.multinomial(
+            self.weights, self.num_samples, replacement=True, generator=self.generator
+        )
+        return iter(idx.tolist())
+
+    def __len__(self):
+        return self.num_samples
+
+
 class DNADataModule(pl.LightningDataModule):
-    def __init__(self, target_mode, batch_size, train_ratio=0.7, val_ratio=0.2):
+    def __init__(self, batch_size, train_ratio=0.7, val_ratio=0.2,
+                 edge_weight=1.0, central_weight=2.0):
         super().__init__()
 
         self.batch_size = batch_size
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
-        self.target_mode = target_mode
+        self.edge_weight = edge_weight
+        self.central_weight = central_weight
 
         self.num_workers = len(os.sched_getaffinity(0))
         self.train_generator = torch.Generator().manual_seed(SEED)
 
     def prepare_data(self):
-        dataset = PyGDataset()
+        PyGDataset()
 
-        if self.target_mode == 'edge':
-            cache_path = osp.join(dataset.processed_dir, EDGE_CACHE_NAME)
-            if not osp.exists(cache_path):
-                with ThreadPoolExecutor() as executor:
-                    flags = list(tqdm(
-                        executor.map(self._window_has_chain_edge, dataset.data_list),
-                        total=len(dataset.data_list),
-                        desc='Filtering edge windows',
-                        colour=PBAR_COLOR
-                    ))
-                kept = [p for p, keep in zip(dataset.data_list, flags) if keep]
-                tmp_path = cache_path + '.tmp'
-                with open(tmp_path, 'w') as f:
-                    f.write('\n'.join(kept))
-                os.replace(tmp_path, cache_path)
-
-    @staticmethod
-    def _window_has_chain_edge(path):
-        return bool(torch.load(path, weights_only=False).is_chain_edge.any().item())
+    def _load_edge_paths(self, dataset: 'PyGDataset') -> set[str]:
+        cache_path = osp.join(dataset.processed_dir, EDGE_CACHE_NAME)
+        if not osp.exists(cache_path):
+            raise FileNotFoundError(
+                f'Edge-window cache `{cache_path}` is missing. Re-run processing.'
+            )
+        with open(cache_path) as f:
+            return {line for line in f.read().splitlines() if line}
 
     def setup(self, stage: Optional[str] = None):
         dataset = PyGDataset()
-
-        if self.target_mode == 'edge':
-            cache_path = osp.join(dataset.processed_dir, EDGE_CACHE_NAME)
-            with open(cache_path) as f:
-                dataset.data_list = [line for line in f.read().splitlines() if line]
+        edge_paths = self._load_edge_paths(dataset)
 
         # Structure-wise split: group windows by their parent PDB directory so
         # that all windows from a single structure end up in the same subset
@@ -281,16 +351,25 @@ class DNADataModule(pl.LightningDataModule):
         val_indices = [i for pdb_id in val_pdb_ids for i in indices_by_structure[pdb_id]]
         test_indices = [i for pdb_id in test_pdb_ids for i in indices_by_structure[pdb_id]]
 
-        self.train_dataset: Subset[Data] = Subset(dataset, train_indices)
-        self.val_dataset: Subset[Data] = Subset(dataset, val_indices)
-        self.test_dataset: Subset[Data] = Subset(dataset, test_indices)
+        def _wrap(indices: list[int]) -> WindowTargetDataset:
+            flags = [dataset.data_list[i] in edge_paths for i in indices]
+            return WindowTargetDataset(dataset, indices, flags)
+
+        self.train_dataset = _wrap(train_indices)
+        self.val_dataset = _wrap(val_indices)
+        self.test_dataset = _wrap(test_indices)
 
     def train_dataloader(self):
+        sampler = EdgeCentralTargetSampler(
+            self.train_dataset,
+            edge_weight=self.edge_weight,
+            central_weight=self.central_weight,
+            generator=self.train_generator,
+        )
         return DataLoader(
             cast(Dataset, self.train_dataset),
             batch_size=self.batch_size,
-            shuffle=True,
-            generator=self.train_generator,
+            sampler=sampler,
             num_workers=self.num_workers,
             persistent_workers=True,
             multiprocessing_context='spawn'

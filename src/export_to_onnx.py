@@ -6,7 +6,6 @@ from glob import glob
 
 import torch
 
-from config import PER_MODE
 from model import PytorchLightningModule
 from utils import atom_to_idx, base_to_idx
 
@@ -27,7 +26,7 @@ SCHEDULE_BUFFERS = (
 
 # Keys from self.hparams that describe what the denoiser expects and how to
 # wrap it into reverse-diffusion sampling at inference time
-HPARAM_KEYS = ('hidden_dim', 'num_layers', 'num_timesteps', 'beta_schedule', 'target_mode')
+HPARAM_KEYS = ('hidden_dim', 'num_layers', 'num_timesteps', 'beta_schedule')
 
 
 def find_best_checkpoint(run_dir):
@@ -64,7 +63,7 @@ def find_best_checkpoint(run_dir):
 
 
 def _resolve_run_dir(run):
-    """Map a user-facing experiment id (e.g. ``fixed_swa/central/baseline``) to its log directory.
+    """Map a user-facing experiment id (e.g. ``fixed_swa/baseline``) to its log directory.
 
     A redundant leading ``logs/`` is stripped so both ``fixed_swa/...`` and
     ``logs/fixed_swa/...`` resolve to the same place.
@@ -157,10 +156,7 @@ def _parse_args():
     p.add_argument(
         '--run-dir',
         required=True,
-        help=(
-            'Experiment id template relative to logs/ (e.g. "fixed_swa/{target_mode}/baseline"). '
-            'Must contain "{target_mode}"; both modes from config.PER_MODE are exported in one call.'
-        ),
+        help='Experiment id relative to logs/ (e.g. "fixed_swa/baseline").',
     )
     p.add_argument('--opset', type=int, default=17, help='ONNX opset version (>=16 required for ScatterND).')
     return p.parse_args()
@@ -168,14 +164,10 @@ def _parse_args():
 
 if __name__ == '__main__':
     args = _parse_args()
-    if '{target_mode}' not in args.run_dir:
-        raise SystemExit('--run-dir must contain "{target_mode}"; both modes are always exported.')
 
-    for mode in PER_MODE:
-        run_dir = _resolve_run_dir(args.run_dir.format(target_mode=mode))
-        ckpt_path = find_best_checkpoint(run_dir)
-        out_dir = osp.join(MODEL_DIR, mode)
-        print(f'[{mode}] Best checkpoint:         {ckpt_path}')
-        onnx_path, json_path = export_to_onnx(ckpt_path, out_dir, args.opset)
-        print(f'[{mode}] Exported ONNX graph:     {onnx_path}')
-        print(f'[{mode}] Exported companion JSON: {json_path}')
+    run_dir = _resolve_run_dir(args.run_dir)
+    ckpt_path = find_best_checkpoint(run_dir)
+    print(f'Best checkpoint:         {ckpt_path}')
+    onnx_path, json_path = export_to_onnx(ckpt_path, MODEL_DIR, args.opset)
+    print(f'Exported ONNX graph:     {onnx_path}')
+    print(f'Exported companion JSON: {json_path}')

@@ -38,18 +38,42 @@ def _load_model(ckpt_path, device):
 
 
 @torch.no_grad()
-def _predict_window(model, data, device):
+def _predict_window(model, data, frame_atom_idx, device):
     """Reverse-diffuse a single window; returns world-frame positions of the atoms the
-    model was trained to predict, in the order they appear in the window.
+    model was asked to predict (selected via `data.is_target`), in the order they
+    appear in the window. `frame_atom_idx` names the atom whose nucleotide frame
+    `data.pos` is currently expressed in (matches the training-time frame).
     """
     batch = Batch.from_data_list([data]).to(device)  # type: ignore
     gen_pos_local = model.sample(batch)
-    origin = data.origin.squeeze(0).to(device)
-    ref_frame = data.ref_frame.squeeze(0).to(device)
+    origin = data.origins[frame_atom_idx].to(device)
+    ref_frame = data.ref_frames[frame_atom_idx].to(device)
     return (gen_pos_local @ ref_frame.T + origin).cpu().numpy()
 
 
-def predict_backbone(input_path, central_ckpt, edge_ckpt, device='cuda'):
+def _run_target(model, data, target_mask_attr, device, meta, predictions):
+    """Set `is_target` to the requested mask, run the diffusion sampler, and store
+    the world-frame predicted coordinates into the shared `predictions` dict.
+    """
+    target = getattr(data, target_mask_attr) & data.backbone_mask
+    if not target.any():
+        return
+    sample_data = data.clone()
+    sample_data.is_target = getattr(sample_data, target_mask_attr).clone()
+    # Mirror training-time frame choice: edge targets use the edge nucleotide's
+    # frame, central targets keep the central nucleotide's frame.
+    if target_mask_attr == 'is_chain_edge':
+        frame_atom_idx = int(sample_data.is_chain_edge.nonzero(as_tuple=True)[0][0])
+        utils.reframe_positions_to_atom(sample_data, frame_atom_idx)
+    else:
+        frame_atom_idx = int(sample_data.central_mask.nonzero(as_tuple=True)[0][0])
+    pred = _predict_window(model, sample_data, frame_atom_idx, device)
+    target_idx = target.nonzero(as_tuple=True)[0].tolist()
+    for idx, xyz in zip(target_idx, pred):
+        predictions[meta[idx]] = xyz
+
+
+def predict_backbone(input_path, ckpt_path, device='cuda'):
     """Load input, run reverse diffusion per window, return predicted backbone atoms.
 
     Returns:
@@ -66,26 +90,18 @@ def predict_backbone(input_path, central_ckpt, edge_ckpt, device='cuda'):
         atoms_provider=utils.inference_atoms_provider,
     )
 
-    central_model = _load_model(central_ckpt, device)
-    edge_model = _load_model(edge_ckpt, device)
+    model = _load_model(ckpt_path, device)
 
     predictions = {}
     for _, _, windows in chain_records:
         for window, _, data in windows:
             meta = _window_atom_meta(window)
-            # central predicts the middle nucleotide's backbone;
-            # edge predicts chain-endpoint nucleotides' backbone
-            model_masks = (
-                (central_model, data.central_mask & data.backbone_mask),
-                (edge_model, data.is_chain_edge & data.backbone_mask),
-            )
-            for model, target_mask in model_masks:
-                if not target_mask.any():
-                    continue
-                pred = _predict_window(model, data, device)
-                target_idx = target_mask.nonzero(as_tuple=True)[0].tolist()
-                for idx, xyz in zip(target_idx, pred):
-                    predictions[meta[idx]] = xyz
+            # The unified model produces one target per forward pass. Always ask for
+            # the central nucleotide; additionally, for chain-edge windows, ask for
+            # the edge nucleotide so positions 0 and L-1 of each chain are covered.
+            _run_target(model, data, 'central_mask', device, meta, predictions)
+            if data.is_chain_edge.any():
+                _run_target(model, data, 'is_chain_edge', device, meta, predictions)
 
     return predictions, chain_records
 
@@ -214,25 +230,18 @@ def _parse_args():
     p.add_argument(
         '--run-dir',
         required=True,
-        help=(
-            'Experiment id template relative to logs/ (must contain "{target_mode}"), '
-            'e.g. "models/{target_mode}". Both modes are resolved automatically.'
-        ),
+        help='Experiment id relative to logs/ (e.g. "fixed_swa/baseline").',
     )
     return p.parse_args()
 
 
 if __name__ == '__main__':
     args = _parse_args()
-    if '{target_mode}' not in args.run_dir:
-        raise SystemExit('--run-dir must contain "{target_mode}".')
 
-    central_ckpt = find_best_checkpoint(_resolve_run_dir(args.run_dir.format(target_mode='central')))
-    edge_ckpt = find_best_checkpoint(_resolve_run_dir(args.run_dir.format(target_mode='edge')))
-    print(f'[central] checkpoint: {central_ckpt}')
-    print(f'[edge]    checkpoint: {edge_ckpt}')
+    ckpt_path = find_best_checkpoint(_resolve_run_dir(args.run_dir))
+    print(f'checkpoint: {ckpt_path}')
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    predictions, chain_records = predict_backbone(args.input, central_ckpt, edge_ckpt, device=device)
+    predictions, chain_records = predict_backbone(args.input, ckpt_path, device=device)
     write_structure(chain_records, predictions, args.output)
     print(f'Wrote {args.output} ({len(predictions)} predicted backbone atoms).')

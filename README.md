@@ -39,21 +39,21 @@ python src/train.py
 python src/visualize.py
 ```
 
-4. Export the best model to ONNX. Pass `--run-dir` as a path template that still contains the literal `{target_mode}` segment (do not substitute it yourself). One invocation exports every mode in `config.PER_MODE`, so each expanded run directory must exist and include a trained checkpoint.
+4. Export the best model to ONNX. A single unified checkpoint regenerates both central and chain-edge nucleotides via the per-atom `is_target` flag, so `--run-dir` points to one concrete run directory.
 
 ```bash
-python src/export_to_onnx.py --run-dir logs/fixed_swa/{target_mode}/baseline
+python src/export_to_onnx.py --run-dir logs/fixed_swa/baseline
 ```
 
 ## Usage
 
 1. Make sure to set up the environment. See [Environment Setup](#environment-setup)
 
-2. Predict the backbone. Pass `--run-dir` as a path template that still contains the literal `{target_mode}` segment (do not substitute it yourself). One invocation runs inference for every entry in `config.PER_MODE`, so each expanded run directory must exist and include a trained checkpoint. Input and output may be PDB or mmCIF independently (e.g. PDB in, mmCIF out).
+2. Predict the backbone. `--run-dir` points to one concrete run directory with a trained checkpoint; the unified model is called once per window for the central nucleotide and, additionally, once per edge window for the chain-edge nucleotide. Input and output may be PDB or mmCIF independently (e.g. PDB in, mmCIF out).
 
 ```bash
 python src/predict.py \
-    --run-dir models/{target_mode} \
+    --run-dir models \
     --input input.pdb \
     --output output.pdb
 ```

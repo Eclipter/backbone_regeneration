@@ -7,7 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from utils import atom_to_idx, base_to_idx
+from utils import CHAIN_END_CLASS_INTERNAL, N_CHAIN_END_CLASSES, atom_to_idx, base_to_idx
 
 
 class SinusoidalPositionalEmbeddings(nn.Module):
@@ -185,11 +185,8 @@ class EGNNDiff(nn.Module):
 class PytorchLightningModule(pl.LightningModule):
     def __init__(self, hidden_dim, num_layers, num_timesteps, batch_size, lr,
                  lr_scheduler, lr_scheduler_patience, lr_scheduler_threshold,
-                 target_mode, beta_schedule):
+                 beta_schedule):
         super().__init__()
-        assert target_mode in ('central', 'edge'), (
-            f"target_mode must be 'central' or 'edge', got {target_mode!r}"
-        )
         self.save_hyperparameters()
 
         self.n_atom_types = len(atom_to_idx)
@@ -197,8 +194,8 @@ class PytorchLightningModule(pl.LightningModule):
         self.time_mlp = SinusoidalPositionalEmbeddings(self.time_emb_dim)
 
         self.gnn = EGNNDiff(
-            # + 1 for has_pair, + 1 for is_chain_edge
-            in_node_nf=self.n_atom_types + self.time_emb_dim + len(base_to_idx) + 2,
+            # +1 for has_pair, +N_CHAIN_END_CLASSES for chain_end_class one-hot, +1 for is_target
+            in_node_nf=self.n_atom_types + self.time_emb_dim + len(base_to_idx) + 2 + N_CHAIN_END_CLASSES,
             hidden_nf=hidden_dim,
             num_layers=num_layers,
         )
@@ -260,16 +257,28 @@ class PytorchLightningModule(pl.LightningModule):
         return node_t.long()
 
     def _target_mask(self, batch):
-        mode = getattr(self.hparams, 'target_mode')
-        if mode == 'central':
-            return batch.central_mask & batch.backbone_mask
-        return batch.is_chain_edge & batch.backbone_mask
+        return batch.is_target & batch.backbone_mask
 
     def _build_node_features(self, batch, node_t):
         t_emb = self.time_mlp(node_t.float())
         has_pair_expanded = batch.has_pair.float().unsqueeze(1)
-        is_chain_edge_expanded = batch.is_chain_edge.float().unsqueeze(1)
-        return torch.cat([batch.x, t_emb, batch.base_types, has_pair_expanded, is_chain_edge_expanded], dim=1)
+        is_target_expanded = batch.is_target.float().unsqueeze(1)
+        chain_end = getattr(batch, 'chain_end_class', None)
+        if chain_end is None:
+            # Older processed graphs without chain-end one-hot
+            chain_end = F.one_hot(
+                torch.full(
+                    (batch.x.size(0),),
+                    CHAIN_END_CLASS_INTERNAL,
+                    device=batch.x.device,
+                    dtype=torch.long,
+                ),
+                num_classes=N_CHAIN_END_CLASSES,
+            ).float().to(dtype=batch.x.dtype)
+        return torch.cat([
+            batch.x, t_emb, batch.base_types,
+            has_pair_expanded, chain_end, is_target_expanded,
+        ], dim=1)
 
     def _predict_noise(self, batch, target_mask, pos_target, node_t):
         h = self._build_node_features(batch, node_t)

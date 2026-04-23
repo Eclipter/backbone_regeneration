@@ -7,7 +7,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from utils import CHAIN_END_CLASS_INTERNAL, N_CHAIN_END_CLASSES, atom_to_idx, base_to_idx
+from utils import (CHAIN_END_CLASS_INTERNAL, N_CHAIN_END_CLASSES, atom_to_idx,
+                   base_to_idx)
 
 
 class SinusoidalPositionalEmbeddings(nn.Module):
@@ -26,24 +27,25 @@ class SinusoidalPositionalEmbeddings(nn.Module):
 
 
 class EquivariantConv(nn.Module):
-    def __init__(self, hidden_nf, act_fn=nn.SiLU()):
+    def __init__(self, hidden_nf, act_fn_cls=nn.SiLU):
         super().__init__()
         self.hidden_nf = hidden_nf
+        act_fn = act_fn_cls
         self.message_mlp = nn.Sequential(
             nn.Linear(2 * hidden_nf + 1, hidden_nf),
-            act_fn,
+            act_fn(),
             nn.Linear(hidden_nf, hidden_nf),
-            act_fn
+            act_fn()
         )
         self.coord_mlp = nn.Sequential(
             nn.Linear(hidden_nf, hidden_nf),
-            act_fn,
+            act_fn(),
             nn.Linear(hidden_nf, 1, bias=False),
             nn.Tanh()
         )
         self.node_update_mlp = nn.Sequential(
             nn.Linear(hidden_nf + hidden_nf, hidden_nf),
-            act_fn,
+            act_fn(),
             nn.Linear(hidden_nf, hidden_nf)
         )
         self.ln = nn.LayerNorm(hidden_nf)
@@ -114,54 +116,45 @@ def extract(a, t, x_shape):
 
 
 class EGNNDiff(nn.Module):
-    def __init__(self, in_node_nf, hidden_nf, num_layers, act_fn=nn.SiLU()):
+    def __init__(self, in_node_nf, hidden_nf, num_layers, act_fn_cls=nn.SiLU):
         super().__init__()
         self.hidden_nf = hidden_nf
         self.num_layers = num_layers
-        self.eps_directional_head = False
-        self.eps_use_local_head = True
+        act_fn = act_fn_cls
         self.eps_normalize_agg = False
 
         self.embedding_in = nn.Linear(in_node_nf, self.hidden_nf)
-        # rel_coords (3) + dist (1)
+
         self.eps_message_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_nf + 4, hidden_nf),
-            act_fn,
+            nn.Linear(2 * hidden_nf + 1, hidden_nf),
+            act_fn(),
             nn.Linear(hidden_nf, hidden_nf),
-            act_fn
-        )
-        self.eps_coord_mlp = nn.Sequential(
-            nn.Linear(hidden_nf, hidden_nf),
-            act_fn,
-            nn.Linear(hidden_nf, 3)
+            act_fn()
         )
         self.eps_coord_scalar_mlp = nn.Sequential(
             nn.Linear(hidden_nf, hidden_nf),
-            act_fn,
+            act_fn(),
             nn.Linear(hidden_nf, 1, bias=False),
             nn.Tanh()
         )
         self.eps_head = nn.Sequential(
             nn.Linear(hidden_nf + 3, hidden_nf),
-            act_fn,
+            act_fn(),
             nn.Linear(hidden_nf, 3)
         )
 
         for i in range(0, num_layers):
-            self.add_module(f'gcl_{i}', EquivariantConv(self.hidden_nf, act_fn=act_fn))
+            self.add_module(f'gcl_{i}', EquivariantConv(self.hidden_nf, act_fn_cls=act_fn))
 
     def predict_epsilon(self, h, x, edge_index):
         row, col = edge_index[0], edge_index[1]
         rel_coords = x[row] - x[col]
         dist = torch.norm(rel_coords, p=2, dim=-1, keepdim=True)
 
-        message_input = torch.cat([h[row], h[col], rel_coords, dist], dim=-1)
+        message_input = torch.cat([h[row], h[col], dist], dim=-1)
         eps_messages = self.eps_message_mlp(message_input)
-        if self.eps_directional_head:
-            rel_dir = rel_coords / (dist + 1e-8)
-            eps_update_src = self.eps_coord_scalar_mlp(eps_messages) * rel_dir
-        else:
-            eps_update_src = self.eps_coord_mlp(eps_messages)
+        rel_dir = rel_coords / (dist + 1e-8)
+        eps_update_src = self.eps_coord_scalar_mlp(eps_messages) * rel_dir
 
         eps = torch.zeros_like(x, dtype=eps_update_src.dtype)
         index = col.unsqueeze(1).expand_as(eps_update_src)
@@ -170,8 +163,7 @@ class EGNNDiff(nn.Module):
             ones = torch.ones(col.size(0), device=x.device, dtype=x.dtype)
             in_degree = torch.zeros(x.size(0), device=x.device, dtype=x.dtype).scatter_add(0, col, ones).unsqueeze(1)
             eps = eps / (in_degree + 1.0)
-        if self.eps_use_local_head:
-            eps = eps + self.eps_head(torch.cat([h, x], dim=-1))
+        eps = eps + self.eps_head(torch.cat([h, x], dim=-1))
         return eps
 
     def forward(self, h, x, edge_index):
@@ -263,18 +255,7 @@ class PytorchLightningModule(pl.LightningModule):
         t_emb = self.time_mlp(node_t.float())
         has_pair_expanded = batch.has_pair.float().unsqueeze(1)
         is_target_expanded = batch.is_target.float().unsqueeze(1)
-        chain_end = getattr(batch, 'chain_end_class', None)
-        if chain_end is None:
-            # Older processed graphs without chain-end one-hot
-            chain_end = F.one_hot(
-                torch.full(
-                    (batch.x.size(0),),
-                    CHAIN_END_CLASS_INTERNAL,
-                    device=batch.x.device,
-                    dtype=torch.long,
-                ),
-                num_classes=N_CHAIN_END_CLASSES,
-            ).float().to(dtype=batch.x.dtype)
+        chain_end = getattr(batch, 'chain_end_class')
         return torch.cat([
             batch.x, t_emb, batch.base_types,
             has_pair_expanded, chain_end, is_target_expanded,
@@ -373,8 +354,13 @@ class PytorchLightningModule(pl.LightningModule):
             on_step=False,
             on_epoch=True,
             sync_dist=True,
-            batch_size=batch.x.size(0)
+            batch_size=batch.x.size(0),
+            logger=False
         )
+
+    def on_test_epoch_end(self):
+        metric = self.trainer.callback_metrics['test_rmse']
+        self.logger.experiment.add_scalar('test_rmse', metric, self.current_epoch)  # type: ignore
 
     def configure_optimizers(self):  # type: ignore
         optimizer = torch.optim.AdamW(self.parameters(), lr=getattr(self.hparams, 'lr'))

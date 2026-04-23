@@ -10,7 +10,6 @@ import torch
 from lightning.pytorch.callbacks import (ModelCheckpoint,
                                          StochasticWeightAveraging)
 from lightning.pytorch.loggers import TensorBoardLogger
-from lightning.pytorch.strategies import DDPStrategy
 
 from config import BASE, EXPERIMENTS, RUN_NAME, SEED
 from dataset import DNADataModule
@@ -61,11 +60,6 @@ def train_one(cfg):
     )
 
     num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
-    strategy = (
-        DDPStrategy(find_unused_parameters=True)
-        if torch.cuda.device_count() > 1 or num_nodes > 1
-        else 'auto'
-    )
 
     # Initialize logger
     log_dir, run_name, run_version, ckpt_path = _get_run_paths(cfg)
@@ -93,7 +87,6 @@ def train_one(cfg):
         precision='16-mixed',
         log_every_n_steps=-1,
         num_nodes=num_nodes,
-        strategy=strategy,
         logger=logger,
         callbacks=[
             checkpoint_callback,

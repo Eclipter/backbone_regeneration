@@ -7,7 +7,7 @@ from datetime import datetime
 
 import lightning.pytorch as pl
 import torch
-from lightning.pytorch.callbacks import (ModelCheckpoint,
+from lightning.pytorch.callbacks import (LearningRateMonitor, ModelCheckpoint,
                                          StochasticWeightAveraging)
 from lightning.pytorch.loggers import TensorBoardLogger
 
@@ -75,6 +75,7 @@ def train_one(cfg):
         save_last=True,
         enable_version_counter=False
     )
+    lr_callback = LearningRateMonitor(logging_interval='epoch')
     if cfg['SWA']:
         swa = StochasticWeightAveraging(
             swa_lrs=cfg['SWA_LR']*cfg['LR'],
@@ -91,6 +92,7 @@ def train_one(cfg):
         logger=logger,
         callbacks=[
             checkpoint_callback,
+            lr_callback,
             *([swa] if cfg['SWA'] else [])  # type: ignore
         ],
         enable_model_summary=False

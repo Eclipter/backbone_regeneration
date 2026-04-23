@@ -68,8 +68,8 @@ def train_one(cfg):
 
     # Initialize callbacks
     checkpoint_callback = ModelCheckpoint(
-        filename='{epoch}',
-        monitor='val_rmse_step',
+        # filename='{epoch}',
+        monitor='val_rmse',
         every_n_epochs=5,
         save_top_k=10,
         save_last=True,

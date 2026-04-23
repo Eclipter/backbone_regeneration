@@ -115,6 +115,15 @@ def extract(a, t, x_shape):
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 
+def extract_or_fill(a, t, x_shape, fill_value):
+    b, *_ = t.shape
+    out = torch.full((b,), fill_value, device=t.device, dtype=a.dtype)
+    valid = t >= 0
+    if valid.any():
+        out[valid] = a.gather(-1, t[valid])
+    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
+
+
 class EGNNDiff(nn.Module):
     def __init__(self, in_node_nf, hidden_nf, num_layers, act_fn_cls=nn.SiLU):
         super().__init__()
@@ -177,9 +186,26 @@ class EGNNDiff(nn.Module):
 class PytorchLightningModule(pl.LightningModule):
     def __init__(self, hidden_dim, num_layers, num_timesteps, batch_size, lr,
                  lr_scheduler, lr_scheduler_patience, lr_scheduler_threshold,
-                 beta_schedule):
+                 beta_schedule, sampling_steps=50, **compat_kwargs):
         super().__init__()
-        self.save_hyperparameters()
+        # Keep loading older checkpoints that stored now-removed sampler knobs.
+        compat_kwargs.pop('sampler', None)
+        compat_kwargs.pop('ddim_eta', None)
+        if compat_kwargs:
+            unknown = ', '.join(sorted(compat_kwargs))
+            raise TypeError(f'Unexpected checkpoint hyperparameters: {unknown}')
+        self.save_hyperparameters(
+            'hidden_dim',
+            'num_layers',
+            'num_timesteps',
+            'batch_size',
+            'lr',
+            'lr_scheduler',
+            'lr_scheduler_patience',
+            'lr_scheduler_threshold',
+            'beta_schedule',
+            'sampling_steps',
+        )
 
         self.n_atom_types = len(atom_to_idx)
         self.time_emb_dim = 32
@@ -205,7 +231,6 @@ class PytorchLightningModule(pl.LightningModule):
         self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
         self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
 
-        # For p_sample
         self.register_buffer('posterior_variance', betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod))
         self.register_buffer('posterior_log_variance_clipped', torch.log(getattr(self, 'posterior_variance').clamp(min=1e-20)))
         self.register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
@@ -225,15 +250,6 @@ class PytorchLightningModule(pl.LightningModule):
 
         noisy_pos = sqrt_alphas_cumprod_t * pos_start + sqrt_one_minus_alphas_cumprod_t * noise_pos
         return noisy_pos
-
-    def q_posterior_mean_variance(self, x_start, x_t, t):
-        posterior_mean = (
-            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start
-            + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
-        )
-        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
-        return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def _expand_node_t(self, batch, t):
         num_nodes = batch.x.size(0)
@@ -274,31 +290,68 @@ class PytorchLightningModule(pl.LightningModule):
         return (pos_noisy - sqrt_one_minus_alphas_cumprod_t * pred_noise_pos) / sqrt_alphas_cumprod_t
 
     @torch.no_grad()
-    def p_sample(self, pos_t, t, batch):
+    def _build_sampling_schedule(self, device):
+        total_steps = int(getattr(self.hparams, 'num_timesteps'))
+        requested_steps = int(getattr(self.hparams, 'sampling_steps', total_steps))
+        sampling_steps = max(1, min(requested_steps, total_steps))
+
+        if sampling_steps == total_steps:
+            timesteps = torch.arange(total_steps - 1, -1, -1, device=device, dtype=torch.long)
+        else:
+            timesteps = torch.linspace(
+                total_steps - 1,
+                0,
+                steps=sampling_steps,
+                device=device,
+            ).round().to(torch.long)
+            timesteps = torch.unique_consecutive(timesteps)
+            if timesteps.numel() > 1:
+                timesteps[0] = total_steps - 1
+                timesteps[-1] = 0
+
+        prev_timesteps = torch.cat([timesteps[1:], timesteps.new_full((1,), -1)])
+        return timesteps, prev_timesteps
+
+    @torch.no_grad()
+    def _init_reverse_noise(self, reference):
+        # Deterministic DDIM starts from the prior mean to produce one repeatable prediction.
+        return torch.zeros_like(reference)
+
+    @torch.no_grad()
+    def _ddim_step(self, pos_t, t, t_prev, batch):
         target_mask = self._target_mask(batch)
         node_t = self._expand_node_t(batch, t)
         target_t = node_t[target_mask]
 
-        model_output = self._predict_noise(batch, target_mask, pos_t, node_t)
-        pred_pos_start = self._decode_epsilon_to_x0(pos_t, model_output, target_t)
-        model_mean_pos, _, model_log_variance_pos = self.q_posterior_mean_variance(x_start=pred_pos_start, x_t=pos_t, t=target_t)
+        pred_noise_pos = self._predict_noise(batch, target_mask, pos_t, node_t)
+        pred_pos_start = self._decode_epsilon_to_x0(pos_t, pred_noise_pos, target_t)
 
-        noise_pos = torch.randn_like(pos_t)
-        nonzero_mask = (target_t > 0).float().unsqueeze(1)
-        pred_pos = model_mean_pos + (0.5 * model_log_variance_pos).exp() * noise_pos * nonzero_mask
+        target_prev_t = torch.full_like(target_t, int(t_prev.item()))
+        alpha_t = extract(self.alphas_cumprod, target_t, pos_t.shape).clamp(min=1e-8, max=1.0)
+        alpha_prev = extract_or_fill(
+            self.alphas_cumprod,
+            target_prev_t,
+            pos_t.shape,
+            fill_value=1.0,
+        ).clamp(min=1e-8, max=1.0)
+
+        direction = torch.sqrt((1.0 - alpha_prev).clamp(min=0.0)) * pred_noise_pos
+        pred_pos = torch.sqrt(alpha_prev) * pred_pos_start + direction
 
         return pred_pos
 
     @torch.no_grad()
-    def p_sample_loop(self, batch):
-        """Full T-step reverse diffusion from Gaussian noise to predicted clean positions."""
+    def sample_loop(self, batch):
+        """Run deterministic DDIM from the initial latent to predicted clean positions."""
         target_mask = self._target_mask(batch)
         true_pos = batch.pos[target_mask]
-        pos_t = torch.randn_like(true_pos)
-        T = getattr(self.hparams, 'num_timesteps')
-        for t_idx in reversed(range(T)):
-            t = torch.tensor([t_idx], device=true_pos.device, dtype=torch.long)
-            pos_t = self.p_sample(pos_t, t, batch)
+        pos_t = self._init_reverse_noise(true_pos)
+
+        timesteps, prev_timesteps = self._build_sampling_schedule(true_pos.device)
+        for current_t, prev_t in zip(timesteps.tolist(), prev_timesteps.tolist()):
+            t = torch.tensor([current_t], device=true_pos.device, dtype=torch.long)
+            t_prev = torch.tensor([prev_t], device=true_pos.device, dtype=torch.long)
+            pos_t = self._ddim_step(pos_t, t, t_prev, batch)
         return true_pos, pos_t
 
     def training_step(self, batch, _):
@@ -329,7 +382,7 @@ class PytorchLightningModule(pl.LightningModule):
         self.logger.experiment.add_scalar('train_rmse', metric, self.current_epoch)  # type: ignore
 
     def validation_step(self, batch, _):
-        true_pos, gen_pos = self.p_sample_loop(batch)
+        true_pos, gen_pos = self.sample_loop(batch)
         rmse = torch.sqrt(F.mse_loss(gen_pos, true_pos))
         self.log(
             'val_rmse_step',
@@ -346,7 +399,7 @@ class PytorchLightningModule(pl.LightningModule):
         self.logger.experiment.add_scalar('val_rmse', metric, self.current_epoch)  # type: ignore
 
     def test_step(self, batch, _):
-        true_pos, gen_pos = self.p_sample_loop(batch)
+        true_pos, gen_pos = self.sample_loop(batch)
         rmse = torch.sqrt(F.mse_loss(gen_pos, true_pos))
         self.log(
             'test_rmse',
@@ -381,5 +434,5 @@ class PytorchLightningModule(pl.LightningModule):
 
     @torch.no_grad()
     def sample(self, batch):
-        _, gen_pos = self.p_sample_loop(batch)
+        _, gen_pos = self.sample_loop(batch)
         return gen_pos

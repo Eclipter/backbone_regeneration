@@ -51,6 +51,7 @@ def train_one(cfg):
         hidden_dim=cfg['HIDDEN_DIM'],
         num_layers=cfg['NUM_LAYERS'],
         num_timesteps=cfg['NUM_TIMESTEPS'],
+        sampling_steps=cfg['SAMPLING_STEPS'],
         batch_size=cfg['BATCH_SIZE'],
         lr=cfg['LR'],
         lr_scheduler=cfg['LR_SCHEDULER'],

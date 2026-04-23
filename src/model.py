@@ -354,6 +354,42 @@ class PytorchLightningModule(pl.LightningModule):
             pos_t = self._ddim_step(pos_t, t, t_prev, batch)
         return true_pos, pos_t
 
+    def _log_epoch_mse_components(self, stage, pred_pos, true_pos):
+        mse_sum = F.mse_loss(pred_pos, true_pos, reduction='sum')
+        mse_count = mse_sum.new_tensor(true_pos.numel())
+        self.log(
+            f'{stage}_mse_sum',
+            mse_sum,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            reduce_fx=torch.sum,
+            logger=False
+        )
+        self.log(
+            f'{stage}_mse_count',
+            mse_count,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            reduce_fx=torch.sum,
+            logger=False
+        )
+
+    def _finalize_epoch_rmse(self, stage):
+        mse_sum = self.trainer.callback_metrics[f'{stage}_mse_sum']
+        mse_count = self.trainer.callback_metrics[f'{stage}_mse_count']
+        rmse = torch.sqrt((mse_sum / mse_count).clamp(min=0.0))
+        self.log(
+            f'{stage}_rmse',
+            rmse,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            logger=False
+        )
+        self.logger.experiment.add_scalar(f'{stage}_rmse', rmse, self.current_epoch)  # type: ignore
+
     def training_step(self, batch, _):
         target_mask = self._target_mask(batch)
         pos_start = batch.pos[target_mask]
@@ -383,37 +419,17 @@ class PytorchLightningModule(pl.LightningModule):
 
     def validation_step(self, batch, _):
         true_pos, gen_pos = self.sample_loop(batch)
-        rmse = torch.sqrt(F.mse_loss(gen_pos, true_pos))
-        self.log(
-            'val_rmse_step',
-            rmse,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch.x.size(0),
-            logger=False
-        )
+        self._log_epoch_mse_components('val', gen_pos, true_pos)
 
     def on_validation_epoch_end(self):
-        metric = self.trainer.callback_metrics['val_rmse_step']
-        self.logger.experiment.add_scalar('val_rmse', metric, self.current_epoch)  # type: ignore
+        self._finalize_epoch_rmse('val')
 
     def test_step(self, batch, _):
         true_pos, gen_pos = self.sample_loop(batch)
-        rmse = torch.sqrt(F.mse_loss(gen_pos, true_pos))
-        self.log(
-            'test_rmse',
-            rmse,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            batch_size=batch.x.size(0),
-            logger=False
-        )
+        self._log_epoch_mse_components('test', gen_pos, true_pos)
 
     def on_test_epoch_end(self):
-        metric = self.trainer.callback_metrics['test_rmse']
-        self.logger.experiment.add_scalar('test_rmse', metric, self.current_epoch)  # type: ignore
+        self._finalize_epoch_rmse('test')
 
     def configure_optimizers(self):  # type: ignore
         optimizer = torch.optim.AdamW(self.parameters(), lr=getattr(self.hparams, 'lr'))
@@ -428,7 +444,7 @@ class PytorchLightningModule(pl.LightningModule):
             'optimizer': optimizer,
             'lr_scheduler': {
                 'scheduler': scheduler,
-                'monitor': 'val_rmse_step'
+                'monitor': 'val_rmse'
             },
         }
 

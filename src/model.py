@@ -381,6 +381,12 @@ class PytorchLightningModule(pl.LightningModule):
     def configure_optimizers(self):  # type: ignore
         optimizer = torch.optim.AdamW(self.parameters(), lr=getattr(self.hparams, 'lr'))
 
+        lr_scheduler = getattr(self.hparams, 'lr_scheduler')
+        if lr_scheduler is None:
+            return {'optimizer': optimizer}
+        if lr_scheduler != 'ReduceLROnPlateau':
+            raise NotImplementedError(f'unknown lr scheduler: {lr_scheduler}')
+
         scheduler = ReduceLROnPlateau(
             optimizer,
             patience=getattr(self.hparams, 'lr_scheduler_patience'),

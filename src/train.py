@@ -51,7 +51,6 @@ def train_one(cfg):
         hidden_dim=cfg['HIDDEN_DIM'],
         num_layers=cfg['NUM_LAYERS'],
         num_timesteps=cfg['NUM_TIMESTEPS'],
-        sampling_steps=cfg['SAMPLING_STEPS'],
         batch_size=cfg['BATCH_SIZE'],
         lr=cfg['LR'],
         lr_scheduler=cfg['LR_SCHEDULER'],
@@ -68,7 +67,7 @@ def train_one(cfg):
 
     # Initialize callbacks
     checkpoint_callback = ModelCheckpoint(
-        # filename='{epoch}',
+        filename='{epoch}',
         monitor='val_rmse',
         every_n_epochs=5,
         save_top_k=10,

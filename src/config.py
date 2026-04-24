@@ -3,7 +3,6 @@ BASE = dict(
     HIDDEN_DIM=256,
     NUM_LAYERS=5,
     NUM_TIMESTEPS=200,
-    SAMPLING_STEPS=50,
     BATCH_SIZE=2**11,
     LR=1e-3,
     LR_SCHEDULER='ReduceLROnPlateau',  # set to None to disable
@@ -20,12 +19,12 @@ BASE = dict(
 # One entry = one experiment. Put ONLY the deltas from BASE here
 EXPERIMENTS = [
     {},  # baseline (matches BASE)
-    {'LR': 1e-4},
-    {'LR_SCHEDULER': None, 'SWA': True, 'LR': 1e-4}
+    {'LR_SCHEDULER': None, 'SWA': True},
+    # {'HIDDEN_DIM': 128},
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'ddim'
+RUN_NAME = 'fixed_equivariance'
 
 SEED = 42
 
@@ -33,9 +32,12 @@ SEED = 42
 ######### TO DOs ########
 # MAJOR:
 # Chemical losses
+# DDIM sampler
 
 # MINOR:
 # v-prediction + self-conditioning
 # Apply root to val/test RMSE on epoch end, after averaging over batches
+# Consider ODE sampler over SDE one
+# Diffuse inside latent space instead of the euclidean one
 # Distillate like in paper: https://openreview.net/forum?id=8NuN5UzXLC
 ########################

@@ -383,17 +383,17 @@ draw_arrow(
     egnn_y-MAX_Y*0.04
 )
 
-# Noise head and DDIM decode
+# Noise head and DDPM decode
 draw_box(
     main_x,
     eps_y,
     main_width,
     main_height,
-    r'$\epsilon$-голова + DDIM шаг',
+    r'$\epsilon$-голова + DDPM шаг',
     r'из финальных $h, x$ считаем' + '\n' +
     r'$\epsilon_\theta(x_t, t)$ только для цели' + '\n' +
-    r'восстанавливаем $\hat{x}_0$ и' + '\n' +
-    r'делаем детерминированный DDIM-переход',
+    r'восстанавливаем $\hat{x}_0$ и параметры' + '\n' +
+    r'$q(x_{t-1} \mid x_t, \hat{x}_0)$',
     'left',
     palette['output']
 )
@@ -524,7 +524,7 @@ ax.add_patch(FancyArrowPatch(
 ax.text(
     1.2,
     MAX_Y/2,
-    r'$x_t^{\mathrm{target}} \rightarrow x_{t-1}^{\mathrm{target}}$' + '\n' + r'$(K \text{ шагов DDIM})$',
+    r'$x_t^{\mathrm{target}} \rightarrow x_{t-1}^{\mathrm{target}}$' + '\n' + r'$(T \text{ шагов DDPM})$',
     fontsize=15,
     rotation=90,
     ha='center',

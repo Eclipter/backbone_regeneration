@@ -26,13 +26,7 @@ SCHEDULE_BUFFERS = (
 
 # Keys from self.hparams that describe what the denoiser expects and how to
 # wrap it into reverse-diffusion sampling at inference time
-HPARAM_KEYS = (
-    'hidden_dim',
-    'num_layers',
-    'num_timesteps',
-    'beta_schedule',
-    'sampling_steps',
-)
+HPARAM_KEYS = ('hidden_dim', 'num_layers', 'num_timesteps', 'beta_schedule')
 
 
 def find_best_checkpoint(run_dir):
@@ -140,7 +134,7 @@ def export_to_onnx(ckpt_path, out_dir=None, opset=17):
         for name in SCHEDULE_BUFFERS
     }
     meta = {
-        'hyperparameters': {k: getattr(hp, k, None) for k in HPARAM_KEYS},
+        'hyperparameters': {k: getattr(hp, k) for k in HPARAM_KEYS},
         'atom_to_idx': atom_to_idx,
         'base_to_idx': base_to_idx,
         'schedule_buffers': schedule,

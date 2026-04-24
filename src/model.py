@@ -301,11 +301,15 @@ class PytorchLightningModule(pl.LightningModule):
             pos_t = self.p_sample(pos_t, t, batch)
         return true_pos, pos_t
 
-    def _log_epoch_mse_components(self, stage, pred_pos, true_pos):
-        mse_sum = F.mse_loss(pred_pos, true_pos, reduction='sum')
-        mse_count = mse_sum.new_tensor(true_pos.numel())
+    def _log_epoch_mse_components(self, metric_name, pred_pos, true_pos):
+        if pred_pos.numel() == 0:
+            mse_sum = pred_pos.new_tensor(0.0)
+            mse_count = pred_pos.new_tensor(0.0)
+        else:
+            mse_sum = F.mse_loss(pred_pos, true_pos, reduction='sum')
+            mse_count = mse_sum.new_tensor(true_pos.numel())
         self.log(
-            f'{stage}_mse_sum',
+            f'{metric_name}_mse_sum',
             mse_sum,
             on_step=False,
             on_epoch=True,
@@ -314,7 +318,7 @@ class PytorchLightningModule(pl.LightningModule):
             logger=False
         )
         self.log(
-            f'{stage}_mse_count',
+            f'{metric_name}_mse_count',
             mse_count,
             on_step=False,
             on_epoch=True,
@@ -323,19 +327,34 @@ class PytorchLightningModule(pl.LightningModule):
             logger=False
         )
 
-    def _finalize_epoch_rmse(self, stage):
-        mse_sum = self.trainer.callback_metrics[f'{stage}_mse_sum']
-        mse_count = self.trainer.callback_metrics[f'{stage}_mse_count']
+    def _log_eval_rmse_components(self, stage, batch, pred_pos, true_pos):
+        target_mask = self._target_mask(batch)
+        central_target_mask = batch.central_mask[target_mask]
+        self._log_epoch_mse_components(stage, pred_pos, true_pos)
+        self._log_epoch_mse_components(f'central_{stage}', pred_pos[central_target_mask], true_pos[central_target_mask])
+        self._log_epoch_mse_components(f'edge_{stage}', pred_pos[~central_target_mask], true_pos[~central_target_mask])
+
+    def _finalize_epoch_rmse(self, metric_name):
+        mse_sum_name = f'{metric_name}_mse_sum'
+        mse_count_name = f'{metric_name}_mse_count'
+        if mse_sum_name not in self.trainer.callback_metrics or mse_count_name not in self.trainer.callback_metrics:
+            return
+
+        mse_sum = self.trainer.callback_metrics[mse_sum_name]
+        mse_count = self.trainer.callback_metrics[mse_count_name]
+        if float(mse_count.detach().cpu()) <= 0:
+            return
+
         rmse = torch.sqrt((mse_sum / mse_count).clamp(min=0.0))
         self.log(
-            f'{stage}_rmse',
+            f'{metric_name}_rmse',
             rmse,
             on_step=False,
             on_epoch=True,
             prog_bar=False,
             logger=False
         )
-        self.logger.experiment.add_scalar(f'{stage}_rmse', rmse, self.current_epoch)  # type: ignore
+        self.logger.experiment.add_scalar(f'{metric_name}_rmse', rmse, self.current_epoch)  # type: ignore
 
     def training_step(self, batch, _):
         target_mask = self._target_mask(batch)
@@ -366,17 +385,21 @@ class PytorchLightningModule(pl.LightningModule):
 
     def validation_step(self, batch, _):
         true_pos, gen_pos = self.p_sample_loop(batch)
-        self._log_epoch_mse_components('val', gen_pos, true_pos)
+        self._log_eval_rmse_components('val', batch, gen_pos, true_pos)
 
     def on_validation_epoch_end(self):
         self._finalize_epoch_rmse('val')
+        self._finalize_epoch_rmse('central_val')
+        self._finalize_epoch_rmse('edge_val')
 
     def test_step(self, batch, _):
         true_pos, gen_pos = self.p_sample_loop(batch)
-        self._log_epoch_mse_components('test', gen_pos, true_pos)
+        self._log_eval_rmse_components('test', batch, gen_pos, true_pos)
 
     def on_test_epoch_end(self):
         self._finalize_epoch_rmse('test')
+        self._finalize_epoch_rmse('central_test')
+        self._finalize_epoch_rmse('edge_test')
 
     def configure_optimizers(self):  # type: ignore
         optimizer = torch.optim.AdamW(self.parameters(), lr=getattr(self.hparams, 'lr'))

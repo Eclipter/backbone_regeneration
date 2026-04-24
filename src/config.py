@@ -7,6 +7,7 @@ BASE = dict(
     LR=1e-3,
     LR_SCHEDULER='ReduceLROnPlateau',  # set to None to disable
     LR_SCHEDULER_PATIENCE=10,
+    LR_SCHEDULER_COOLDOWN=5,
     LR_SCHEDULER_THRESHOLD=0.1,
     SWA=False,
     SWA_LR=0.1,
@@ -19,8 +20,8 @@ BASE = dict(
 # One entry = one experiment. Put ONLY the deltas from BASE here
 EXPERIMENTS = [
     {},  # baseline (matches BASE)
-    {'LR_SCHEDULER': None, 'SWA': True},
-    # {'HIDDEN_DIM': 128},
+    # {'LR_SCHEDULER': None, 'SWA': True}
+    {'LR_SCHEDULER_PATIENCE': 5}
 ]
 
 # Run path under `logs/`

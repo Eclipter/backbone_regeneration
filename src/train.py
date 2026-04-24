@@ -55,6 +55,7 @@ def train_one(cfg):
         lr=cfg['LR'],
         lr_scheduler=cfg['LR_SCHEDULER'],
         lr_scheduler_patience=cfg['LR_SCHEDULER_PATIENCE'],
+        lr_scheduler_cooldown=cfg['LR_SCHEDULER_COOLDOWN'],
         lr_scheduler_threshold=cfg['LR_SCHEDULER_THRESHOLD'],
         beta_schedule=cfg['BETA_SCHEDULE'],
     )

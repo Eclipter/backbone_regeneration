@@ -10,6 +10,7 @@ import torch
 from lightning.pytorch.callbacks import (LearningRateMonitor, ModelCheckpoint,
                                          StochasticWeightAveraging)
 from lightning.pytorch.loggers import TensorBoardLogger
+from lightning_utilities.core.rank_zero import rank_zero_info
 
 from config import BASE, EXPERIMENTS, RUN_NAME, SEED
 from dataset import DNADataModule
@@ -40,6 +41,7 @@ def _get_run_paths(cfg):
     else:
         run_name = datetime.now().strftime('%Y.%m.%d_%H:%M:%S')
         ckpt_path = None
+
     return log_dir, run_name, run_version, ckpt_path
 
 
@@ -58,6 +60,7 @@ def train_one(cfg):
         lr_scheduler_cooldown=cfg['LR_SCHEDULER_COOLDOWN'],
         lr_scheduler_threshold=cfg['LR_SCHEDULER_THRESHOLD'],
         beta_schedule=cfg['BETA_SCHEDULE'],
+        weight_decay=cfg['WEIGHT_DECAY']
     )
 
     num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
@@ -70,7 +73,7 @@ def train_one(cfg):
     checkpoint_callback = ModelCheckpoint(
         filename='{epoch}',
         monitor='val_rmse',
-        every_n_epochs=5,
+        every_n_epochs=2,
         save_top_k=10,
         save_last=True,
         enable_version_counter=False
@@ -115,6 +118,7 @@ def main():
         run_cfg = {**BASE, **exp}
         run_cfg['RUN_NAME'] = RUN_NAME
         run_cfg['RUN_VERSION'] = _make_run_version(run_cfg, BASE)
+        rank_zero_info(f'Running experiment: {run_cfg["RUN_VERSION"]}')
         train_one(run_cfg)
 
 

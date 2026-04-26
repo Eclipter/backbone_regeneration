@@ -12,7 +12,7 @@ from Bio.PDB.PDBParser import PDBParser
 from torch_geometric.data import Batch
 
 import utils
-from export_to_onnx import _resolve_run_dir, find_best_checkpoint
+from export_to_onnx import resolve_run_dir
 from model import PytorchLightningModule
 
 WINDOW_SIZE = 3
@@ -238,7 +238,7 @@ def _parse_args():
 if __name__ == '__main__':
     args = _parse_args()
 
-    ckpt_path = find_best_checkpoint(_resolve_run_dir(args.run_dir))
+    ckpt_path = utils.find_best_checkpoint(resolve_run_dir(args.run_dir))
     print(f'checkpoint: {ckpt_path}')
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'

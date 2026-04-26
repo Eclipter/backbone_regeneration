@@ -2,12 +2,11 @@ import json
 import os
 import os.path as osp
 from argparse import ArgumentParser
-from glob import glob
 
 import torch
 
 from model import PytorchLightningModule
-from utils import atom_to_idx, base_to_idx
+from utils import atom_to_idx, base_to_idx, find_best_checkpoint
 
 # Diffusion schedule buffers registered in PytorchLightningModule.__init__.
 # Exported JSON-side so that a consumer of model.onnx can reproduce sampling
@@ -29,40 +28,7 @@ SCHEDULE_BUFFERS = (
 HPARAM_KEYS = ('hidden_dim', 'num_layers', 'num_timesteps', 'beta_schedule')
 
 
-def find_best_checkpoint(run_dir):
-    """Locate the best-monitor checkpoint of a run via ModelCheckpoint state.
-
-    Any checkpoint file produced by Lightning embeds the full ModelCheckpoint state,
-    including ``best_model_path``. We prefer ``last.ckpt`` when present (cheap, and
-    reflects the final state), otherwise fall back to any other ``.ckpt`` in the
-    directory. The stored path is re-anchored to the local ``checkpoints/`` folder
-    so moved/renamed run directories still resolve.
-    """
-    ckpt_dir = osp.join(run_dir, 'checkpoints')
-    candidates = sorted(glob(osp.join(ckpt_dir, '*.ckpt')))
-    if not candidates:
-        raise FileNotFoundError(f'No *.ckpt files in {ckpt_dir}.')
-
-    last_path = osp.join(ckpt_dir, 'last.ckpt')
-    source = last_path if last_path in candidates else candidates[0]
-
-    state = torch.load(source, map_location='cpu', weights_only=False)
-    for key, cb_state in state.get('callbacks', {}).items():
-        if 'ModelCheckpoint' not in key:
-            continue
-        best_path = cb_state.get('best_model_path', '')
-        if not best_path:
-            continue
-        local = osp.join(ckpt_dir, osp.basename(best_path))
-        if osp.isfile(local):
-            return local
-        if osp.isfile(best_path):
-            return best_path
-
-    raise RuntimeError(f'best_model_path not present in ModelCheckpoint state of {source}.')
-
-
-def _resolve_run_dir(run):
+def resolve_run_dir(run):
     """Map a user-facing experiment id (e.g. ``fixed_swa/baseline``) to its log directory.
 
     A redundant leading ``logs/`` is stripped so both ``fixed_swa/...`` and
@@ -165,7 +131,7 @@ def _parse_args():
 if __name__ == '__main__':
     args = _parse_args()
 
-    run_dir = _resolve_run_dir(args.run_dir)
+    run_dir = resolve_run_dir(args.run_dir)
     ckpt_path = find_best_checkpoint(run_dir)
     print(f'Best checkpoint:         {ckpt_path}')
     onnx_path, json_path = export_to_onnx(ckpt_path, MODEL_DIR, args.opset)

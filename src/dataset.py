@@ -309,7 +309,7 @@ class DNADataModule(pl.LightningDataModule):
         self.edge_weight = edge_weight
         self.central_weight = central_weight
 
-        self.num_workers = len(os.sched_getaffinity(0))
+        self.num_workers = min(len(os.sched_getaffinity(0)), 16)
         self.train_generator = torch.Generator().manual_seed(SEED)
 
     def prepare_data(self):

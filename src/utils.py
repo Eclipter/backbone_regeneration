@@ -1,7 +1,9 @@
 import os
+import os.path as osp
 import tempfile
 from collections import defaultdict
 from functools import lru_cache
+from glob import glob
 
 import MDAnalysis as mda
 import numpy as np
@@ -27,6 +29,32 @@ CHAIN_END_CLASS_INTERNAL = 0
 CHAIN_END_CLASS_5_PRIME = 1
 CHAIN_END_CLASS_3_PRIME = 2
 N_CHAIN_END_CLASSES = 3
+
+
+def find_best_checkpoint(run_dir):
+    """Locate the best-monitor checkpoint of a run via ModelCheckpoint state."""
+    ckpt_dir = osp.join(run_dir, 'checkpoints')
+    candidates = sorted(glob(osp.join(ckpt_dir, '*.ckpt')))
+    if not candidates:
+        raise FileNotFoundError(f'No *.ckpt files in {ckpt_dir}.')
+
+    last_path = osp.join(ckpt_dir, 'last.ckpt')
+    source = last_path if last_path in candidates else candidates[0]
+
+    state = torch.load(source, map_location='cpu', weights_only=False)
+    for key, cb_state in state.get('callbacks', {}).items():
+        if 'ModelCheckpoint' not in key:
+            continue
+        best_path = cb_state.get('best_model_path', '')
+        if not best_path:
+            continue
+        local = osp.join(ckpt_dir, osp.basename(best_path))
+        if osp.isfile(local):
+            return local
+        if osp.isfile(best_path):
+            return best_path
+
+    raise RuntimeError(f'best_model_path not present in ModelCheckpoint state of {source}.')
 
 
 def get_pdb_ids():

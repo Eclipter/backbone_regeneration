@@ -177,7 +177,7 @@ class EGNNDiff(nn.Module):
 class PytorchLightningModule(pl.LightningModule):
     def __init__(self, hidden_dim, num_layers, num_timesteps, batch_size, lr,
                  lr_scheduler, lr_scheduler_patience, lr_scheduler_threshold, lr_scheduler_cooldown,
-                 beta_schedule):
+                 beta_schedule, weight_decay):
         super().__init__()
         self.save_hyperparameters()
 
@@ -351,6 +351,7 @@ class PytorchLightningModule(pl.LightningModule):
             rmse,
             on_step=False,
             on_epoch=True,
+            sync_dist=True,
             prog_bar=False,
             logger=False
         )
@@ -402,7 +403,7 @@ class PytorchLightningModule(pl.LightningModule):
         self._finalize_epoch_rmse('edge_test')
 
     def configure_optimizers(self):  # type: ignore
-        optimizer = torch.optim.AdamW(self.parameters(), lr=getattr(self.hparams, 'lr'))
+        optimizer = torch.optim.AdamW(self.parameters(), lr=getattr(self.hparams, 'lr'), weight_decay=getattr(self.hparams, 'weight_decay'))
 
         lr_scheduler = getattr(self.hparams, 'lr_scheduler')
         if lr_scheduler is None:

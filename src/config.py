@@ -3,26 +3,35 @@ BASE = dict(
     HIDDEN_DIM=256,
     NUM_LAYERS=5,
     NUM_TIMESTEPS=200,
-    BATCH_SIZE=2**11,
+    BATCH_SIZE=3500,
     LR=1e-3,
+    WEIGHT_DECAY=0.01,
     LR_SCHEDULER='ReduceLROnPlateau',  # set to None to disable
     LR_SCHEDULER_PATIENCE=10,
     LR_SCHEDULER_COOLDOWN=5,
     LR_SCHEDULER_THRESHOLD=0.1,
     SWA=False,
     SWA_LR=0.1,
-    SWA_EPOCH_START=10,
-    NUM_EPOCHS=50,
+    SWA_EPOCH_START=15,
+    NUM_EPOCHS=25,
     BETA_SCHEDULE='cosine',  # 'linear' | 'cosine'
     START_FROM_LAST_CKPT=True,
 )
 
 # One entry = one experiment. Put ONLY the deltas from BASE here
 EXPERIMENTS = [
-    {},  # baseline (matches BASE)
-    # {'LR_SCHEDULER': None, 'SWA': True}
-    {'LR_SCHEDULER_PATIENCE': 5}
+    # {},  # baseline (matches BASE)
+    {'LR_SCHEDULER': None, 'SWA': True, 'WEIGHT_DECAY': 0.1, 'HIDDEN_DIM': 512},
+    {'LR_SCHEDULER': None, 'SWA': True, 'WEIGHT_DECAY': 0.1, 'NUM_LAYERS': 3},
+    {'LR_SCHEDULER': None, 'SWA': True, 'WEIGHT_DECAY': 0.1, 'NUM_LAYERS': 8}
 ]
+
+# EXPERIMENTS = [
+#     # {},  # baseline (matches BASE)
+#     {'LR_SCHEDULER': None, 'SWA': True, 'WEIGHT_DECAY': 0.05, 'HIDDEN_DIM': 512},
+#     {'LR_SCHEDULER': None, 'SWA': True, 'WEIGHT_DECAY': 0.05, 'NUM_LAYERS': 3},
+#     {'LR_SCHEDULER': None, 'SWA': True, 'WEIGHT_DECAY': 0.05, 'NUM_LAYERS': 8}
+# ]
 
 # Run path under `logs/`
 RUN_NAME = 'fixed_equivariance'

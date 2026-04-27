@@ -20,7 +20,6 @@ from tqdm import tqdm
 import utils
 from config import SEED
 
-PBAR_COLOR = '#B366FF'
 EDGE_CACHE_NAME = 'edge_windows.txt'
 
 
@@ -79,7 +78,7 @@ class PyGDataset(Dataset):
                 executor.map(self.download_file, pdb_ids_to_download),
                 total=len(pdb_ids_to_download),
                 desc='Downloading mmCIF files',
-                colour=PBAR_COLOR
+                colour=utils.PBAR_COLOR
             ))
 
         # Single-threaded downloading for debugging
@@ -87,7 +86,7 @@ class PyGDataset(Dataset):
         #     map(self.download_file, pdb_ids_to_download),
         #     total=len(pdb_ids_to_download),
         #     desc='Downloading mmCIF files',
-        #     colour=PBAR_COLOR
+        #     colour=utils.PBAR_COLOR
         # ))
 
         tag_path = osp.join(self.processed_dir, self.processed_file_names)
@@ -160,7 +159,7 @@ class PyGDataset(Dataset):
                 for per_file_edges in tqdm(
                     executor.map(self.process_file, self.pdb_ids),
                     total=len(self.pdb_ids),
-                    colour=PBAR_COLOR
+                    colour=utils.PBAR_COLOR
                 ):
                     edge_paths.extend(per_file_edges)
         else:
@@ -168,7 +167,7 @@ class PyGDataset(Dataset):
             for per_file_edges in tqdm(
                 map(self.process_file, self.pdb_ids),
                 total=len(self.pdb_ids),
-                colour=PBAR_COLOR
+                colour=utils.PBAR_COLOR
             ):
                 edge_paths.extend(per_file_edges)
 

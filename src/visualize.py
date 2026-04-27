@@ -1,44 +1,46 @@
-# %% [markdown]
-# ### Imports
-
 # %%
+# Imports
 import os.path as osp
 import random
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import lru_cache
 from glob import glob
 from io import StringIO
 from pathlib import Path
 
+import matplotlib.colors as mcolors
 import matplotlib.path as mpath
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import py3Dmol
+import requests
 import seaborn as sns
 import torch
 from Bio.PDB import Atom, Chain
 from Bio.PDB import Model as PDBModel
 from Bio.PDB import Residue, Structure
 from Bio.PDB.mmcifio import MMCIFIO
-from IPython.display import display
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 from tensorboard.backend.event_processing import event_accumulator
+from torch_geometric.data import Batch
+from tqdm import tqdm
 
-import utils as _utils
+import utils
 from dataset import PyGDataset
 from model import PytorchLightningModule
+from predict import write_structure
 
 plt.rcParams['font.family'] = 'Nunito'
 
-# %% [markdown]
-# ### Load model and dataset
-
 # %%
+# Load model and dataset
 log_dir = osp.join('..', 'logs')
-run_filename = osp.join('fixed_swa', 'central', 'baseline')
+run_filename = osp.join('fixed_equivariance', 'NUM_LAYERS=8_WEIGHT_DECAY=0.05_SWA_EPOCH_START=17_NUM_EPOCHS=30_BETA_SCHEDULE=linear')
 run_dir = osp.join(log_dir, run_filename)
-ckpt_path = osp.join(run_dir, 'checkpoints', 'last.ckpt')
+ckpt_path = utils.find_best_checkpoint(run_dir)
 test_dataset_path = osp.join(run_dir, 'test_dataset.pt')
 event_files = glob(osp.join(run_dir, 'events.*'))
 
@@ -47,15 +49,38 @@ try:
 except FileNotFoundError:
     raise FileNotFoundError(f'File `{test_dataset_path}` not found. Ensure training completed successfully.')
 
-try:
-    model = PytorchLightningModule.load_from_checkpoint(ckpt_path, map_location='cpu').eval()
-except FileNotFoundError:
-    raise FileNotFoundError(f'File `{ckpt_path}` not found. Ensure you ran train.py.')
+target_modes = ('all', 'central', 'edge')
+test_indices_per_mode = {
+    'all': list(range(len(test_dataset))),
+    'central': list(test_dataset.central_virtual),
+    'edge': list(test_dataset.edge_virtual),
+}
+test_datasets = {
+    mode: torch.utils.data.Subset(test_dataset, indices)
+    for mode, indices in test_indices_per_mode.items()
+}
+mode_colors = {
+    'all': 'indigo',
+    'central': mcolors.to_rgba(utils.PBAR_COLOR, 0.5),
+    'edge': mcolors.to_rgba('violet', 0.5),
+}
+mode_linestyles = {
+    'all': '-',
+    'central': '--',
+    'edge': '--',
+}
 
-# %% [markdown]
-# ### Dataset
+try:
+    model = PytorchLightningModule.load_from_checkpoint(ckpt_path, weights_only=False, map_location='cpu').eval()
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    device = 'cuda:2'
+    model.to(device)
+    print(device)
+except FileNotFoundError:
+    raise FileNotFoundError(f'Best checkpoint `{ckpt_path}` not found. Ensure training completed successfully.')
 
 # %%
+# Load dataset
 dataset = PyGDataset()
 rng = np.random.default_rng()
 idx = rng.integers(len(dataset))
@@ -166,10 +191,9 @@ fig.update_layout(
 )
 fig.show()
 
-# %% [markdown]
-# ### Model
 
 # %%
+# Model
 plt.rcParams['font.family'] = 'DejaVu Sans'
 
 MAX_X = 15
@@ -195,8 +219,8 @@ palette = {
 # num_layers = int(model.hparams.num_layers)
 # time_emb_dim = int(model.time_emb_dim)
 # n_atom_types = int(model.n_atom_types)
-# n_base_types = len(_utils.base_to_idx)
-# n_chain_end_classes = int(_utils.N_CHAIN_END_CLASSES)
+# n_base_types = len(utils.base_to_idx)
+# n_chain_end_classes = int(utils.N_CHAIN_END_CLASSES)
 # input_feature_dim = int(model.gnn.embedding_in.in_features)
 
 hidden_dim = 256
@@ -536,10 +560,8 @@ diagram_path = osp.join('..', 'data', 'model.png')
 plt.savefig(diagram_path, dpi=300, bbox_inches='tight')
 plt.show()
 
-# %% [markdown]
-# ### Check optimizer state
-
 # %%
+# Check optimizer state
 _ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 print('epoch:', _ck.get('epoch'), '| global_step:', _ck.get('global_step'))
 print('hyper_parameters lr:', (_ck.get('hyper_parameters') or {}).get('lr'))
@@ -557,10 +579,8 @@ for i, _opt in enumerate(_ck.get('optimizer_states', [])):
 for i, sch in enumerate(_ck.get('lr_schedulers') or []):
     print(f'\nlr_schedulers[{i}]:', {k: v for k, v in sch.items() if k in ('_last_lr', 'last_epoch', 'best', 'num_bad_epochs', 'cooldown_counter', 'factor', 'patience')})
 
-# %% [markdown]
-# ### Training
-
 # %%
+# Training
 
 
 def load_event_accumulator(path):
@@ -579,8 +599,17 @@ def scalars_to_dataframe(ea, tag):
     return pd.DataFrame(rows, columns=['epoch', 'value'])
 
 
-# Unified-model logging: only train_rmse and val_rmse are tracked, step == epoch
-tracked_tags = {'train_rmse', 'val_rmse'}
+# Unified-model logging: train_rmse is noise-prediction RMSE, val_* is coordinate RMSD.
+metric_tags = {
+    'train_rmse': ('all', 'train_noise_rmse'),
+    'val_rmsd': ('all', 'val_rmsd'),
+    'central_val_rmsd': ('central', 'val_rmsd'),
+    'edge_val_rmsd': ('edge', 'val_rmsd'),
+    'test_rmsd': ('all', 'test_rmsd'),
+    'central_test_rmsd': ('central', 'test_rmsd'),
+    'edge_test_rmsd': ('edge', 'test_rmsd'),
+}
+tracked_tags = set(metric_tags)
 
 dfs = []
 for ef in event_files:
@@ -589,50 +618,64 @@ for ef in event_files:
         if tag not in tracked_tags:
             continue
         df = scalars_to_dataframe(ea, tag)
-        df['tag'] = tag
+        mode, metric = metric_tags[tag]
+        df['mode'] = mode
+        df['metric'] = metric
         dfs.append(df)
 
-scalars_by_epoch = pd.concat(dfs, ignore_index=True)[['epoch', 'tag', 'value']] \
+if not dfs:
+    raise ValueError(f'No tracked TensorBoard scalars found in `{run_dir}`.')
+
+scalars_by_epoch = pd.concat(dfs, ignore_index=True)[['epoch', 'mode', 'metric', 'value']] \
     .reset_index(drop=True)
-# Aggregate duplicates per (epoch, tag): keep the last logged value (handles resumed runs / multiple event files).
-wide_scalars = scalars_by_epoch.pivot_table(
-    index='epoch',
-    columns='tag',
-    values='value',
-    aggfunc='last'
-)
+# Aggregate duplicates per (epoch, metric): keep the last logged value (handles resumed runs / multiple event files).
+wide_scalars_per_mode = {
+    mode: scalars_by_epoch.loc[scalars_by_epoch['mode'] == mode].pivot_table(
+        index='epoch',
+        columns='metric',
+        values='value',
+        aggfunc='last'
+    )
+    for mode in target_modes
+}
+wide_scalars = wide_scalars_per_mode['all']
 
-with pd.option_context('display.max_rows', 10):
-    display(wide_scalars)
+
+def _plot_metric(ax, table, column, color, label, linestyle='-'):
+    values = table[column].dropna()
+    return ax.plot(
+        values.index.to_numpy(),
+        values.to_numpy(),
+        color=color,
+        linewidth=3,
+        label=label,
+        linestyle=linestyle
+    )[0]
 
 
-# %%
-fig, ax = plt.subplots(figsize=(10, 6))
+fig, ax = plt.subplots(figsize=(7, 4))
 ax.tick_params(axis='both', labelsize=15)
-sns.despine(ax=ax, top=True, right=True)
-
-values = wide_scalars['train_rmse'].dropna()
-ax.plot(
-    values.index.to_numpy(),
-    values.to_numpy(),
-    color='indigo',
-    linewidth=3,
-    label='Тренировка',
+_plot_metric(
+    ax,
+    wide_scalars,
+    'train_noise_rmse',
+    'indigo',
+    'train_rmse',
 )
-values = wide_scalars['val_rmse'].dropna()
-ax.plot(
-    values.index.to_numpy(),
-    values.to_numpy(),
-    color='#B366FF',
-    linewidth=3,
-    label='Валидация',
+ax.axvline(17, color='red', linewidth=3, linestyle='--')
+ax.text(
+    17.5,
+    0.95,
+    'Старт стохастического\nусреднения весов',
+    transform=ax.get_xaxis_transform(),
+    color='red',
+    fontsize=14,
+    va='top',
+    ha='left',
 )
-
-# Log scale keeps both the validation spike and the converged regime readable on one axis.
-ax.set_yscale('log')
 ax.set_xlabel('Эпоха', fontsize=18)
-ax.set_ylabel('RMSE (Å)', fontsize=18)
-ax.legend(fontsize=14)
+ax.set_ylabel('RMSE шума 1 шага (Å)', fontsize=18)
+sns.despine(ax=ax, top=True, right=True)
 
 fig.tight_layout()
 fig.savefig(
@@ -643,13 +686,63 @@ fig.savefig(
 
 plt.show()
 
-# %% [markdown]
-# ### Results
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.tick_params(axis='both', labelsize=15)
+validation_labels = {
+    'all': 'все нуклеотиды',
+    'central': 'центральные нуклеотиды',
+    'edge': 'краевые нуклеотиды',
+}
+for mode in target_modes:
+    _plot_metric(
+        ax,
+        wide_scalars_per_mode[mode],
+        'val_rmsd',
+        mode_colors[mode],
+        validation_labels[mode],
+        mode_linestyles[mode]
+    )
+ax.set_yscale('log')
+ax.set_xlabel('Эпоха', fontsize=18)
+ax.set_ylabel('RMSD (Å)', fontsize=18)
+ax.legend(fontsize=14)
+sns.despine(ax=ax, top=True, right=True)
+
+fig.tight_layout()
+fig.savefig(
+    osp.join(run_dir, 'val.png'),
+    bbox_inches='tight',
+    dpi=300
+)
+
+plt.show()
+
+fig, ax = plt.subplots(figsize=(6, 3))
+ax.tick_params(axis='both', labelsize=15)
+test_values = [
+    float(wide_scalars_per_mode[mode]['test_rmsd'].dropna().iloc[-1])
+    for mode in target_modes
+]
+bars = ax.barh(
+    [validation_labels[mode] for mode in target_modes],
+    test_values,
+    color=[mode_colors[mode] for mode in target_modes]
+)
+ax.bar_label(bars, labels=[f'{value:.2f}' for value in test_values], fontsize=14, padding=4)
+ax.set_ylabel('RMSD (Å)', fontsize=18)
+sns.despine(ax=ax, top=True, right=True)
+
+fig.tight_layout()
+fig.savefig(
+    osp.join(run_dir, 'test.png'),
+    bbox_inches='tight',
+    dpi=300
+)
+
+plt.show()
 
 # %%
-# Cache the test-path layout so downstream cells can reuse it cheaply. The test
-# dataset is a WindowTargetDataset, so each virtual entry maps to a backing
-# window via (window_idx, target_type).
+# Results
 _virtual_entries = test_dataset.virtual_entries
 _base_paths = test_dataset.base.data_list
 test_paths = [_base_paths[w_idx] for w_idx, _ in _virtual_entries]
@@ -677,7 +770,7 @@ edge_index = data.edge_index.cpu().numpy() if data.edge_index is not None else N
 true_backbone = pos_full[target_mask]
 
 with torch.no_grad():
-    pred_backbone_raw = model.sample(data).cpu().numpy()
+    pred_backbone_raw = model.sample(data.clone().to(device)).cpu().numpy()
 
 # Apply translation-only alignment for visualization to remove possible global drift.
 # The model predicts coordinates, while this correction only matches global centroid.
@@ -897,13 +990,11 @@ fig.update_layout(
 
 fig.show()
 
-# %% [markdown]
-# ### Inference
-
 # %%
+# Inference
 # Map atom vocabulary index back to its canonical atom name / chemical element so
 # that the resulting CIF files carry meaningful atom metadata.
-_idx_to_atom_name = {v: k for k, v in _utils.atom_to_idx.items()}
+idx_to_atom_name = {v: k for k, v in utils.atom_to_idx.items()}
 
 
 def _atom_element(atom_name: str) -> str:
@@ -918,7 +1009,7 @@ def graph_to_cif_string(atom_types, pos, structure_name='structure'):
     residue = Residue.Residue((' ', 1, ' '), 'UNK', ' ')
 
     for i, (atom_type_idx, coord) in enumerate(zip(atom_types, pos)):
-        atom_name = _idx_to_atom_name.get(int(atom_type_idx), 'X')
+        atom_name = idx_to_atom_name.get(int(atom_type_idx), 'X')
         element = _atom_element(atom_name)
         unique_atom_name = f'{atom_name}_{i+1}'
         atom = Atom.Atom(
@@ -938,6 +1029,22 @@ def graph_to_cif_string(atom_types, pos, structure_name='structure'):
     return cif_io.getvalue()
 
 
+def _window_atom_meta_training_order(window):
+    return [
+        (nt.segid, int(nt.resid), name)
+        for nt in window
+        for name, _ in utils.default_atoms_provider(nt)
+    ]
+
+
+def _chain_windows_by_processed_idx(chain_records):
+    return [
+        window_record
+        for _, _, windows in chain_records
+        for window_record in windows
+    ]
+
+
 inference_pdb_id = random.choice(sorted(test_pdb_to_local.keys()))
 inference_local_indices = sorted(
     test_pdb_to_local[inference_pdb_id],
@@ -946,36 +1053,65 @@ inference_local_indices = sorted(
 print(f'Reconstructing backbone for structure {inference_pdb_id}: '
       f'{len(inference_local_indices)} windows')
 
-all_generated_pos: list[torch.Tensor] = []
-all_true_pos: list[torch.Tensor] = []
-all_atom_types: list[torch.Tensor] = []
-for local_i in inference_local_indices:
-    window = test_dataset[local_i].clone()
-    mask = model._target_mask(window)
+inference_windows = [
+    test_dataset[local_i].clone()
+    for local_i in tqdm(inference_local_indices, colour=utils.PBAR_COLOR)
+]
+raw_inference_path = osp.join('..', 'data', 'raw', f'{inference_pdb_id}.cif')
+_, inference_chain_records = utils.parse_dna(
+    raw_inference_path,
+    use_full_nucleotide=True,
+    window_size=test_dataset.base.window_size,
+)
+inference_chain_windows = _chain_windows_by_processed_idx(inference_chain_records)
+target_atom_meta = []
+for local_i, window_data in zip(inference_local_indices, inference_windows):
+    window_idx = int(Path(test_paths[local_i]).stem)
+    window, _, _ = inference_chain_windows[window_idx]
+    window_meta = _window_atom_meta_training_order(window)
+    target_idx = (window_data.is_target & window_data.backbone_mask).nonzero(as_tuple=True)[0].tolist()
+    target_atom_meta.extend(window_meta[i] for i in target_idx)
 
-    with torch.no_grad():
-        gen_local = model.sample(window)
+frame_offsets = torch.tensor(
+    [int(window.is_target.nonzero(as_tuple=True)[0][0]) for window in inference_windows],
+    dtype=torch.long,
+    device=device
+)
 
-    # Invert the dataset's local transform pos_local = (pos_global - origin) @ R
-    # via pos_global = pos_local @ R.T + origin. The dataset stores edge-target
-    # samples in the edge nucleotide's frame and central ones in the central's,
-    # so pick the frame-owning nucleotide from `is_target`.
-    frame_atom_idx = int(window.is_target.nonzero(as_tuple=True)[0][0])
-    ref_frame = window.ref_frames[frame_atom_idx].float()
-    origin = window.origins[frame_atom_idx].float()
-    gen_global = gen_local.float() @ ref_frame.T + origin
-    true_global = window.pos[mask].float() @ ref_frame.T + origin
+with torch.no_grad():
+    batched_windows = Batch.from_data_list(inference_windows).to(device)  # type: ignore
+    mask = model._target_mask(batched_windows)
+    gen_local = model.sample(batched_windows).float()
 
-    all_generated_pos.append(gen_global)
-    all_true_pos.append(true_global)
-    all_atom_types.append(torch.argmax(window.x[mask], dim=1))
+    # Invert the dataset's local transform for every window in the PyG batch.
+    target_graph_ids = batched_windows.batch[mask]
+    frame_atom_indices = batched_windows.ptr[:-1].to(device) + frame_offsets
+    ref_frames = batched_windows.ref_frames[frame_atom_indices].float()[target_graph_ids]
+    origins = batched_windows.origins[frame_atom_indices].float()[target_graph_ids].reshape(-1, 3)
 
-generated_pos = torch.cat(all_generated_pos, dim=0).cpu().numpy()
-original_pos = torch.cat(all_true_pos, dim=0).cpu().numpy()
-atom_types = torch.cat(all_atom_types, dim=0).cpu().numpy()
+    true_local = batched_windows.pos[mask].float()
+    generated_pos = (
+        torch.bmm(gen_local.unsqueeze(1), ref_frames.transpose(1, 2)).squeeze(1) + origins
+    ).cpu().numpy()
+    original_pos = (
+        torch.bmm(true_local.unsqueeze(1), ref_frames.transpose(1, 2)).squeeze(1) + origins
+    ).cpu().numpy()
+    atom_types = torch.argmax(batched_windows.x[mask], dim=1).cpu().numpy()
 
 generated_cif_data = graph_to_cif_string(atom_types, generated_pos, 'generated_structure')
 original_cif_data = graph_to_cif_string(atom_types, original_pos, 'original_structure')
+if len(target_atom_meta) != len(generated_pos):
+    raise RuntimeError(
+        f'Target metadata count ({len(target_atom_meta)}) does not match '
+        f'predicted atom count ({len(generated_pos)}).'
+    )
+generated_predictions = {
+    meta: xyz
+    for meta, xyz in zip(target_atom_meta, generated_pos)
+}
+generated_pdb_path = osp.join(run_dir, f'generated_backbone_{inference_pdb_id}.pdb')
+write_structure(inference_chain_records, generated_predictions, generated_pdb_path)
+print(f'Saved generated backbone PDB to {generated_pdb_path}')
 
 view = py3Dmol.view(width=800, height=400, linked=False, viewergrid=(1, 2))
 
@@ -997,3 +1133,145 @@ view.addLabel(
 
 view.zoomTo()
 view.show()
+
+# %%
+# Estimate dataset noise
+
+
+@lru_cache
+def _dna_seqs(pdb_id):
+    q = '''{ entry(entry_id: "%s") { polymer_entities { entity_poly {
+        rcsb_entity_polymer_type pdbx_seq_one_letter_code_can } } } }''' % pdb_id
+    r = requests.post('https://data.rcsb.org/graphql', json={'query': q}, timeout=10)
+    return [
+        e['entity_poly']['pdbx_seq_one_letter_code_can']
+        for e in r.json()['data']['entry']['polymer_entities']
+        if e['entity_poly']['rcsb_entity_polymer_type'] == 'DNA'
+    ]
+
+
+@lru_cache
+def _similar_entries(seq):
+    r = requests.post('https://search.rcsb.org/rcsbsearch/v2/query', json={
+        'query': {'type': 'terminal', 'service': 'sequence', 'parameters': {
+            'evalue_cutoff': 1, 'identity_cutoff': 1.0,
+            'sequence_type': 'dna', 'value': seq}},
+        'return_type': 'entry'
+    }, timeout=15)
+    return [x['identifier'] for x in r.json().get('result_set', [])]
+
+
+@lru_cache
+def _parsed_chain_records(pdb_id):
+    path = osp.join('..', 'data', 'raw', f'{pdb_id}.cif')
+    if not osp.exists(path):
+        url = f'https://files.rcsb.org/download/{pdb_id}.cif'
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
+        Path(path).write_bytes(requests.get(url, timeout=60).content)
+    _, chain_records = utils.parse_dna(
+        path,
+        use_full_nucleotide=True,
+        window_size=test_dataset.base.window_size,
+    )
+    return chain_records
+
+
+def _central_window_index(chain_records):
+    idx = {}
+    central_offset = test_dataset.base.window_size // 2
+    for _, _, windows in chain_records:
+        for window, _, data in windows:
+            central_nt = window[central_offset]
+            idx[(central_nt.segid, int(central_nt.resid))] = data
+    return idx
+
+
+def _central_backbone_by_atom_name(data):
+    mask = data.central_mask & data.backbone_mask
+    atom_type_ids = torch.argmax(data.x[mask], dim=1).cpu().numpy()
+    positions = data.pos[mask].cpu().numpy()
+    return {
+        idx_to_atom_name[int(atom_type_id)]: position
+        for atom_type_id, position in zip(atom_type_ids, positions)
+    }
+
+
+def _experimental_rmsd_windows(pdb_id1, pdb_id2):
+    idx1 = _central_window_index(_parsed_chain_records(pdb_id1))
+    idx2 = _central_window_index(_parsed_chain_records(pdb_id2))
+
+    values = []
+    for key in set(idx1) & set(idx2):
+        atoms1 = _central_backbone_by_atom_name(idx1[key])
+        atoms2 = _central_backbone_by_atom_name(idx2[key])
+        atom_names = [
+            atom_name for atom_name in utils.backbone_atoms
+            if atom_name in atoms1 and atom_name in atoms2
+        ]
+        if not atom_names:
+            continue
+        pos1 = np.array([atoms1[atom_name] for atom_name in atom_names])
+        pos2 = np.array([atoms2[atom_name] for atom_name in atom_names])
+        values.append(float(np.sqrt(np.mean(np.sum((pos1 - pos2) ** 2, axis=1)))))
+    return values
+
+
+# collect test pdb ids once: the experimental floor is target-mode independent
+test_pdb_ids = sorted({
+    Path(test_dataset.base.data_list[w_idx]).parent.name
+    for w_idx, _ in test_dataset.virtual_entries
+})
+
+
+def _noise_pairs_for_pdb(pdb_id):
+    values = []
+    try:
+        partners = {e for seq in _dna_seqs(pdb_id) for e in _similar_entries(seq)} - {pdb_id}
+        for pid in sorted(partners):
+            try:
+                window_values = _experimental_rmsd_windows(pdb_id, pid)
+                if window_values:
+                    values.append((pdb_id, pid, window_values))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return values
+
+
+rmsd_values = []
+with ThreadPoolExecutor(max_workers=8) as executor:
+    futures = [executor.submit(_noise_pairs_for_pdb, pdb_id) for pdb_id in test_pdb_ids]
+    for future in as_completed(futures):
+        for pdb_id, pid, window_values in future.result():
+            rmsd_values.extend(window_values)
+            print(
+                f'{pdb_id} vs {pid}: median={np.median(window_values):.2f} Å '
+                f'n_windows={len(window_values)}'
+            )
+
+print(f'\nExperimental window backbone RMSD  median={np.median(rmsd_values):.2f}  mean={np.mean(rmsd_values):.2f}  n={len(rmsd_values)}')
+
+# %%
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.hist(rmsd_values, bins=50, color='skyblue', edgecolor='white')
+for mode, color in mode_colors.items():
+    val = float(wide_scalars_per_mode[mode]['val_rmsd'].dropna().iloc[-1])
+    ax.axvline(
+        val,
+        color=color,
+        linewidth=2,
+        label=f'model val RMSD [{mode}] {val:.2f} Å'
+    )
+ax.axvline(
+    np.median(rmsd_values),
+    color='black', linestyle='--',
+    linewidth=1.5,
+    label=f'experimental window median {np.median(rmsd_values):.2f} Å'
+)
+ax.set_xlabel('Window backbone RMSD between independent structures (Å)', fontsize=13)
+ax.set_ylabel('Count', fontsize=13)
+ax.legend(fontsize=11)
+sns.despine(ax=ax)
+fig.tight_layout()
+plt.show()

@@ -92,6 +92,7 @@ def train_one(cfg):
         precision='16-mixed',
         log_every_n_steps=-1,
         num_nodes=num_nodes,
+        devices=[0, 1],
         logger=logger,
         callbacks=[
             checkpoint_callback,

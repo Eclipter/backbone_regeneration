@@ -33,12 +33,10 @@ from dataset import PyGDataset
 from model import PytorchLightningModule
 from predict import write_structure
 
-plt.rcParams['font.family'] = 'Nunito'
-
 # %%
 # Load model and dataset
 log_dir = osp.join('..', 'logs')
-run_filename = osp.join('fixed_equivariance', 'NUM_LAYERS=8_WEIGHT_DECAY=0.05_SWA_EPOCH_START=17_NUM_EPOCHS=30_BETA_SCHEDULE=linear')
+run_filename = osp.join('fixed_phosphorus', 'baseline')
 run_dir = osp.join(log_dir, run_filename)
 ckpt_path = utils.find_best_checkpoint(run_dir)
 test_dataset_path = osp.join(run_dir, 'test_dataset.pt')
@@ -581,6 +579,7 @@ for i, sch in enumerate(_ck.get('lr_schedulers') or []):
 
 # %%
 # Training
+plt.rcParams['font.family'] = 'Nunito'
 
 
 def load_event_accumulator(path):
@@ -1267,10 +1266,10 @@ ax.axvline(
     np.median(rmsd_values),
     color='black', linestyle='--',
     linewidth=1.5,
-    label=f'experimental window median {np.median(rmsd_values):.2f} Å'
+    label=f'медиана окна экспериментальных структур {np.median(rmsd_values):.2f} Å'
 )
-ax.set_xlabel('Window backbone RMSD between independent structures (Å)', fontsize=13)
-ax.set_ylabel('Count', fontsize=13)
+ax.set_xlabel('RMSD (Å)', fontsize=13)
+ax.set_ylabel('Количество структур', fontsize=13)
 ax.legend(fontsize=11)
 sns.despine(ax=ax)
 fig.tight_layout()

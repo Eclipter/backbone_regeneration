@@ -384,8 +384,7 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
     """Build a PyG Data object for a single window of consecutive nucleotides.
 
     atoms_provider controls where per-atom (name, position) pairs come from. Defaults
-    to iterating `nucleotide.e_residue` (used at training time); inference can pass a
-    reference-based provider when backbone atoms are missing from the input.
+    to the canonical provider so node indexing matches `get_edge_idx`.
 
     chain_direction is +1 when the list order of the chain goes 5'->3' (resids
     ascending), -1 when it goes 3'->5' (lagging strand, resids descending). Used to
@@ -396,6 +395,7 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
     atom_names = []
     atom_positions = []
     backbone_mask = []
+    present_mask = []
     has_pair_list = []
     chain_end_class_list = []
     atom_ref_frames = []
@@ -419,11 +419,13 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
 
         nt_ref_frame = ref_frames_all[nucleotide.ind].float()
         nt_origin = origins_all[nucleotide.ind].float()
+        exp_positions = dict(default_atoms_provider(nucleotide))
 
         for atom_name, atom_position in atoms_provider(nucleotide):
             atom_names.append(atom_to_idx[atom_name])
             atom_positions.append(atom_position)
             backbone_mask.append(1 if atom_name in backbone_atoms else 0)
+            present_mask.append(atom_name in exp_positions)
             base_types.append(base_type)
             central_mask.append(is_central)
             has_pair_list.append(nt_has_pair)
@@ -449,6 +451,7 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
 
     central_mask_tensor = torch.tensor(central_mask, dtype=torch.bool)
     backbone_mask_tensor = torch.tensor(backbone_mask, dtype=torch.bool)
+    present_mask_tensor = torch.tensor(present_mask, dtype=torch.bool)
     has_pair_tensor = torch.tensor(has_pair_list, dtype=torch.bool)
     chain_end_class_long = torch.tensor(chain_end_class_list, dtype=torch.long)
     chain_end_class_tensor = F.one_hot(chain_end_class_long, num_classes=N_CHAIN_END_CLASSES).float()
@@ -467,6 +470,7 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
         origins=origins_tensor,
         central_mask=central_mask_tensor,
         backbone_mask=backbone_mask_tensor,
+        present_mask=present_mask_tensor,
         has_pair=has_pair_tensor,
         is_chain_edge=is_chain_edge_tensor,
         chain_end_class=chain_end_class_tensor,
@@ -474,7 +478,7 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
     )
 
 
-def parse_dna(path, use_full_nucleotide, window_size=3, atoms_provider=default_atoms_provider):
+def parse_dna(path, use_full_nucleotide, window_size=3, atoms_provider=inference_atoms_provider):
     """Read a PDB/mmCIF file, run pynamod DNA analysis, group nucleotides by chain,
     slide sliding windows, and build PyG Data objects for every contiguous window.
 

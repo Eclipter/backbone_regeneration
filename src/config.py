@@ -20,11 +20,15 @@ BASE = dict(
 
 # One entry = one experiment. Put ONLY the deltas from BASE here
 EXPERIMENTS = [
-    {},  # baseline (matches BASE)
+    # {},  # baseline (matches BASE)
+    # {'NUM_TIMESTEPS': 250},
+    # {'NUM_TIMESTEPS': 300},
+    {'NUM_TIMESTEPS': 400},
+    {'NUM_TIMESTEPS': 500}
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'fixed_equivariance'
+RUN_NAME = 'fixed_phosphorus'
 
 SEED = 42
 
@@ -34,8 +38,6 @@ SEED = 42
 
 # MINOR:
 # v-prediction + self-conditioning
-# Apply root to val/test RMSE on epoch end, after averaging over batches
-# Consider ODE sampler over SDE one
 # Diffuse inside latent space instead of the euclidean one
 # Distillate like in paper: https://openreview.net/forum?id=8NuN5UzXLC
 ########################

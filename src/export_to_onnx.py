@@ -114,7 +114,7 @@ def export_to_onnx(ckpt_path, out_dir=None, opset=17):
     return onnx_path, json_path
 
 
-MODEL_DIR = osp.normpath(osp.join(osp.dirname(osp.abspath(__file__)), '..', 'models'))
+MODEL_DIR = osp.normpath(osp.join(osp.dirname(osp.abspath(__file__)), '..', 'model'))
 
 
 def _parse_args():

@@ -7,8 +7,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from utils import (CHAIN_END_CLASS_INTERNAL, N_CHAIN_END_CLASSES, atom_to_idx,
-                   base_to_idx)
+from utils import N_CHAIN_END_CLASSES, atom_to_idx, base_to_idx
 
 
 class SinusoidalPositionalEmbeddings(nn.Module):
@@ -249,7 +248,7 @@ class PytorchLightningModule(pl.LightningModule):
         return node_t.long()
 
     def _target_mask(self, batch):
-        return batch.is_target & batch.backbone_mask
+        return batch.is_target & batch.backbone_mask & batch.present_mask
 
     def _build_node_features(self, batch, node_t):
         t_emb = self.time_mlp(node_t.float())

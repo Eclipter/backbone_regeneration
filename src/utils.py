@@ -30,6 +30,8 @@ CHAIN_END_CLASS_5_PRIME = 1
 CHAIN_END_CLASS_3_PRIME = 2
 N_CHAIN_END_CLASSES = 3
 
+PBAR_COLOR = '#B366FF'
+
 
 def find_best_checkpoint(run_dir):
     """Locate the best-monitor checkpoint of a run via ModelCheckpoint state."""

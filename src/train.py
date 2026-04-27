@@ -46,7 +46,7 @@ def _get_run_paths(cfg):
 
 
 def train_one(cfg):
-    pl.seed_everything(SEED, workers=True)
+    pl.seed_everything(SEED, workers=True, verbose=False)
 
     data_module = DNADataModule(batch_size=cfg['BATCH_SIZE'])
     pl_module = PytorchLightningModule(
@@ -118,7 +118,7 @@ def main():
         run_cfg = {**BASE, **exp}
         run_cfg['RUN_NAME'] = RUN_NAME
         run_cfg['RUN_VERSION'] = _make_run_version(run_cfg, BASE)
-        rank_zero_info(f'Running experiment: {run_cfg["RUN_VERSION"]}')
+        rank_zero_info(f'\n\033[1;38;5;93mRunning experiment: {run_cfg["RUN_VERSION"]}\033[0m')
         train_one(run_cfg)
 
 

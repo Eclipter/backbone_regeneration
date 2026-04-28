@@ -3,6 +3,7 @@ import os.path as osp
 
 import lightning.pytorch as pl
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import ReduceLROnPlateau
@@ -209,6 +210,7 @@ class PytorchLightningModule(pl.LightningModule):
         self.register_buffer('posterior_log_variance_clipped', torch.log(getattr(self, 'posterior_variance').clamp(min=1e-20)))
         self.register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         self.register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
+        self._epoch_window_rmsds = {}
 
     def on_test_start(self):
         if self.trainer.is_global_zero:
@@ -250,6 +252,28 @@ class PytorchLightningModule(pl.LightningModule):
     def _target_mask(self, batch):
         return batch.is_target & batch.backbone_mask & batch.present_mask
 
+    def _central_context_hidden_mask(self, batch):
+        central_target_nodes = batch.is_target & batch.central_mask
+        if not central_target_nodes.any():
+            return torch.zeros_like(batch.backbone_mask)
+
+        graph_ids = getattr(batch, 'batch', None)
+        if graph_ids is not None:
+            num_graphs = getattr(batch, 'num_graphs', None)
+            if num_graphs is None:
+                num_graphs = int(graph_ids.max().item()) + 1
+            graph_has_central_target = torch.zeros(
+                num_graphs,
+                device=batch.backbone_mask.device,
+                dtype=torch.bool
+            )
+            graph_has_central_target[graph_ids[central_target_nodes]] = True
+            central_target_graph_nodes = graph_has_central_target[graph_ids]
+        else:
+            central_target_graph_nodes = torch.ones_like(batch.backbone_mask)
+
+        return central_target_graph_nodes & ~batch.central_mask & batch.backbone_mask
+
     def _build_node_features(self, batch, node_t):
         t_emb = self.time_mlp(node_t.float())
         has_pair_expanded = batch.has_pair.float().unsqueeze(1)
@@ -264,6 +288,7 @@ class PytorchLightningModule(pl.LightningModule):
         h = self._build_node_features(batch, node_t)
         pos = batch.pos.clone()
         pos[target_mask] = pos_target
+        pos[self._central_context_hidden_mask(batch)] = 0.0
         _, _, eps_out = self.gnn(h, pos, batch.edge_index)
         return eps_out[target_mask]
 
@@ -300,47 +325,85 @@ class PytorchLightningModule(pl.LightningModule):
             pos_t = self.p_sample(pos_t, t, batch)
         return true_pos, pos_t
 
-    def _log_epoch_msd_components(self, metric_name, pred_pos, true_pos):
-        msd_sum = F.mse_loss(pred_pos, true_pos, reduction='sum')
-        msd_count = msd_sum.new_tensor(true_pos.size(0))
-        self.log(
-            f'{metric_name}_msd_sum',
-            msd_sum,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            reduce_fx=torch.sum,
-            logger=False
+    def _collect_epoch_window_rmsd(self, metric_name, pred_pos, true_pos, graph_ids):
+        if pred_pos.numel() == 0:
+            return
+
+        squared_dist = torch.sum((pred_pos - true_pos) ** 2, dim=1)
+        num_graphs = int(graph_ids.max().item()) + 1
+        msd_sum = squared_dist.new_zeros(num_graphs).scatter_add_(0, graph_ids, squared_dist)
+        counts = squared_dist.new_zeros(num_graphs).scatter_add_(0, graph_ids, torch.ones_like(squared_dist))
+        window_rmsd = torch.sqrt((msd_sum[counts > 0] / counts[counts > 0]).clamp(min=0.0))
+        self._epoch_window_rmsds.setdefault(metric_name, []).append(window_rmsd.detach())
+
+    def _log_eval_rmsd_components(self, stage, batch, pred_pos, true_pos, atom_names=None):
+        target_mask = self._target_mask(batch)
+        if atom_names is not None:
+            atom_names = atom_names.to(device=pred_pos.device)
+            op1_indices = (atom_names == atom_to_idx['OP1']).nonzero(as_tuple=False).flatten()
+            op2_indices = (atom_names == atom_to_idx['OP2']).nonzero(as_tuple=False).flatten()
+            if op1_indices.numel() == op2_indices.numel() and op1_indices.numel() > 0:
+                same_msd = (
+                    torch.sum((pred_pos[op1_indices] - true_pos[op1_indices]) ** 2, dim=1)
+                    + torch.sum((pred_pos[op2_indices] - true_pos[op2_indices]) ** 2, dim=1)
+                )
+                swapped_msd = (
+                    torch.sum((pred_pos[op1_indices] - true_pos[op2_indices]) ** 2, dim=1)
+                    + torch.sum((pred_pos[op2_indices] - true_pos[op1_indices]) ** 2, dim=1)
+                )
+                swap_mask = swapped_msd < same_msd
+                if swap_mask.any():
+                    swap_op1_indices = op1_indices[swap_mask]
+                    swap_op2_indices = op2_indices[swap_mask]
+                    pred_pos = pred_pos.clone()
+                    pred_op1_pos = pred_pos[swap_op1_indices].clone()
+                    pred_pos[swap_op1_indices] = pred_pos[swap_op2_indices]
+                    pred_pos[swap_op2_indices] = pred_op1_pos
+        central_target_mask = batch.central_mask[target_mask]
+        target_graph_ids = batch.batch[target_mask]
+        self._collect_epoch_window_rmsd(stage, pred_pos, true_pos, target_graph_ids)
+        self._collect_epoch_window_rmsd(
+            f'central_{stage}',
+            pred_pos[central_target_mask],
+            true_pos[central_target_mask],
+            target_graph_ids[central_target_mask]
         )
-        self.log(
-            f'{metric_name}_msd_count',
-            msd_count,
-            on_step=False,
-            on_epoch=True,
-            sync_dist=True,
-            reduce_fx=torch.sum,
-            logger=False
+        self._collect_epoch_window_rmsd(
+            f'edge_{stage}',
+            pred_pos[~central_target_mask],
+            true_pos[~central_target_mask],
+            target_graph_ids[~central_target_mask]
         )
 
-    def _log_eval_rmsd_components(self, stage, batch, pred_pos, true_pos):
-        target_mask = self._target_mask(batch)
-        central_target_mask = batch.central_mask[target_mask]
-        self._log_epoch_msd_components(stage, pred_pos, true_pos)
-        self._log_epoch_msd_components(f'central_{stage}', pred_pos[central_target_mask], true_pos[central_target_mask])
-        self._log_epoch_msd_components(f'edge_{stage}', pred_pos[~central_target_mask], true_pos[~central_target_mask])
+    def _gather_variable_length(self, values):
+        values = values.to(self.device)
+        if not (dist.is_available() and dist.is_initialized()):
+            return values
+
+        local_size = torch.tensor([values.numel()], device=values.device, dtype=torch.long)
+        gathered_sizes = [torch.zeros_like(local_size) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered_sizes, local_size)
+
+        max_size = int(torch.stack(gathered_sizes).max().item())
+        if max_size == 0:
+            return values
+
+        padded = F.pad(values, (0, max_size - values.numel()))
+        gathered_values = [torch.empty(max_size, device=values.device, dtype=values.dtype) for _ in gathered_sizes]
+        dist.all_gather(gathered_values, padded)
+        return torch.cat([
+            gathered[:int(size.item())]
+            for gathered, size in zip(gathered_values, gathered_sizes)
+        ])
 
     def _finalize_epoch_rmsd(self, metric_name):
-        msd_sum_name = f'{metric_name}_msd_sum'
-        msd_count_name = f'{metric_name}_msd_count'
-        if msd_sum_name not in self.trainer.callback_metrics or msd_count_name not in self.trainer.callback_metrics:
+        local_values = self._epoch_window_rmsds.pop(metric_name, [])
+        local_window_rmsds = torch.cat(local_values) if local_values else torch.empty(0, device=self.device)
+        window_rmsds = self._gather_variable_length(local_window_rmsds)
+        if window_rmsds.numel() == 0:
             return
 
-        msd_sum = self.trainer.callback_metrics[msd_sum_name]
-        msd_count = self.trainer.callback_metrics[msd_count_name]
-        if float(msd_count.detach().cpu()) <= 0:
-            return
-
-        rmsd = torch.sqrt((msd_sum / msd_count).clamp(min=0.0))
+        rmsd = torch.quantile(window_rmsds.float(), 0.5)
         self.log(
             f'{metric_name}_rmsd',
             rmsd,
@@ -350,7 +413,8 @@ class PytorchLightningModule(pl.LightningModule):
             prog_bar=False,
             logger=False
         )
-        self.logger.experiment.add_scalar(f'{metric_name}_rmsd', rmsd, self.current_epoch)  # type: ignore
+        if self.trainer.is_global_zero:
+            self.logger.experiment.add_scalar(f'{metric_name}_rmsd', rmsd, self.current_epoch)  # type: ignore
 
     def training_step(self, batch, _):
         target_mask = self._target_mask(batch)
@@ -381,7 +445,8 @@ class PytorchLightningModule(pl.LightningModule):
 
     def validation_step(self, batch, _):
         true_pos, gen_pos = self.p_sample_loop(batch)
-        self._log_eval_rmsd_components('val', batch, gen_pos, true_pos)
+        atom_names = batch.x[self._target_mask(batch)].argmax(dim=1)
+        self._log_eval_rmsd_components('val', batch, gen_pos, true_pos, atom_names)
 
     def on_validation_epoch_end(self):
         self._finalize_epoch_rmsd('val')
@@ -390,7 +455,8 @@ class PytorchLightningModule(pl.LightningModule):
 
     def test_step(self, batch, _):
         true_pos, gen_pos = self.p_sample_loop(batch)
-        self._log_eval_rmsd_components('test', batch, gen_pos, true_pos)
+        atom_names = batch.x[self._target_mask(batch)].argmax(dim=1)
+        self._log_eval_rmsd_components('test', batch, gen_pos, true_pos, atom_names)
 
     def on_test_epoch_end(self):
         self._finalize_epoch_rmsd('test')

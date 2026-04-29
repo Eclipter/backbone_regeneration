@@ -73,21 +73,24 @@ class PyGDataset(Dataset):
             )
         ]
 
-        with ThreadPoolExecutor() as executor:
+        # Enables single-threaded downloading when True
+        debug = False
+        if not debug:
+            with ThreadPoolExecutor() as executor:
+                list(tqdm(
+                    executor.map(self.download_file, pdb_ids_to_download),
+                    total=len(pdb_ids_to_download),
+                    desc='\033[1;38;5;93mDownloading mmCIF files\033[0m',
+                    colour=utils.PBAR_COLOR
+                ))
+        else:
+            print('\033[1;31mUsing single-threaded downloading for debugging purposes...\033[0m')
             list(tqdm(
-                executor.map(self.download_file, pdb_ids_to_download),
+                map(self.download_file, pdb_ids_to_download),
                 total=len(pdb_ids_to_download),
-                desc='Downloading mmCIF files',
+                desc='\033[1;38;5;93mDownloading mmCIF files\033[0m',
                 colour=utils.PBAR_COLOR
             ))
-
-        # Single-threaded downloading for debugging
-        # list(tqdm(
-        #     map(self.download_file, pdb_ids_to_download),
-        #     total=len(pdb_ids_to_download),
-        #     desc='Downloading mmCIF files',
-        #     colour=utils.PBAR_COLOR
-        # ))
 
         tag_path = osp.join(self.processed_dir, self.processed_file_names)
         if osp.exists(tag_path):
@@ -163,7 +166,7 @@ class PyGDataset(Dataset):
                 ):
                     edge_paths.extend(per_file_edges)
         else:
-            print('Using single-threaded processing for debugging purposes...')
+            print('\033[1;31mUsing single-threaded processing for debugging purposes...\033[0m')
             for per_file_edges in tqdm(
                 map(self.process_file, self.pdb_ids),
                 total=len(self.pdb_ids),
@@ -325,32 +328,62 @@ class DNADataModule(pl.LightningDataModule):
         with open(cache_path) as f:
             return {line for line in f.read().splitlines() if line}
 
+    def _read_deposit_group_id(self, dataset: 'PyGDataset', pdb_id: str) -> Optional[str]:
+        raw_path = osp.join(dataset.raw_dir, f'{pdb_id}.cif')
+        if not osp.exists(raw_path):
+            return None
+
+        with open(raw_path) as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped.startswith('_pdbx_deposit_group.group_id'):
+                    continue
+
+                parts = stripped.split(maxsplit=1)
+                if len(parts) < 2:
+                    return None
+
+                value = parts[1].strip().strip("'\"")
+                if value in {'', '.', '?'}:
+                    return None
+                return value
+
+        return None
+
     def setup(self, stage: Optional[str] = None):
         dataset = PyGDataset()
         edge_paths = self._load_edge_paths(dataset)
 
-        # Structure-wise split: group windows by their parent PDB directory so
-        # that all windows from a single structure end up in the same subset
-        indices_by_structure: dict[str, list[int]] = defaultdict(list)
+        # Deposit-wise split: structures from the same deposit group must stay
+        # in the same subset. Structures without a deposit group stay separate.
+        indices_by_split_group: dict[str, list[int]] = defaultdict(list)
+        split_group_by_pdb_id: dict[str, str] = {}
         for idx, path in enumerate(dataset.data_list):
             pdb_id = osp.basename(osp.dirname(path))
-            indices_by_structure[pdb_id].append(idx)
+            if pdb_id not in split_group_by_pdb_id:
+                deposit_group_id = self._read_deposit_group_id(dataset, pdb_id)
+                split_group_by_pdb_id[pdb_id] = (
+                    f'deposit:{deposit_group_id}'
+                    if deposit_group_id is not None
+                    else f'structure:{pdb_id}'
+                )
+            indices_by_split_group[split_group_by_pdb_id[pdb_id]].append(idx)
 
-        pdb_ids = sorted(indices_by_structure.keys())
+        split_groups = sorted(indices_by_split_group.keys())
         rng = np.random.default_rng(SEED)
-        rng.shuffle(pdb_ids)
+        rng.shuffle(split_groups)
 
-        n_structures = len(pdb_ids)
-        train_val_split = int(n_structures * self.train_ratio)
-        val_test_split = int(n_structures * (self.train_ratio + self.val_ratio))
+        n_split_groups = len(split_groups)
+        train_val_split = int(n_split_groups * self.train_ratio)
+        val_test_split = int(n_split_groups * (self.train_ratio + self.val_ratio))
 
-        train_pdb_ids = pdb_ids[:train_val_split]
-        val_pdb_ids = pdb_ids[train_val_split:val_test_split]
-        test_pdb_ids = pdb_ids[val_test_split:]
+        train_split_groups = split_groups[:train_val_split]
+        val_split_groups = split_groups[train_val_split:val_test_split]
+        test_split_groups = split_groups[val_test_split:]
 
-        train_indices = [i for pdb_id in train_pdb_ids for i in indices_by_structure[pdb_id]]
-        val_indices = [i for pdb_id in val_pdb_ids for i in indices_by_structure[pdb_id]]
-        test_indices = [i for pdb_id in test_pdb_ids for i in indices_by_structure[pdb_id]]
+        train_indices = [i for group in train_split_groups for i in indices_by_split_group[group]]
+        val_indices = [i for group in val_split_groups for i in indices_by_split_group[group]]
+        test_indices = [i for group in test_split_groups for i in indices_by_split_group[group]]
 
         def _wrap(indices: list[int]) -> WindowTargetDataset:
             flags = [dataset.data_list[i] in edge_paths for i in indices]

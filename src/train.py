@@ -48,7 +48,10 @@ def _get_run_paths(cfg):
 def train_one(cfg):
     pl.seed_everything(SEED, workers=True, verbose=False)
 
-    data_module = DNADataModule(batch_size=cfg['BATCH_SIZE'])
+    data_module = DNADataModule(
+        batch_size=cfg['BATCH_SIZE'],
+        edge_weight=cfg['EDGE_WEIGHT'],
+    )
     pl_module = PytorchLightningModule(
         hidden_dim=cfg['HIDDEN_DIM'],
         num_layers=cfg['NUM_LAYERS'],

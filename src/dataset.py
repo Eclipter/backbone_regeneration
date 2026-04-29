@@ -258,7 +258,7 @@ class WindowTargetDataset(torch.utils.data.Dataset):
 
 class EdgeCentralTargetSampler(Sampler[int]):
     """Weighted sampler yielding edge-target and central-target virtual entries
-    in a fixed ratio (default 1:2).
+    with a fixed edge-target probability.
 
     Note: the ratio is applied at the *target* level. Edge-target samples come
     only from edge windows; central-target samples come from any window, which
@@ -269,13 +269,16 @@ class EdgeCentralTargetSampler(Sampler[int]):
     def __init__(
         self,
         dataset: WindowTargetDataset,
-        edge_weight: float = 1.0,
-        central_weight: float = 2.0,
+        edge_weight: float = 0.3,
         num_samples: Optional[int] = None,
         generator: Optional[torch.Generator] = None,
     ):
+        if not 0 <= edge_weight <= 1:
+            raise ValueError(f'edge_weight must be in [0, 1], got {edge_weight}')
+
         num_edge = len(dataset.edge_virtual)
         num_central = len(dataset.central_virtual)
+        central_weight = 1 - edge_weight
 
         weights = torch.zeros(len(dataset), dtype=torch.double)
         if num_edge > 0:
@@ -299,14 +302,13 @@ class EdgeCentralTargetSampler(Sampler[int]):
 
 class DNADataModule(pl.LightningDataModule):
     def __init__(self, batch_size, train_ratio=0.7, val_ratio=0.2,
-                 edge_weight=1.0, central_weight=2.0):
+                 edge_weight=0.3):
         super().__init__()
 
         self.batch_size = batch_size
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.edge_weight = edge_weight
-        self.central_weight = central_weight
 
         self.num_workers = min(len(os.sched_getaffinity(0)), 16)
         self.train_generator = torch.Generator().manual_seed(SEED)
@@ -362,7 +364,6 @@ class DNADataModule(pl.LightningDataModule):
         sampler = EdgeCentralTargetSampler(
             self.train_dataset,
             edge_weight=self.edge_weight,
-            central_weight=self.central_weight,
             generator=self.train_generator,
         )
         return DataLoader(
@@ -397,15 +398,3 @@ class DNADataModule(pl.LightningDataModule):
 
 if __name__ == '__main__':
     PyGDataset()
-
-    # structure.dna.nucleotides: Nucleotides_Storage
-
-    # structure.dna.nucleotides.resids: list[int] — индексы нуклеотидов (0-based, уникальны только в пределах цепи). Если все цепи лидирующие, то индексы в порядке возрастания, если цепи разделены, то сначала по возрастанию индексы лидирующих, затем — отстающих
-
-    # structure.dna.nucleotides.segids: list[str] — segids нуклеотидов. Если все цепи лидирующие, то segids в порядке возрастания, если цепи разделены, то сначала по возрастанию segids лидирующих, затем — отстающих
-
-    # structure.dna.nucleotides.restypes: list[str] — типы нуклеотидов (A, C, G, T). Если все цепи лидирующие, то restypes в порядке возрастания индексов, если цепи разделены, то сначала по возрастанию restypes лидирующих, затем — отстающих. Причем лидирующие цепи в одном направлении, отстающие — в обратном
-
-    # structure.dna.nucleotides.ref_frames: torch.Tensor — система отсчета для каждого нуклеотида (N, 3, 3)
-
-    # structure.dna.nucleotides.leading_strands: list[bool] — булевые значения для каждого нуклеотида, указывающие, является ли он лидирующим

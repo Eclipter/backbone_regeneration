@@ -1,3 +1,5 @@
 {
-  "extraPaths": ["./pynamod"]
+  "extraPaths": ["./pynamod", "./src"],
+  "venvPath": "../.conda/envs",
+  "venv": "backbone_regen"
 }

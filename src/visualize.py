@@ -2,6 +2,7 @@
 # Imports
 import os.path as osp
 import random
+import warnings
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
@@ -23,6 +24,7 @@ from Bio.PDB import Atom, Chain
 from Bio.PDB import Model as PDBModel
 from Bio.PDB import Residue, Structure
 from Bio.PDB.mmcifio import MMCIFIO
+from Bio.PDB.PDBExceptions import PDBConstructionWarning
 from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 from tensorboard.backend.event_processing import event_accumulator
 from torch_geometric.data import Batch
@@ -36,7 +38,7 @@ from predict import write_structure
 # %%
 # Load model and dataset
 log_dir = osp.join('..', 'logs')
-run_filename = osp.join('fixed_phosphorus', 'baseline')
+run_filename = osp.join('fixed_noising', 'NUM_LAYERS=3_LR=0.0001_WEIGHT_DECAY=0')
 run_dir = osp.join(log_dir, run_filename)
 ckpt_path = utils.find_best_checkpoint(run_dir)
 test_dataset_path = osp.join(run_dir, 'test_dataset.pt')
@@ -703,7 +705,7 @@ for mode in target_modes:
     )
 ax.set_yscale('log')
 ax.set_xlabel('Эпоха', fontsize=18)
-ax.set_ylabel('RMSD (Å)', fontsize=18)
+ax.set_ylabel('Медианный RMSD по окнам \nпредсказанных координат (Å)', fontsize=18)
 ax.legend(fontsize=14)
 sns.despine(ax=ax, top=True, right=True)
 
@@ -803,7 +805,7 @@ if edge_index is not None:
         z=lines_z,
         mode='lines',
         line=dict(color='rgba(35, 35, 35, 0.55)', width=6),
-        name='True bonds (window, outline)'
+        name='Связи исходной структуры (фон)'
     ))
     fig.add_trace(go.Scatter3d(
         x=lines_x,
@@ -811,7 +813,7 @@ if edge_index is not None:
         z=lines_z,
         mode='lines',
         line=dict(color='rgba(210, 210, 210, 0.95)', width=3),
-        name='True bonds (window)'
+        name='Связи исходной структуры'
     ))
 
 # Encode three classifications directly in legend and marker style:
@@ -819,9 +821,9 @@ if edge_index is not None:
 # 2) central/side via size and edge thickness
 # 3) true/generated via base color palette and outline style
 true_classes = [
-    ('True | Central | Backbone', central_mask & backbone_mask, '#d62728', 8, 0.96, 1.2),
-    ('True | Central | Base', central_mask & base_mask, '#2ca02c', 7, 0.94, 1.0),
-    ('True | Side | Backbone', side_mask & backbone_mask, '#ff9896', 7, 0.9, 1.0),
+    ('Исходное: центральный нуклеотид, остов', central_mask & backbone_mask, '#d62728', 8, 0.96, 1.2),
+    ('Исходное: центральный нуклеотид, основание', central_mask & base_mask, '#2ca02c', 7, 0.94, 1.0),
+    ('Исходное: соседние нуклеотиды, остов', side_mask & backbone_mask, '#ff9896', 7, 0.9, 1.0),
 ]
 
 for name, mask, color, size, opacity, edge_width in true_classes:
@@ -858,7 +860,7 @@ if np.any(side_base_mask):
             symbol='circle',
             line=dict(width=1.4, color='rgba(15, 55, 10, 0.95)')
         ),
-        name='True | Side | Base'
+        name='Исходное: окружение, основание'
     ))
 
 fig.add_trace(go.Scatter3d(
@@ -873,7 +875,7 @@ fig.add_trace(go.Scatter3d(
         symbol='circle',
         line=dict(width=2.4, color='rgba(10, 10, 10, 0.9)')
     ),
-    name='Generated | Backbone'
+    name='Сгенерированный остов'
 ))
 
 # Build generated bonds by reusing central-backbone topology from the true graph.
@@ -896,7 +898,7 @@ if edge_index is not None:
             z=gen_bonds_z,
             mode='lines',
             line=dict(color='rgba(8, 65, 140, 0.95)', width=6),
-            name='Generated bonds (topology from true graph)'
+            name='Связи сгенерированного остова'
         ))
 
 # Add pairwise GT->generated correspondence lines (same atom order as target_mask indexing).
@@ -914,7 +916,7 @@ if true_backbone.shape[0] == pred_backbone.shape[0]:
         z=corr_z,
         mode='lines',
         line=dict(color='rgba(10, 25, 50, 0.82)', width=6, dash='dot'),
-        name='True -> Generated links (outline)'
+        name='Пары исходное-сгенерированное (фон)'
     ))
     fig.add_trace(go.Scatter3d(
         x=corr_x,
@@ -922,41 +924,41 @@ if true_backbone.shape[0] == pred_backbone.shape[0]:
         z=corr_z,
         mode='lines',
         line=dict(color='rgba(40, 170, 255, 0.98)', width=3, dash='dot'),
-        name='True -> Generated links'
+        name='Пары исходное-сгенерированное'
     ))
 
 # Scale the displayed frame to current sample extent while keeping the origin fixed.
 all_points = np.vstack([pos_full, pred_backbone])
 radius = float(np.max(np.linalg.norm(all_points, axis=1)))
-axis_len = max(4.0, radius * 1.15)
+axis_len = max(4.0, radius * 1.15) / 5.0
 
 fig.add_trace(go.Scatter3d(
     x=[0, axis_len], y=[0, 0], z=[0, 0], mode='lines',
-    line=dict(color='red', width=5), showlegend=False, name='Frame X'
+    line=dict(color='red', width=5), showlegend=False, name='Ось X'
 ))
 fig.add_trace(go.Scatter3d(
     x=[0, 0], y=[0, axis_len], z=[0, 0], mode='lines',
-    line=dict(color='green', width=5), showlegend=False, name='Frame Y'
+    line=dict(color='green', width=5), showlegend=False, name='Ось Y'
 ))
 fig.add_trace(go.Scatter3d(
     x=[0, 0], y=[0, 0], z=[0, axis_len], mode='lines',
-    line=dict(color='blue', width=5), showlegend=False, name='Frame Z'
+    line=dict(color='blue', width=5), showlegend=False, name='Ось Z'
 ))
 
 fig.add_trace(go.Cone(
     x=[axis_len], y=[0], z=[0], u=[1], v=[0], w=[0],
     showscale=False, colorscale=[[0, 'red'], [1, 'red']],
-    sizemode='absolute', sizeref=0.45, anchor='tail', name='Frame X arrow'
+    sizemode='absolute', sizeref=0.45, anchor='tail', name='Стрелка оси X'
 ))
 fig.add_trace(go.Cone(
     x=[0], y=[axis_len], z=[0], u=[0], v=[1], w=[0],
     showscale=False, colorscale=[[0, 'green'], [1, 'green']],
-    sizemode='absolute', sizeref=0.45, anchor='tail', name='Frame Y arrow'
+    sizemode='absolute', sizeref=0.45, anchor='tail', name='Стрелка оси Y'
 ))
 fig.add_trace(go.Cone(
     x=[0], y=[0], z=[axis_len], u=[0], v=[0], w=[1],
     showscale=False, colorscale=[[0, 'blue'], [1, 'blue']],
-    sizemode='absolute', sizeref=0.45, anchor='tail', name='Frame Z arrow'
+    sizemode='absolute', sizeref=0.45, anchor='tail', name='Стрелка оси Z'
 ))
 
 fig.add_trace(go.Scatter3d(
@@ -972,8 +974,8 @@ fig.add_trace(go.Scatter3d(
 
 fig.update_layout(
     title=(
-        f'Results: run={run_filename}, '
-        f'pdb_id={sample_pdb_id}, window={sample_window}'
+        f'Эксперимент {run_filename}: '
+        f'PDB {sample_pdb_id}, окно {sample_window}'
     ),
     scene=dict(
         xaxis=dict(visible=False),
@@ -981,8 +983,8 @@ fig.update_layout(
         zaxis=dict(visible=False),
         aspectmode='data'
     ),
-    width=1300,
-    height=850,
+    width=800,
+    height=600,
     margin=dict(r=10, l=10, b=10, t=50),
     legend=dict(itemsizing='constant')
 )
@@ -1167,11 +1169,13 @@ def _parsed_chain_records(pdb_id):
         url = f'https://files.rcsb.org/download/{pdb_id}.cif'
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         Path(path).write_bytes(requests.get(url, timeout=60).content)
-    _, chain_records = utils.parse_dna(
-        path,
-        use_full_nucleotide=True,
-        window_size=test_dataset.base.window_size,
-    )
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', PDBConstructionWarning)
+        _, chain_records = utils.parse_dna(
+            path,
+            use_full_nucleotide=True,
+            window_size=test_dataset.base.window_size,
+        )
     return chain_records
 
 
@@ -1260,14 +1264,15 @@ for mode, color in mode_colors.items():
         val,
         color=color,
         linewidth=2,
-        label=f'model val RMSD [{mode}] {val:.2f} Å'
+        label=f'валидационный RMSD модели в режиме {mode} ({val:.2f} Å)'
     )
 ax.axvline(
     np.median(rmsd_values),
     color='black', linestyle='--',
     linewidth=1.5,
-    label=f'медиана окна экспериментальных структур {np.median(rmsd_values):.2f} Å'
+    label=f'медиана окон экспериментальных структур ({np.median(rmsd_values):.2f} Å)'
 )
+ax.set_xlim(0, 3)
 ax.set_xlabel('RMSD (Å)', fontsize=13)
 ax.set_ylabel('Количество структур', fontsize=13)
 ax.legend(fontsize=11)

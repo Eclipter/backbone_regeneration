@@ -35,7 +35,6 @@ SEED = 42
 # MAJOR:
 # Chemical losses
 # Check chemicality
-# Split dataset by sequence similarity
 
 # MINOR:
 # Self-conditioning

@@ -209,7 +209,7 @@ palette = {
     'input': '#E8F4F8',
     'pre': '#FDF5E6',
     'embed': '#FFE8C1',
-    'equiv': '#EAE3F5',
+    'graph': '#EAE3F5',
     'output': '#D8F0DF',
     'detail': '#FFF8D6',
     'feature': '#F0F8FF'
@@ -300,7 +300,7 @@ step_stride = main_height + arrow_length
 input_y = main_y
 prep_y = main_y - step_stride
 embed_y = main_y - 2 * step_stride
-egnn_y = main_y - 3 * step_stride
+gnn_y = main_y - 3 * step_stride
 eps_y = main_y - 4 * step_stride
 output_y = main_y - 5 * step_stride
 
@@ -385,26 +385,26 @@ draw_arrow(
     embed_y-MAX_Y*0.04
 )
 
-# Equivariant blocks
+# Graph convolution blocks
 draw_box(
     main_x,
-    egnn_y,
+    gnn_y,
     main_width,
     main_height,
-    'EGNN backbone',
-    fr'SE(3)-эквивариантная свертка ({num_layers}x):' + '\n' +
+    'GNN backbone',
+    fr'Обычная графовая свертка ({num_layers}x):' + '\n' +
     '• Сообщения по ребрам\n' +
     '• Агрегирование по узлам\n' +
     '• Обновление координат\n' +
     '• Обновление признаков',
     'left',
-    palette['equiv']
+    palette['graph']
 )
 draw_arrow(
     main_x + main_width/2,
-    egnn_y-MAX_Y*0.01,
+    gnn_y-MAX_Y*0.01,
     main_x + main_width/2,
-    egnn_y-MAX_Y*0.04
+    gnn_y-MAX_Y*0.04
 )
 
 # Noise head and DDPM decode
@@ -443,18 +443,18 @@ draw_box(
 
 # ========== DETAIL OPERATIONS (right column) ==========
 detail_steps = [
-    ('Относительные координаты',
-     r'$\vec{r}_{ij} = x_i - x_j$' + '\n' + r'$d_{ij} = \|\vec{r}_{ij}\|$'),
-    ('Инвариантные сообщения',
-     r'$m_{ij} = \text{MLP}([h_i, h_j, d_{ij}])$'),
+    ('Координатные признаки',
+     r'$z_{ij} = [h_i, h_j, x_i, x_j]$'),
+    ('Сообщения',
+     r'$m_{ij} = \text{MLP}(z_{ij})$'),
     ('Агрегация',
      r'$\bar{m}_i = \sum_j m_{ji}$'),
     ('Обновление координат',
-     r'$\Delta x_i = \sum_j \phi_x(m_{ji}) \frac{\vec{r}_{ji}}{d_{ji} + \epsilon}$'),
+     r'$\Delta x_i = \sum_j \phi_x(m_{ji})$'),
     ('Обновление признаков',
      r'$h_i := \mathrm{LayerNorm}(h_i + \text{MLP}([h_i, \bar{m}_i]))$'),
     (r'Предсказание $\epsilon$',
-     r'$\epsilon_i = \sum_j \phi_\epsilon(m_{ji}) \frac{\vec{r}_{ji}}{d_{ji} + \epsilon}$')
+     r'$\epsilon_i = \sum_j \phi_\epsilon(m_{ji}) + \psi_\epsilon([h_i, x_i])$')
 ]
 
 detail_palette_steps = ['#FCE4EC', '#F3E5F5', '#E8F5E9', '#FFF8E1', '#E0F2F1', '#E3F2FD']
@@ -486,24 +486,24 @@ for idx, (step_title, step_desc) in enumerate(detail_steps):
 
 
 # ============ Lines connecting core blocks to their details ============
-egnn_height = main_height
-egnn_x_right = main_x + main_width + MAX_X*0.02
-egnn_y_center = egnn_y + egnn_height/2
+gnn_height = main_height
+gnn_x_right = main_x + main_width + MAX_X*0.02
+gnn_y_center = gnn_y + gnn_height/2
 
 eps_height = main_height
 eps_x_right = main_x + main_width + MAX_X*0.02
 eps_y_center = eps_y + eps_height/2
 
-rel_coords_y_bottom = detail_y - step_height
-rel_coords_height = detail_box_height
-rel_coords_y_top = rel_coords_y_bottom + rel_coords_height
+graph_features_y_bottom = detail_y - step_height
+graph_features_height = detail_box_height
+graph_features_y_top = graph_features_y_bottom + graph_features_height
 
 eps_detail_y_bottom = detail_y - len(detail_steps)*step_height
 
 # Line to top block
 ax.add_patch(FancyArrowPatch(
-    (egnn_x_right, egnn_y_center),
-    (detail_x - MAX_X*0.02, rel_coords_y_top),
+    (gnn_x_right, gnn_y_center),
+    (detail_x - MAX_X*0.02, graph_features_y_top),
     linewidth=2,
     arrowstyle='-'  # Draw a line, not an arrow
 ))

@@ -13,21 +13,19 @@ BASE = dict(
     LR_SCHEDULER_THRESHOLD=0.1,
     SWA=True,
     SWA_LR=0.1,
-    SWA_EPOCH_START=20,
-    NUM_EPOCHS=60,
+    SWA_EPOCH_START=10,
+    NUM_EPOCHS=20,
     BETA_SCHEDULE='linear',  # 'linear' | 'cosine'
     START_FROM_LAST_CKPT=True,
 )
 
 # One entry = one experiment. Put ONLY the deltas from BASE here
 EXPERIMENTS = [
-    # {},  # baseline (matches BASE)
-    {'SWA': False, 'LR_SCHEDULER_THRESHOLD': None},
-    # {'SWA': False, 'LR_SCHEDULER': 'ReduceLROnPlateau'}
+    {},  # baseline (matches BASE)
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'fixed_noising'
+RUN_NAME = 'non_equivariant_gnn'
 
 SEED = 42
 

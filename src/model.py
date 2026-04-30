@@ -26,21 +26,21 @@ class SinusoidalPositionalEmbeddings(nn.Module):
         return embeddings
 
 
-class EquivariantConv(nn.Module):
+class GraphConv(nn.Module):
     def __init__(self, hidden_nf, act_fn_cls=nn.SiLU):
         super().__init__()
         self.hidden_nf = hidden_nf
         act_fn = act_fn_cls
         self.message_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_nf + 1, hidden_nf),
+            nn.Linear(2 * hidden_nf + 6, hidden_nf),
             act_fn(),
             nn.Linear(hidden_nf, hidden_nf),
             act_fn()
         )
-        self.coord_mlp = nn.Sequential(
+        self.coord_update_mlp = nn.Sequential(
             nn.Linear(hidden_nf, hidden_nf),
             act_fn(),
-            nn.Linear(hidden_nf, 1, bias=False),
+            nn.Linear(hidden_nf, 3),
             nn.Tanh()
         )
         self.node_update_mlp = nn.Sequential(
@@ -55,9 +55,7 @@ class EquivariantConv(nn.Module):
         row, col = edge_index[0], edge_index[1]
 
         # Message passing
-        rel_coords = x[row] - x[col]
-        dist = torch.norm(rel_coords, p=2, dim=-1, keepdim=True)
-        message_input = torch.cat([h[row], h[col], dist], dim=-1)
+        message_input = torch.cat([h[row], h[col], x[row], x[col]], dim=-1)
         messages = self.message_mlp(message_input)
 
         # Aggregate messages
@@ -66,9 +64,7 @@ class EquivariantConv(nn.Module):
         agg_messages.scatter_add_(0, index, messages)
 
         # Update & normalize coordinates
-        rel_dir = rel_coords / (dist + 1e-8)
-        coord_mult = self.coord_mlp(messages)
-        coord_update_src = coord_mult * rel_dir
+        coord_update_src = self.coord_update_mlp(messages)
         coord_update = torch.zeros_like(x, dtype=coord_update_src.dtype)
         index = col.unsqueeze(1).expand_as(coord_update_src)
         coord_update.scatter_add_(0, index, coord_update_src)
@@ -115,7 +111,7 @@ def extract(a, t, x_shape):
     return out.reshape(b, *((1,) * (len(x_shape) - 1)))
 
 
-class EGNNDiff(nn.Module):
+class GraphDiffusionDenoiser(nn.Module):
     def __init__(self, in_node_nf, hidden_nf, num_layers, act_fn_cls=nn.SiLU):
         super().__init__()
         self.hidden_nf = hidden_nf
@@ -126,15 +122,15 @@ class EGNNDiff(nn.Module):
         self.embedding_in = nn.Linear(in_node_nf, self.hidden_nf)
 
         self.eps_message_mlp = nn.Sequential(
-            nn.Linear(2 * hidden_nf + 1, hidden_nf),
+            nn.Linear(2 * hidden_nf + 6, hidden_nf),
             act_fn(),
             nn.Linear(hidden_nf, hidden_nf),
             act_fn()
         )
-        self.eps_coord_scalar_mlp = nn.Sequential(
+        self.eps_vector_mlp = nn.Sequential(
             nn.Linear(hidden_nf, hidden_nf),
             act_fn(),
-            nn.Linear(hidden_nf, 1, bias=False),
+            nn.Linear(hidden_nf, 3),
             nn.Tanh()
         )
         self.eps_head = nn.Sequential(
@@ -143,18 +139,17 @@ class EGNNDiff(nn.Module):
             nn.Linear(hidden_nf, 3)
         )
 
-        for i in range(0, num_layers):
-            self.add_module(f'gcl_{i}', EquivariantConv(self.hidden_nf, act_fn_cls=act_fn))
+        self.layers = nn.ModuleList([
+            GraphConv(self.hidden_nf, act_fn_cls=act_fn)
+            for _ in range(num_layers)
+        ])
 
     def predict_epsilon(self, h, x, edge_index):
         row, col = edge_index[0], edge_index[1]
-        rel_coords = x[row] - x[col]
-        dist = torch.norm(rel_coords, p=2, dim=-1, keepdim=True)
 
-        message_input = torch.cat([h[row], h[col], dist], dim=-1)
+        message_input = torch.cat([h[row], h[col], x[row], x[col]], dim=-1)
         eps_messages = self.eps_message_mlp(message_input)
-        rel_dir = rel_coords / (dist + 1e-8)
-        eps_update_src = self.eps_coord_scalar_mlp(eps_messages) * rel_dir
+        eps_update_src = self.eps_vector_mlp(eps_messages)
 
         eps = torch.zeros_like(x, dtype=eps_update_src.dtype)
         index = col.unsqueeze(1).expand_as(eps_update_src)
@@ -168,8 +163,8 @@ class EGNNDiff(nn.Module):
 
     def forward(self, h, x, edge_index):
         h = self.embedding_in(h)
-        for i in range(0, self.num_layers):
-            h, x = getattr(self, f'gcl_{i}')(h, x, edge_index)
+        for layer in self.layers:
+            h, x = layer(h, x, edge_index)
         eps = self.predict_epsilon(h, x, edge_index)
         return h, x, eps
 
@@ -185,7 +180,7 @@ class PytorchLightningModule(pl.LightningModule):
         self.time_emb_dim = 32
         self.time_mlp = SinusoidalPositionalEmbeddings(self.time_emb_dim)
 
-        self.gnn = EGNNDiff(
+        self.gnn = GraphDiffusionDenoiser(
             # +1 for has_pair, +N_CHAIN_END_CLASSES for chain_end_class one-hot, +1 for is_target
             in_node_nf=self.n_atom_types + self.time_emb_dim + len(base_to_idx) + 2 + N_CHAIN_END_CLASSES,
             hidden_nf=hidden_dim,

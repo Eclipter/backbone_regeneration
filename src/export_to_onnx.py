@@ -44,10 +44,10 @@ def resolve_run_dir(run):
 
 
 def export_to_onnx(ckpt_path, out_dir=None, opset=17):
-    """Export the EGNN denoiser from a Lightning checkpoint to ONNX.
+    """Export the graph denoiser from a Lightning checkpoint to ONNX.
 
     Writes two files into ``out_dir`` (defaults to the checkpoint directory):
-        - model.onnx: a single denoising step, i.e. EGNNDiff(h, x, edge_index) -> (h, x, eps).
+        - model.onnx: a single denoising step, i.e. GraphDiffusionDenoiser(h, x, edge_index) -> (h, x, eps).
         - model.json: hyperparameters + schedule buffers + atom/base vocabularies.
 
     The full reverse diffusion loop is *not* exported: consumers run the loop

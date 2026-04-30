@@ -25,16 +25,23 @@ EXPERIMENTS = [
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'non_equivariant_gnn'
+RUN_NAME = 'eps_normalize_agg'
 
 SEED = 42
 
 ######### TO DOs ########
 # MAJOR:
+# Normalize coordinates to match the noise range
+# Experiment with resolution threshold
+# Measure distribution of RMSD between different stochastic runs
+# Compare with rigid molecular model fitting
 # Chemical losses
 # Check chemicality
 
 # MINOR:
+# Exoeriment with removing LayerNorm
+# Experiment with large window sizes
+# Experiment with edge weight
 # Self-conditioning
 # Compile
 # Distillate like in paper: https://openreview.net/forum?id=8NuN5UzXLC

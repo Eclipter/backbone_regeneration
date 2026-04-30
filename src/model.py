@@ -117,7 +117,6 @@ class GraphDiffusionDenoiser(nn.Module):
         self.hidden_nf = hidden_nf
         self.num_layers = num_layers
         act_fn = act_fn_cls
-        self.eps_normalize_agg = False
 
         self.embedding_in = nn.Linear(in_node_nf, self.hidden_nf)
 
@@ -154,10 +153,6 @@ class GraphDiffusionDenoiser(nn.Module):
         eps = torch.zeros_like(x, dtype=eps_update_src.dtype)
         index = col.unsqueeze(1).expand_as(eps_update_src)
         eps.scatter_add_(0, index, eps_update_src)
-        if self.eps_normalize_agg:
-            ones = torch.ones(col.size(0), device=x.device, dtype=x.dtype)
-            in_degree = torch.zeros(x.size(0), device=x.device, dtype=x.dtype).scatter_add(0, col, ones).unsqueeze(1)
-            eps = eps / (in_degree + 1.0)
         eps = eps + self.eps_head(torch.cat([h, x], dim=-1))
         return eps
 

@@ -51,7 +51,7 @@ def _predict_window(model, data, frame_atom_idx, device):
     return (gen_pos_local @ ref_frame.T + origin).cpu().numpy()
 
 
-def _run_target(model, data, target_mask_attr, device, meta, predictions):
+def _run_target(model, data, target_mask_attr, device, meta, predictions, generate_5_prime_phosphate=False):
     """Set `is_target` to the requested mask, run the diffusion sampler, and store
     the world-frame predicted coordinates into the shared `predictions` dict.
     """
@@ -60,6 +60,17 @@ def _run_target(model, data, target_mask_attr, device, meta, predictions):
         return
     sample_data = data.clone()
     sample_data.is_target = getattr(sample_data, target_mask_attr).clone()
+    sample_target = sample_data.is_target & sample_data.backbone_mask
+    sample_data.present_mask[sample_target] = True
+    if not generate_5_prime_phosphate:
+        atom_names = sample_data.x.argmax(dim=-1)
+        phosphate_atom_mask = (
+            (atom_names == utils.atom_to_idx['P'])
+            | (atom_names == utils.atom_to_idx['OP1'])
+            | (atom_names == utils.atom_to_idx['OP2'])
+        )
+        five_prime_mask = sample_data.chain_end_class[:, 1] == 1
+        sample_data.present_mask[sample_target & phosphate_atom_mask & five_prime_mask] = False
     # Mirror training-time frame choice: edge targets use the edge nucleotide's
     # frame, central targets keep the central nucleotide's frame.
     if target_mask_attr == 'is_chain_edge':
@@ -68,12 +79,12 @@ def _run_target(model, data, target_mask_attr, device, meta, predictions):
     else:
         frame_atom_idx = int(sample_data.central_mask.nonzero(as_tuple=True)[0][0])
     pred = _predict_window(model, sample_data, frame_atom_idx, device)
-    target_idx = target.nonzero(as_tuple=True)[0].tolist()
+    target_idx = (sample_target & sample_data.present_mask).nonzero(as_tuple=True)[0].tolist()
     for idx, xyz in zip(target_idx, pred):
         predictions[meta[idx]] = xyz
 
 
-def predict_backbone(input_path, ckpt_path, device='cuda'):
+def predict_backbone(input_path, ckpt_path, device='cuda', generate_5_prime_phosphate=False):
     """Load input, run reverse diffusion per window, return predicted backbone atoms.
 
     Returns:
@@ -99,9 +110,25 @@ def predict_backbone(input_path, ckpt_path, device='cuda'):
             # The unified model produces one target per forward pass. Always ask for
             # the central nucleotide; additionally, for chain-edge windows, ask for
             # the edge nucleotide so positions 0 and L-1 of each chain are covered.
-            _run_target(model, data, 'central_mask', device, meta, predictions)
+            _run_target(
+                model,
+                data,
+                'central_mask',
+                device,
+                meta,
+                predictions,
+                generate_5_prime_phosphate=generate_5_prime_phosphate,
+            )
             if data.is_chain_edge.any():
-                _run_target(model, data, 'is_chain_edge', device, meta, predictions)
+                _run_target(
+                    model,
+                    data,
+                    'is_chain_edge',
+                    device,
+                    meta,
+                    predictions,
+                    generate_5_prime_phosphate=generate_5_prime_phosphate,
+                )
 
     return predictions, chain_records
 
@@ -232,6 +259,12 @@ def _parse_args():
         required=True,
         help='Experiment id relative to logs/ (e.g. "fixed_swa/baseline").',
     )
+    p.add_argument(
+        '--generate-5-prime-phosphate',
+        action='store_true',
+        default=False,
+        help="Generate P/OP1/OP2 atoms for 5' terminal nucleotides.",
+    )
     return p.parse_args()
 
 
@@ -242,6 +275,11 @@ if __name__ == '__main__':
     print(f'checkpoint: {ckpt_path}')
 
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    predictions, chain_records = predict_backbone(args.input, ckpt_path, device=device)
+    predictions, chain_records = predict_backbone(
+        args.input,
+        ckpt_path,
+        device=device,
+        generate_5_prime_phosphate=args.generate_5_prime_phosphate,
+    )
     write_structure(chain_records, predictions, args.output)
     print(f'Wrote {args.output} ({len(predictions)} predicted backbone atoms).')

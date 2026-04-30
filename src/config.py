@@ -3,7 +3,7 @@ BASE = dict(
     HIDDEN_DIM=256,
     NUM_LAYERS=3,
     NUM_TIMESTEPS=200,
-    BATCH_SIZE=4000,
+    BATCH_SIZE=2000,
     LR=1e-3,
     WEIGHT_DECAY=0.01,
     EDGE_WEIGHT=0.3,  # from 0 (for central-only), to 1 (for edge-only)
@@ -21,7 +21,9 @@ BASE = dict(
 
 # One entry = one experiment. Put ONLY the deltas from BASE here
 EXPERIMENTS = [
-    {},  # baseline (matches BASE)
+    # {},  # baseline (matches BASE)
+    # {'SWA': False},
+    {'NUM_LAYERS': 15, 'NUM_EPOCHS': 40, 'SWA_EPOCH_START': 30},
 ]
 
 # Run path under `logs/`
@@ -39,6 +41,7 @@ SEED = 42
 # Check chemicality
 
 # MINOR:
+# Remove bias in visualization of sampled examples
 # Exoeriment with removing LayerNorm
 # Experiment with large window sizes
 # Experiment with edge weight

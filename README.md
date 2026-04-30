@@ -49,7 +49,7 @@ python src/export_to_onnx.py --run-dir logs/fixed_swa/baseline
 
 1. Make sure to set up the environment. See [Environment Setup](#environment-setup)
 
-2. Predict the backbone. `--run-dir` points to one concrete run directory with a trained checkpoint; the unified model is called once per window for the central nucleotide and, additionally, once per edge window for the chain-edge nucleotide. Input and output may be PDB or mmCIF independently (e.g. PDB in, mmCIF out).
+2. Predict the backbone. `--run-dir` points to one concrete run directory with a trained checkpoint; the unified model is called once per window for the central nucleotide and, additionally, once per edge window for the chain-edge nucleotide. Input and output may be PDB or mmCIF independently (e.g. PDB in, mmCIF out). By default **5'-terminal phosphate atoms** (`P`, `OP1`, `OP2`) are **not** predicted. Pass `--generate-5-prime-phosphate` to include them.
 
 ```bash
 python src/predict.py \

@@ -48,7 +48,6 @@ class GraphConv(nn.Module):
             act_fn(),
             nn.Linear(hidden_nf, hidden_nf)
         )
-        self.ln = nn.LayerNorm(hidden_nf)
 
     def forward(self, h, x, edge_index):
         # h: [N, hidden_nf], x: [N, 3]
@@ -77,7 +76,6 @@ class GraphConv(nn.Module):
         # Update features
         node_update_input = torch.cat([h, agg_messages], dim=-1)
         h_new = h + self.node_update_mlp(node_update_input)
-        h_new = self.ln(h_new)
 
         return h_new, x_new
 

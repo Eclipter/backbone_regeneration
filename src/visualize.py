@@ -452,7 +452,7 @@ detail_steps = [
     ('Обновление координат',
      r'$\Delta x_i = \sum_j \phi_x(m_{ji})$'),
     ('Обновление признаков',
-     r'$h_i := \mathrm{LayerNorm}(h_i + \text{MLP}([h_i, \bar{m}_i]))$'),
+     r'$h_i := h_i + \text{MLP}([h_i, \bar{m}_i])$'),
     (r'Предсказание $\epsilon$',
      r'$\epsilon_i = \sum_j \phi_\epsilon(m_{ji}) + \psi_\epsilon([h_i, x_i])$')
 ]

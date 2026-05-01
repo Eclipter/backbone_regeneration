@@ -38,7 +38,7 @@ from predict import write_structure
 # %%
 # Load model and dataset
 log_dir = osp.join('..', 'logs')
-run_filename = osp.join('fixed_noising', 'NUM_LAYERS=3_LR=0.0001_WEIGHT_DECAY=0')
+run_filename = osp.join('no_layer_norm', 'baseline')
 run_dir = osp.join(log_dir, run_filename)
 ckpt_path = utils.find_best_checkpoint(run_dir)
 test_dataset_path = osp.join(run_dir, 'test_dataset.pt')
@@ -771,12 +771,7 @@ edge_index = data.edge_index.cpu().numpy() if data.edge_index is not None else N
 true_backbone = pos_full[target_mask]
 
 with torch.no_grad():
-    pred_backbone_raw = model.sample(data.clone().to(device)).cpu().numpy()
-
-# Apply translation-only alignment for visualization to remove possible global drift.
-# The model predicts coordinates, while this correction only matches global centroid.
-centroid_shift = true_backbone.mean(axis=0) - pred_backbone_raw.mean(axis=0)
-pred_backbone = pred_backbone_raw + centroid_shift
+    pred_backbone = model.sample(data.clone().to(device)).cpu().numpy()
 
 # WindowTargetDataset stores edge-target samples in the edge nucleotide's
 # frame and central-target samples in the central nucleotide's frame, so pick

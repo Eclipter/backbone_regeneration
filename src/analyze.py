@@ -4,14 +4,13 @@ import os.path as osp
 import random
 import warnings
 from collections import defaultdict
-from typing import Any, cast
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
 from glob import glob
 from pathlib import Path
+from typing import Any, cast
 
 import matplotlib.pyplot as plt
-from matplotlib.transforms import Bbox
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -20,6 +19,7 @@ import requests
 import seaborn as sns
 import torch
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
+from matplotlib.transforms import Bbox
 from torch_geometric.data import Batch, Data
 from tqdm import tqdm
 
@@ -27,7 +27,7 @@ import utils
 from dataset import PyGDataset
 from model import PytorchLightningModule
 from predict import predict_backbone, write_structure
-from torsion_geometry import N_TORSIONS
+from torsion_geometry import N_TORSIONS, build_backbone_from_torsions
 
 TOR_NAMES = ['α', 'β', 'γ', 'δ', 'ε', 'ζ', 'χ', 'P']
 
@@ -489,3 +489,84 @@ if rmsd_values:
     sns.despine(ax=ax)
     fig.tight_layout()
     plt.show()
+
+# %%
+# Measure stochastic spread across independent diffusion runs on the same input
+K = 10
+N_SAMPLES = 60
+
+_skip_atoms = {'OP1', 'OP2', 'P'}
+_valid_bb_atoms = [a for a in utils.backbone_atoms if a not in _skip_atoms]
+_idx_to_base = {v: k for k, v in utils.base_to_idx.items()}
+
+_pool_size = len(test_dataset)
+_inter_run_indices = rng.choice(
+    _pool_size, size=min(N_SAMPLES, _pool_size), replace=False
+).tolist()
+
+inter_run_rmsds: list[float] = []
+per_sample_medians: list[float] = []
+
+with torch.no_grad():
+    for _wi in tqdm(_inter_run_indices, desc='Inter-run RMSD'):
+        data = cast(Any, test_dataset[_wi].clone())
+        tidx = int(data.target_nt_idx.item())
+        restype = _idx_to_base[int(data.base_types[tidx].argmax().item())]
+
+        batch = cast(Any, Batch.from_data_list([data])).to(device)
+
+        run_coords: list[dict] = []
+        for _ in range(K):
+            pred_theta, pred_tau_m = model.sample(batch)
+            torsions_np = pred_theta[0].cpu().numpy()
+            tau_m_val = float(pred_tau_m[0].clamp(min=1e-3).item())
+            bb = build_backbone_from_torsions(
+                torsions_np, restype, o3_prev_local=None, tau_m=tau_m_val,
+            )
+            run_coords.append({k: v for k, v in bb.items() if k not in _skip_atoms})
+
+        # intersection of atoms present in every run, ordered by backbone_atoms
+        shared = set(run_coords[0].keys())
+        for rc in run_coords[1:]:
+            shared &= set(rc.keys())
+        shared_atoms = [a for a in _valid_bb_atoms if a in shared]
+
+        if len(shared_atoms) < 3:
+            continue
+
+        coords = np.array(
+            [[rc[a] for a in shared_atoms] for rc in run_coords]
+        )  # [K, n_atoms, 3]
+
+        pair_rmsds: list[float] = []
+        for r1 in range(K):
+            for r2 in range(r1 + 1, K):
+                diff = coords[r1] - coords[r2]
+                pair_rmsds.append(float(np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))))
+
+        inter_run_rmsds.extend(pair_rmsds)
+        per_sample_medians.append(float(np.median(pair_rmsds)))
+
+_med = float(np.median(inter_run_rmsds))
+_mean = float(np.mean(inter_run_rmsds))
+_p25, _p75 = np.percentile(inter_run_rmsds, [25, 75])
+print(f'Inter-run RMSD  K={K}  N={len(per_sample_medians)} samples  '
+      f'({K * (K - 1) // 2 * len(per_sample_medians)} pairs):')
+print(f'  median={_med:.3f}  mean={_mean:.3f}  p25={_p25:.3f}  p75={_p75:.3f} Å')
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.hist(inter_run_rmsds, bins=50, color='mediumpurple', edgecolor='white',
+        label='pairwise inter-run RMSD')
+ax.axvline(_med, color='black', linestyle='--', linewidth=1.8,
+           label=f'median: {_med:.3f} Å')
+if rmsd_values:
+    _noise_med = float(np.median(rmsd_values))
+    ax.axvline(_noise_med, color='steelblue', linestyle=':', linewidth=1.8,
+               label=f'exp. noise floor: {_noise_med:.3f} Å')
+ax.set_xlabel('Backbone RMSD between runs (Å)', fontsize=13)
+ax.set_ylabel('Count', fontsize=13)
+ax.legend(fontsize=11)
+sns.despine(ax=ax)
+fig.tight_layout()
+fig.savefig(osp.join(run_dir, 'inter_run_rmsd.png'), dpi=200, bbox_inches='tight')
+plt.show()

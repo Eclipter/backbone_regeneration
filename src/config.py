@@ -35,7 +35,6 @@ SEED = 42
 
 ######### TO DOs ########
 # MAJOR:
-# Measure distribution of RMSD between different stochastic runs
 # Compare with rigid molecular model fitting
 # Include info about the complement chain
 # Round-trip test ONNX export

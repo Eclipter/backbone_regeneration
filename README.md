@@ -17,7 +17,7 @@ cd backbone-regeneration
 conda env create --name backbone_regen --file pynamod/environment.yml
 ```
 
-4. Install the project requirements:
+4. Install the project dependencies:
 
 ```bash
 conda env update --name backbone_regen --file environment.yml
@@ -27,7 +27,7 @@ conda env update --name backbone_regen --file environment.yml
 
 1. Make sure to set up the environment. See [Environment Setup](#environment-setup)
 
-2. Train and test the model
+2. Train and test the model:
 
 ```bash
 python src/train.py
@@ -39,17 +39,17 @@ python src/train.py
 python src/visualize.py
 ```
 
-4. Export the best model to ONNX. A single unified checkpoint regenerates both central and chain-edge nucleotides via the per-atom `is_target` flag, so `--run-dir` points to one concrete run directory.
+4. Export the best model to ONNX:
 
 ```bash
-python src/export_to_onnx.py --run-dir logs/fixed_swa/baseline
+python src/export.py --run-dir logs/fixed_swa/baseline
 ```
 
 ## Usage
 
 1. Make sure to set up the environment. See [Environment Setup](#environment-setup)
 
-2. Predict the backbone. `--run-dir` points to one concrete run directory with a trained checkpoint; the unified model is called once per window for the central nucleotide and, additionally, once per edge window for the chain-edge nucleotide. Input and output may be PDB or mmCIF independently (e.g. PDB in, mmCIF out). By default **5'-terminal phosphate atoms** (`P`, `OP1`, `OP2`) are **not** predicted. Pass `--generate-5-prime-phosphate` to include them.
+2. Predict the backbone. Input and output may be PDB or mmCIF independently (e.g. PDB in, mmCIF out). By default **5'-terminal phosphate atoms** (`P`, `OP1`, `OP2`) are **not** predicted. Pass `--generate-5-prime-phosphate` to include them.
 
 ```bash
 python src/predict.py \

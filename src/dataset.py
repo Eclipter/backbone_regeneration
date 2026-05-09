@@ -208,7 +208,7 @@ class PyGDataset(Dataset):
             for _, _, data in windows:
                 save_path = osp.join(pdb_id_processed_dir, f'{data_idx}.pt')
                 torch.save(data, save_path)
-                if bool(data.is_chain_edge.any().item()):
+                if bool(data.touches_chain_edge.item()):
                     edge_paths.append(save_path)
                 data_idx += 1
 
@@ -220,8 +220,8 @@ class WindowTargetDataset(torch.utils.data.Dataset):
 
     Every window contributes a central-target sample. Edge windows additionally
     contribute an edge-target sample, so the unified model can be trained on
-    both tasks from the same backing windows. The `is_target` per-atom mask
-    attached to each emitted Data tells the model which atoms to denoise.
+    both tasks from the same backing windows. `target_nt_idx` and
+    `is_target_nt` mark the nucleotide that receives noisy torsions.
     """
 
     CENTRAL = 0
@@ -247,15 +247,26 @@ class WindowTargetDataset(torch.utils.data.Dataset):
     def __getitem__(self, i):
         w_idx, target_type = self.virtual_entries[i]
         data = self.base.get(w_idx).clone()
+        ws = self.base.window_size
         if target_type == self.CENTRAL:
-            data.is_target = data.central_mask.clone()
+            tidx = ws // 2
         else:
-            data.is_target = data.is_chain_edge.clone()
-            # For edge-target samples, express positions in the edge nucleotide's
-            # own reference frame instead of the central one.
-            edge_flat = data.is_chain_edge.view(-1)
-            edge_atom_idx = int(torch.where(edge_flat)[0][0].item())
-            utils.reframe_positions_to_atom(data, edge_atom_idx)
+            edge_idx = int(data.is_chain_edge_nt.nonzero(as_tuple=True)[0][0].item())
+            tidx = edge_idx
+        data.target_nt_idx = torch.tensor(tidx, dtype=torch.long)
+
+        # per-atom flag: 1.0 for the target nucleotide, 0.0 for context
+        ws = self.base.window_size
+        is_target = torch.zeros(ws, dtype=torch.float)
+        is_target[tidx] = 1.0
+        data.is_target_nt = is_target
+
+        o_t = data.nt_origins_world[tidx]
+        R_t = data.nt_frames_world[tidx]
+        rel_o = (data.nt_origins_world - o_t) @ R_t
+        rel_R = torch.einsum('ji,njk->nik', R_t, data.nt_frames_world)
+        data.rel_origins = rel_o.float()
+        data.rel_frames = rel_R.float()
         return data
 
 

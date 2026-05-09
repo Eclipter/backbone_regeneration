@@ -54,6 +54,7 @@ def train_one(cfg):
     )
     pl_module = PytorchLightningModule(
         hidden_dim=cfg['HIDDEN_DIM'],
+        num_heads=cfg['NUM_HEADS'],
         num_layers=cfg['NUM_LAYERS'],
         num_timesteps=cfg['NUM_TIMESTEPS'],
         batch_size=cfg['BATCH_SIZE'],
@@ -79,6 +80,7 @@ def train_one(cfg):
         every_n_epochs=2,
         save_top_k=10,
         save_last=True,
+        mode='min',
         enable_version_counter=False
     )
     lr_callback = LearningRateMonitor(logging_interval='epoch')
@@ -93,9 +95,9 @@ def train_one(cfg):
         max_epochs=cfg['NUM_EPOCHS'],
         gradient_clip_val=1,
         precision='16-mixed',
-        log_every_n_steps=-1,
+        log_every_n_steps=1000000,  # Basically, log every epoch only
         num_nodes=num_nodes,
-        devices=[0, 1],
+        devices=([0, 1] if os.uname().nodename.partition('.')[0] == 'node07' else 'auto'),  # TODO: remove
         logger=logger,
         callbacks=[
             checkpoint_callback,

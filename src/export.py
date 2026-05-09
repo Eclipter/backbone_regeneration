@@ -5,8 +5,8 @@ from argparse import ArgumentParser
 
 import torch
 
-from model import PytorchLightningModule
-from utils import atom_to_idx, base_to_idx, find_best_checkpoint
+from model import N_TORSIONS_LATENT, PytorchLightningModule
+from utils import base_to_idx, find_best_checkpoint, resolve_run_dir
 
 # Diffusion schedule buffers registered in PytorchLightningModule.__init__.
 # Exported JSON-side so that a consumer of model.onnx can reproduce sampling
@@ -25,33 +25,14 @@ SCHEDULE_BUFFERS = (
 
 # Keys from self.hparams that describe what the denoiser expects and how to
 # wrap it into reverse-diffusion sampling at inference time
-HPARAM_KEYS = ('hidden_dim', 'num_layers', 'num_timesteps', 'beta_schedule')
+HPARAM_KEYS = ('hidden_dim', 'num_heads', 'num_layers', 'num_timesteps', 'beta_schedule')
 
-
-def resolve_run_dir(run):
-    """Map a user-facing experiment id (e.g. ``fixed_swa/baseline``) to its log directory.
-
-    A redundant leading ``logs/`` is stripped so both ``fixed_swa/...`` and
-    ``logs/fixed_swa/...`` resolve to the same place.
-    """
-    if osp.isabs(run):
-        return run
-    log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'logs')
-    run_norm = osp.normpath(run)
-    if run_norm.split(os.sep, 1)[0] == 'logs':
-        run_norm = run_norm.split(os.sep, 1)[1] if os.sep in run_norm else ''
-    return osp.normpath(osp.join(log_dir, run_norm))
 
 
 def export_to_onnx(ckpt_path, out_dir=None, opset=17):
-    """Export the graph denoiser from a Lightning checkpoint to ONNX.
+    """Export the torsion Transformer denoiser from a Lightning checkpoint to ONNX.
 
-    Writes two files into ``out_dir`` (defaults to the checkpoint directory):
-        - model.onnx: a single denoising step, i.e. GraphDiffusionDenoiser(h, x, edge_index) -> (h, x, eps).
-        - model.json: hyperparameters + schedule buffers + atom/base vocabularies.
-
-    The full reverse diffusion loop is *not* exported: consumers run the loop
-    themselves using buffers from model.json.
+    Writes ``model.onnx`` (single forward: node features -> epsilon) and ``model.json``.
     """
     if out_dir is None:
         out_dir = osp.dirname(osp.abspath(ckpt_path))
@@ -64,30 +45,20 @@ def export_to_onnx(ckpt_path, out_dir=None, opset=17):
         .float()
         .eval()
     )
-    gnn = pl_module.gnn
-
-    # Dummy inputs exercise dynamic axes N (nodes) and E (edges).
-    # All edge endpoints are valid node indices so the trace is well-formed.
-    in_node_nf = gnn.embedding_in.in_features
-    num_nodes, num_edges = 64, 256
-    h = torch.randn(num_nodes, in_node_nf)
-    x = torch.randn(num_nodes, 3)
-    edge_index = torch.randint(0, num_nodes, (2, num_edges), dtype=torch.long)
+    net = pl_module.denoiser
+    d_in = pl_module.node_dim
+    x = torch.randn(1, 3, d_in)
 
     onnx_path = osp.join(out_dir, 'model.onnx')
     torch.onnx.export(
-        gnn,
-        (h, x, edge_index),
+        net,
+        (x,),
         onnx_path,
-        input_names=['h', 'x', 'edge_index'],
-        output_names=['h_out', 'x_out', 'eps'],
+        input_names=['node_features'],
+        output_names=['eps'],
         dynamic_axes={
-            'h': {0: 'N'},
-            'x': {0: 'N'},
-            'edge_index': {1: 'E'},
-            'h_out': {0: 'N'},
-            'x_out': {0: 'N'},
-            'eps': {0: 'N'},
+            'node_features': {0: 'B', 1: 'L'},
+            'eps': {0: 'B', 1: 'L'},
         },
         opset_version=opset,
         do_constant_folding=True,
@@ -101,7 +72,7 @@ def export_to_onnx(ckpt_path, out_dir=None, opset=17):
     }
     meta = {
         'hyperparameters': {k: getattr(hp, k) for k in HPARAM_KEYS},
-        'atom_to_idx': atom_to_idx,
+        'N_TORSIONS_LATENT': N_TORSIONS_LATENT,
         'base_to_idx': base_to_idx,
         'schedule_buffers': schedule,
         'opset_version': opset,

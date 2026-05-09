@@ -35,7 +35,6 @@ SEED = 42
 
 ######### TO DOs ########
 # MAJOR:
-# Compare with rigid molecular model fitting
 # Round-trip test ONNX export
 # Consider bridge-matching
 

@@ -1,5 +1,7 @@
 # %%
 # Imports
+from dataset import DNADataModule
+from sklearn.neighbors import NearestNeighbors
 import os.path as osp
 import random
 import warnings
@@ -570,3 +572,95 @@ sns.despine(ax=ax)
 fig.tight_layout()
 fig.savefig(osp.join(run_dir, 'inter_run_rmsd.png'), dpi=200, bbox_inches='tight')
 plt.show()
+
+# %%
+# Compare with kNN baseline
+
+
+# Reconstruct train split with the same fixed seed used during training
+_dm = DNADataModule(batch_size=1)
+_dm.setup()
+train_dataset = _dm.train_dataset
+
+_n_bb = len(utils.backbone_atoms)
+_j_op1 = utils.backbone_atoms.index('OP1')
+_j_op2 = utils.backbone_atoms.index('OP2')
+
+# --- Build train feature matrix and local backbone targets ---
+_train_feats: list[np.ndarray] = []
+_train_locals: list[np.ndarray] = []  # each [n_bb, 3], NaN where atom absent
+
+for _i in tqdm(range(len(train_dataset)), desc='kNN: building train index'):
+    _d = train_dataset[_i]
+    _ti = int(_d.target_nt_idx.item())
+    _train_feats.append(_d.rel_origins.flatten().numpy())          # [ws*3]
+    _bb_w = _d.bb_xyz_world[_ti].numpy()                          # [n_bb, 3]
+    _o = _d.nt_origins_world[_ti].numpy()                         # [3]
+    _R = _d.nt_frames_world[_ti].numpy()                          # [3, 3]
+    _train_locals.append((_bb_w - _o) @ _R)                       # local [n_bb, 3]
+
+_train_feats_arr = np.array(_train_feats, dtype=np.float32)       # [N_train, ws*3]
+
+_nn_index = NearestNeighbors(n_neighbors=1, algorithm='ball_tree')
+_nn_index.fit(_train_feats_arr)
+
+
+def _knn_local_rmsd(pred_local: np.ndarray, gt_local: np.ndarray) -> float:
+    """RMSD in local frame; skips NaN atoms; permutation-invariant for OP1/OP2."""
+    sq: list[float] = []
+    for _j, _nm in enumerate(utils.backbone_atoms):
+        if _nm in ('OP1', 'OP2'):
+            continue
+        _p, _g = pred_local[_j], gt_local[_j]
+        if np.isnan(_p).any() or np.isnan(_g).any():
+            continue
+        sq.append(float(np.sum((_p - _g) ** 2)))
+    # permutation-invariant matching for the two equivalent phosphate oxygens
+    _p1, _p2 = pred_local[_j_op1], pred_local[_j_op2]
+    _g1, _g2 = gt_local[_j_op1], gt_local[_j_op2]
+    if not (np.isnan(_p1).any() or np.isnan(_p2).any()
+            or np.isnan(_g1).any() or np.isnan(_g2).any()):
+        _d_str = np.sum((_p1 - _g1) ** 2) + np.sum((_p2 - _g2) ** 2)
+        _d_swp = np.sum((_p1 - _g2) ** 2) + np.sum((_p2 - _g1) ** 2)
+        sq.append(float(min(_d_str, _d_swp)) / 2)
+    return float(np.sqrt(np.mean(sq))) if sq else np.nan
+
+
+# --- Evaluate on test dataset ---
+_knn_rmsds: list[float] = []
+_knn_is_edge: list[bool] = []
+
+for _i in tqdm(range(len(test_dataset)), desc='kNN: evaluating test'):
+    _d = test_dataset[_i]
+    _ti = int(_d.target_nt_idx.item())
+    _feat = _d.rel_origins.flatten().numpy()[None].astype(np.float32)  # [1, ws*3]
+    _, _nb_idx = _nn_index.kneighbors(_feat)
+    _nn_i = int(_nb_idx[0, 0])
+
+    _bb_w = _d.bb_xyz_world[_ti].numpy()
+    _o = _d.nt_origins_world[_ti].numpy()
+    _R = _d.nt_frames_world[_ti].numpy()
+    _gt_local = (_bb_w - _o) @ _R
+
+    _knn_rmsds.append(_knn_local_rmsd(_train_locals[_nn_i], _gt_local))
+    _knn_is_edge.append(bool(_d.is_chain_edge_nt[_ti].item()))
+
+_knn_rmsds_arr = np.array(_knn_rmsds, dtype=np.float64)
+_knn_is_edge_arr = np.array(_knn_is_edge)
+
+print('kNN backbone RMSD (local frame):')
+for _label, _mask in [
+    ('all',     np.ones(len(_knn_rmsds_arr), dtype=bool)),
+    ('central', ~_knn_is_edge_arr),
+    ('edge',    _knn_is_edge_arr),
+]:
+    _vals = _knn_rmsds_arr[_mask & np.isfinite(_knn_rmsds_arr)]
+    if len(_vals):
+        print(f'  {_label:>7}:  median={np.median(_vals):.3f}  mean={np.mean(_vals):.3f}'
+              f'  n={len(_vals)}')
+
+print('\nModel val RMSD (last epoch):')
+for _label, _w in [('all', wide)] + [(m, wide_per_mode[m]) for m in ('central', 'edge')]:
+    if 'val_rmsd' in _w.columns:
+        _v = float(_w['val_rmsd'].dropna().iloc[-1])
+        print(f'  {_label:>7}: {_v:.3f} Å')

@@ -3,7 +3,7 @@ BASE = dict(
     HIDDEN_DIM=256,  # Must be divisible by NUM_HEADS
     NUM_HEADS=8,
     NUM_LAYERS=3,
-    NUM_TIMESTEPS=100,
+    NUM_TIMESTEPS=200,
     BATCH_SIZE=20000,
     LR=1e-3,
     WEIGHT_DECAY=0.01,
@@ -36,8 +36,8 @@ SEED = 42
 ######### TO DOs ########
 # MAJOR:
 # Compare with rigid molecular model fitting
-# Include info about the complement chain
 # Round-trip test ONNX export
+# Consider bridge-matching
 
 # MINOR:
 # Decrease batch size

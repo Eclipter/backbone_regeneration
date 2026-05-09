@@ -281,6 +281,15 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
 
     tau_m_list: list[float] = []
     tau_m_mask_list: list[bool] = []
+    pair_origins: list = []
+    pair_frames: list = []
+
+    # Build bidirectional map: nucleotide.ind -> paired nucleotide.ind
+    _pairs = structure.dna.pairs_list
+    pair_map: dict[int, int] = {
+        **{lead: lag for lead, lag in zip(_pairs.lead_nucl_inds, _pairs.lag_nucl_inds)},
+        **{lag: lead for lead, lag in zip(_pairs.lead_nucl_inds, _pairs.lag_nucl_inds)},
+    }
 
     for nucleotide_idx, nucleotide in enumerate(window):
         base_letter = nucleotide.restype
@@ -310,10 +319,20 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
         nt_origins.append(origins_all[nucleotide.ind].float().view(3))
         nt_frames.append(ref_frames_all[nucleotide.ind].float())
 
+        if nucleotide.ind in pair_map:
+            partner_ind = pair_map[nucleotide.ind]
+            pair_origins.append(origins_all[partner_ind].float().view(3))
+            pair_frames.append(ref_frames_all[partner_ind].float())
+        else:
+            pair_origins.append(torch.zeros(3, dtype=torch.float32))
+            pair_frames.append(torch.zeros(3, 3, dtype=torch.float32))
+
     torsions = torch.tensor(np.stack(torsion_rows, axis=0), dtype=torch.float32)
     torsion_mask = torch.tensor(np.stack(mask_rows, axis=0), dtype=torch.bool)
     nt_origins_world = torch.stack(nt_origins, dim=0)
     nt_frames_world = torch.stack(nt_frames, dim=0)
+    pair_origins_world = torch.stack(pair_origins, dim=0)
+    pair_frames_world = torch.stack(pair_frames, dim=0)
 
     chain_end_class_long = torch.tensor(chain_end_class_list, dtype=torch.long)
     chain_end_class_tensor = F.one_hot(chain_end_class_long, num_classes=N_CHAIN_END_CLASSES).float()
@@ -338,6 +357,8 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
     return Data(
         nt_origins_world=nt_origins_world,
         nt_frames_world=nt_frames_world,
+        pair_origins_world=pair_origins_world,
+        pair_frames_world=pair_frames_world,
         torsions=torsions,
         torsion_mask=torsion_mask,
         tau_m=torch.tensor(tau_m_list, dtype=torch.float32),

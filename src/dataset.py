@@ -267,6 +267,12 @@ class WindowTargetDataset(torch.utils.data.Dataset):
         rel_R = torch.einsum('ji,njk->nik', R_t, data.nt_frames_world)
         data.rel_origins = rel_o.float()
         data.rel_frames = rel_R.float()
+
+        # Partner nucleotide positions/frames in the target nucleotide's local frame
+        pair_rel_o = (data.pair_origins_world - o_t) @ R_t
+        pair_rel_R = torch.einsum('ji,njk->nik', R_t, data.pair_frames_world)
+        data.pair_rel_origins = pair_rel_o.float()
+        data.pair_rel_frames = pair_rel_R.float()
         return data
 
 

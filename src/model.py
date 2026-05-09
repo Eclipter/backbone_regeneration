@@ -107,6 +107,8 @@ class PytorchLightningModule(pl.LightningModule):
         self.node_dim = (
             3
             + 9
+            + 3   # pair_rel_origins
+            + 9   # pair_rel_frames (flattened 3x3)
             + len(base_to_idx)
             + 1
             + N_CHAIN_END_CLASSES
@@ -220,6 +222,8 @@ class PytorchLightningModule(pl.LightningModule):
         b, ws = self._b_ws(batch)
         rel_o = batch.rel_origins.view(b, ws, 3)
         rel_R = batch.rel_frames.view(b, ws, 9)
+        pair_o = batch.pair_rel_origins.view(b, ws, 3)
+        pair_R = batch.pair_rel_frames.view(b, ws, 3, 3).reshape(b, ws, 9)
         base = batch.base_types.view(b, ws, len(base_to_idx))
         hp = batch.has_pair_nt.view(b, ws, 1).float()
         ce = batch.chain_end_class.view(b, ws, N_CHAIN_END_CLASSES)
@@ -242,7 +246,7 @@ class PytorchLightningModule(pl.LightningModule):
         )
         o += N_TORSIONS
         pad[bi, tidx, o:o + N_TORSIONS_LATENT] = sc
-        return torch.cat([rel_o, rel_R, base, hp, ce, it, pad], dim=-1)
+        return torch.cat([rel_o, rel_R, pair_o, pair_R, base, hp, ce, it, pad], dim=-1)
 
     def forward_denoiser(self, batch, x_t_latent, t_per_graph, sc):
         b, _ = self._b_ws(batch)

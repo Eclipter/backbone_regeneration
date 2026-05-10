@@ -27,12 +27,17 @@ SCHEDULE_BUFFERS = (
 # wrap it into reverse-diffusion sampling at inference time
 HPARAM_KEYS = ('hidden_dim', 'num_heads', 'num_layers', 'num_timesteps', 'beta_schedule')
 
+# Inference window (nucleotides). Legacy ``torch.onnx.export`` fixes this axis in the graph; only
+# batch ``B`` is dynamic — do not declare ``L`` in ``dynamic_axes`` or consumers may assume any length.
+ONNX_EXPORT_SEQ_LEN = 3
 
 
 def export_to_onnx(ckpt_path, out_dir=None, opset=17):
     """Export the torsion Transformer denoiser from a Lightning checkpoint to ONNX.
 
     Writes ``model.onnx`` (single forward: node features -> epsilon) and ``model.json``.
+    Tensors are ``[B, ONNX_EXPORT_SEQ_LEN, node_dim]`` and ``[B, ONNX_EXPORT_SEQ_LEN, N_TORSIONS_LATENT]``;
+    only the batch axis ``B`` is dynamic in the ONNX graph.
     """
     if out_dir is None:
         out_dir = osp.dirname(osp.abspath(ckpt_path))
@@ -47,7 +52,7 @@ def export_to_onnx(ckpt_path, out_dir=None, opset=17):
     )
     net = pl_module.denoiser
     d_in = pl_module.node_dim
-    x = torch.randn(1, 3, d_in)
+    x = torch.randn(1, ONNX_EXPORT_SEQ_LEN, d_in)
 
     onnx_path = osp.join(out_dir, 'model.onnx')
     torch.onnx.export(
@@ -57,8 +62,8 @@ def export_to_onnx(ckpt_path, out_dir=None, opset=17):
         input_names=['node_features'],
         output_names=['eps'],
         dynamic_axes={
-            'node_features': {0: 'B', 1: 'L'},
-            'eps': {0: 'B', 1: 'L'},
+            'node_features': {0: 'B'},
+            'eps': {0: 'B'},
         },
         opset_version=opset,
         do_constant_folding=True,

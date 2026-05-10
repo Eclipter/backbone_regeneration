@@ -354,6 +354,28 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
             if nm in exp:
                 bb_world[i, j] = torch.tensor(np.asarray(exp[nm], dtype=np.float32))
 
+    j_O3 = backbone_atoms.index("O3'")
+    o3_prev_local_rows = []
+    o3_prev_valid_rows = []
+    for k in range(window_size):
+        if k == 0:
+            o3_prev_local_rows.append(torch.zeros(3, dtype=torch.float32))
+            o3_prev_valid_rows.append(False)
+        else:
+            o3w = bb_world[k - 1, j_O3]
+            if torch.isnan(o3w).any():
+                o3_prev_local_rows.append(torch.zeros(3, dtype=torch.float32))
+                o3_prev_valid_rows.append(False)
+            else:
+                ok = nt_origins[k]
+                Rk = nt_frames[k]
+                o3_local = (o3w - ok) @ Rk
+                o3_prev_local_rows.append(o3_local.float())
+                o3_prev_valid_rows.append(True)
+
+    o3_prev_local_t = torch.stack(o3_prev_local_rows, dim=0)
+    o3_prev_valid_t = torch.tensor(o3_prev_valid_rows, dtype=torch.bool)
+
     return Data(
         nt_origins_world=nt_origins_world,
         nt_frames_world=nt_frames_world,
@@ -370,6 +392,8 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
         is_chain_edge_nt=is_chain_edge_nt_t,
         touches_chain_edge=torch.tensor(touches_chain_edge, dtype=torch.bool),
         bb_xyz_world=bb_world,
+        o3_prev_local=o3_prev_local_t,
+        o3_prev_valid=o3_prev_valid_t,
         target_nt_idx=target_nt_idx,
     )
 

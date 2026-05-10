@@ -2,6 +2,7 @@ import logging
 import os
 import os.path as osp
 import shutil
+import sys
 import warnings
 from datetime import datetime
 
@@ -18,6 +19,14 @@ from model import PytorchLightningModule
 
 # Suppress PyTorch FutureWarning about functools.partial in DDP comm hooks (Python 3.13 compatibility)
 warnings.filterwarnings('ignore', category=FutureWarning, module='torch.distributed.algorithms.ddp_comm_hooks')
+
+
+def _train_probe(msg: str) -> None:
+    """stderr + flush: видно в tlog/slurm даже при буферизованном stdout."""
+    lr = os.environ.get('LOCAL_RANK', '?')
+    rk = os.environ.get('RANK', '?')
+    sys.stderr.write(f'[train_probe RANK={rk} LOCAL_RANK={lr} pid={os.getpid()}] {msg}\n')
+    sys.stderr.flush()
 
 
 def _make_run_version(cfg, baseline):
@@ -46,6 +55,7 @@ def _get_run_paths(cfg):
 
 
 def train_one(cfg):
+    _train_probe('train_one: enter')
     pl.seed_everything(SEED, workers=True, verbose=False)
 
     data_module = DNADataModule(
@@ -64,8 +74,10 @@ def train_one(cfg):
         lr_scheduler_cooldown=cfg['LR_SCHEDULER_COOLDOWN'],
         lr_scheduler_threshold=cfg['LR_SCHEDULER_THRESHOLD'],
         beta_schedule=cfg['BETA_SCHEDULE'],
-        weight_decay=cfg['WEIGHT_DECAY']
+        weight_decay=cfg['WEIGHT_DECAY'],
+        closure_loss_weight=cfg['CLOSURE_LOSS_WEIGHT'],
     )
+    _train_probe('train_one: model constructed, calling trainer.fit next')
 
     num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
 
@@ -95,7 +107,6 @@ def train_one(cfg):
         max_epochs=cfg['NUM_EPOCHS'],
         gradient_clip_val=1,
         precision='16-mixed',
-        log_every_n_steps=1000000,  # Basically, log every epoch only
         num_nodes=num_nodes,
         devices=([0, 1] if os.uname().nodename.partition('.')[0] == 'node07' else 'auto'),  # TODO: remove
         logger=logger,
@@ -107,12 +118,17 @@ def train_one(cfg):
         enable_model_summary=False
     )
 
+    _train_probe('train_one: Trainer ready → fit (setup/datamodule/DDP happens inside)')
     # Train and test
     trainer.fit(pl_module, datamodule=data_module, ckpt_path=ckpt_path, weights_only=False)
     trainer.test(pl_module, datamodule=data_module, ckpt_path='best', weights_only=False)
 
 
 def main():
+    os.environ.setdefault('PYTHONUNBUFFERED', '1')
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(line_buffering=True)
+
     torch.set_float32_matmul_precision('high')
 
     # Mute litmodels / litlogger advertisements from Lightning

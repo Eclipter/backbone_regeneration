@@ -8,7 +8,6 @@ from torsion_geometry import (
     N_TORSIONS,
     TOR_ALPHA,
     TOR_BETA,
-    TOR_DELTA,
     TOR_EPS,
     TOR_ZETA,
     TOR_GAMMA,
@@ -23,16 +22,12 @@ from torsion_geometry import (
 
 
 def _encode(theta: torch.Tensor, tau_m: torch.Tensor) -> torch.Tensor:
-    sc = torch.stack([theta.sin(), theta.cos()], dim=-1).flatten(-2)
     log_tau = torch.log(tau_m.clamp(min=1e-3)).unsqueeze(-1)
-    return torch.cat([sc, log_tau], dim=-1)
+    return torch.cat([theta, log_tau], dim=-1)
 
 
 def _decode(latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    theta = torch.atan2(
-        latent[..., 0::2][..., :N_TORSIONS],
-        latent[..., 1::2][..., :N_TORSIONS],
-    )
+    theta = latent[..., :N_TORSIONS]
     tau_m = torch.exp(latent[..., -1])
     return theta, tau_m
 
@@ -75,20 +70,19 @@ def test_alpha_roundtrip_from_template():
     alpha = float(t[TOR_ALPHA])
     beta = float(t[TOR_BETA])
     gamma = float(t[TOR_GAMMA])
-    delta = float(t[TOR_DELTA])
     eps = float(t[TOR_EPS])
     zeta = float(t[TOR_ZETA])
     chi = float(t[TOR_CHI])
     p_rad = float(t[TOR_PUCKER_P])
 
     ma, mb = bool(mask[TOR_ALPHA]), bool(mask[TOR_BETA])
-    mg, md = bool(mask[TOR_GAMMA]), bool(mask[TOR_DELTA])
+    mg = bool(mask[TOR_GAMMA])
     me, mz = bool(mask[TOR_EPS]), bool(mask[TOR_ZETA])
     mx, mp = bool(mask[TOR_CHI]), bool(mask[TOR_PUCKER_P])
-    assert ma and mb and mg and md and me and mz and mx and mp
+    assert ma and mb and mg and me and mz and mx and mp
     assert tau_m_valid
     assert tau_m_val > 0.0
-    assert all(np.isfinite((alpha, beta, gamma, delta, eps, zeta, chi, p_rad)))
+    assert all(np.isfinite((alpha, beta, gamma, eps, zeta, chi, p_rad)))
 
     o3_prev_local = np.asarray(xyz_prev["O3'"], dtype=np.float64).reshape(3)
     bb = build_backbone_from_torsions(t, restype, o3_prev_local=o3_prev_local, tau_m=None)
@@ -147,11 +141,11 @@ def _consistent_neighbor_tpl(restype: str):
 
 
 def test_beta_gamma_paths_close_on_canonical_template():
-    """γ vs β placements on the same canonical template atoms.
+    """γ and β are two consistent ways to place O5′ when the correct sign (+ HP) is used on β.
 
-    `predict.build_backbone_from_torsions` uses ψ = γ − HP and ψ = β − HP like other
-    backbone steps. Empirically, for γ vs β *through P* here, ψ = β + HP brings the two
-    O5′ NeRF constructions within 0.5 Å without changing χ/δ closures; production keeps β − HP.
+    On the canonical template, NeRF from (C3′, C4′, C5′) with γ − HP matches NeRF from
+    (C4′, C5′, P) with β + HP in position and dihedral tolerances. Production O5′ placement
+    uses the γ-path only; this test does not exercise β − HP.
     """
     restype = 'C'
     tpl, xyz_prev, xyz_next = _consistent_neighbor_tpl(restype)
@@ -159,19 +153,18 @@ def test_beta_gamma_paths_close_on_canonical_template():
     alpha = float(t[TOR_ALPHA])
     beta = float(t[TOR_BETA])
     gamma = float(t[TOR_GAMMA])
-    delta = float(t[TOR_DELTA])
     eps = float(t[TOR_EPS])
     zeta = float(t[TOR_ZETA])
     chi = float(t[TOR_CHI])
     p_rad = float(t[TOR_PUCKER_P])
 
     ma, mb = bool(mask[TOR_ALPHA]), bool(mask[TOR_BETA])
-    mg, md = bool(mask[TOR_GAMMA]), bool(mask[TOR_DELTA])
+    mg = bool(mask[TOR_GAMMA])
     me, mz = bool(mask[TOR_EPS]), bool(mask[TOR_ZETA])
     mx, mp = bool(mask[TOR_CHI]), bool(mask[TOR_PUCKER_P])
-    assert ma and mb and mg and md and me and mz and mx and mp
+    assert ma and mb and mg and me and mz and mx and mp
     assert tau_m_valid and tau_m_val > 0.0
-    assert all(np.isfinite((alpha, beta, gamma, delta, eps, zeta, chi, p_rad)))
+    assert all(np.isfinite((alpha, beta, gamma, eps, zeta, chi, p_rad)))
     p_b = tpl['P'].copy()
     HP = np.pi / 2.0
     c3, c4, c5 = tpl["C3'"].copy(), tpl["C4'"].copy(), tpl["C5'"].copy()
@@ -190,23 +183,15 @@ def test_beta_gamma_paths_close_on_canonical_template():
 
     r_o5_p = _blen(tpl["O5'"], tpl['P'])
     ang_p = _ba(tpl["C5'"], tpl['P'], tpl["O5'"])
-    o5_bt_relaxed = nerf_place(c4, c5, p_b, r_o5_p, ang_p, beta + HP)
-
-    # Strict match to inference code (`torsion_geometry.build_backbone_from_torsions`):
-    o5_bt_strict = nerf_place(c4, c5, p_b, r_o5_p, ang_p, beta - HP)
+    o5_beta = nerf_place(c4, c5, p_b, r_o5_p, ang_p, beta + HP)
 
     g_meas = dihedral_rad(c3, c4, c5, o5_ga)
     dg = float(np.arctan2(np.sin(g_meas - gamma), np.cos(g_meas - gamma)))
     assert abs(dg) < 0.06
 
-    b_meas_loose = dihedral_rad(p_b, o5_bt_relaxed, c5, c4)
+    b_meas_loose = dihedral_rad(p_b, o5_beta, c5, c4)
     db_loose = float(np.arctan2(np.sin(b_meas_loose - beta), np.cos(b_meas_loose - beta)))
     assert abs(db_loose) < 0.25
 
-    b_meas_strict = dihedral_rad(p_b, o5_bt_strict, c5, c4)
-    db_strict = float(np.arctan2(np.sin(b_meas_strict - beta), np.cos(b_meas_strict - beta)))
-    assert float(np.linalg.norm(o5_ga - o5_bt_strict)) > 0.5
-    assert abs(db_strict) > 1.0
-
-    d_geom = float(np.linalg.norm(o5_ga - o5_bt_relaxed))
+    d_geom = float(np.linalg.norm(o5_ga - o5_beta))
     assert d_geom <= 0.5 + 1e-6

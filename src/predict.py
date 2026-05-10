@@ -3,11 +3,12 @@ import os.path as osp
 import tempfile
 import warnings
 from argparse import ArgumentParser
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import MDAnalysis as mda
 import numpy as np
 import torch
+from tqdm import tqdm
 from Bio.PDB.mmcifio import MMCIFIO
 from Bio.PDB.PDBParser import PDBParser
 from torch_geometric.data import Batch
@@ -15,8 +16,7 @@ from torch_geometric.data import Batch
 import utils
 from model import PytorchLightningModule
 from torsion_geometry import (N_TORSIONS, TOR_ALPHA, TOR_EPS, TOR_ZETA,
-                              _get_template, build_backbone_from_torsions,
-                              nerf_place)
+                              build_backbone_from_torsions)
 from utils import (CHAIN_END_CLASS_3_PRIME, CHAIN_END_CLASS_5_PRIME,
                    resolve_run_dir)
 
@@ -32,29 +32,6 @@ def _load_model(ckpt_path, device):
         .to(device)
         .eval()
     )
-
-
-def _blen_tpl(a: np.ndarray, b: np.ndarray) -> float:
-    return float(np.linalg.norm(a - b))
-
-
-def _bangle_tpl(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-    ba, bc = a - b, c - b
-    cos_t = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-12)
-    return float(np.arccos(np.clip(cos_t, -1.0, 1.0)))
-
-
-def _base_atoms_local(nt, o_t: torch.Tensor, r_t: torch.Tensor) -> Dict[str, np.ndarray]:
-    exp = dict(utils.default_atoms_provider(nt))
-    o = o_t.cpu().numpy().reshape(3)
-    r = r_t.cpu().numpy().reshape(3, 3)
-    out: Dict[str, np.ndarray] = {}
-    for nm in ('N9', 'N1', 'C4', 'C2'):
-        if nm not in exp:
-            continue
-        w = np.asarray(exp[nm], dtype=np.float64).reshape(3)
-        out[nm] = (w - o) @ r
-    return out
 
 
 def _chain_list_direction(chain):
@@ -85,6 +62,10 @@ def _predict_window(
     data.rel_origins = ((data.nt_origins_world - o_t) @ r_t).float()
     data.rel_frames = torch.einsum('ji,njk->nik', r_t, data.nt_frames_world).float()
 
+    # Partner nucleotide positions/frames in the target nucleotide's local frame
+    data.pair_rel_origins = ((data.pair_origins_world - o_t) @ r_t).float()
+    data.pair_rel_frames = torch.einsum('ji,njk->nik', r_t, data.pair_frames_world).float()
+
     batch = Batch.from_data_list([data]).to(device)  # type: ignore[union-attr]
     pred_theta, pred_tau_m = model.sample(batch)
 
@@ -94,7 +75,6 @@ def _predict_window(
 
     torsions_np = pred_theta[0].cpu().numpy()
     tau_m = float(pred_tau_m[0].clamp(min=1e-3, max=7.4).item())
-    base_loc = _base_atoms_local(nt, o_tt, r_tt)
     o3pl = (
         np.asarray(o3_prev_local, dtype=np.float64).reshape(3)
         if o3_prev_local is not None
@@ -105,7 +85,6 @@ def _predict_window(
         torsions_np,
         nt.restype,
         o3_prev_local=o3pl,
-        base_atoms_local=base_loc if base_loc else None,
         tau_m=tau_m,
     )
     o = o_tt.cpu().numpy().reshape(3)
@@ -134,7 +113,6 @@ def _run_target(
     sample_data,
     device,
     predictions,
-    torsions_cache: Dict[Tuple[Any, int], np.ndarray],
     window,
     tidx: int,
     o3_prev_local: Optional[np.ndarray],
@@ -149,64 +127,6 @@ def _run_target(
         o3_prev_local=o3_prev_local,
     )
     predictions.update(bb)
-    nt = window[tidx]
-    torsions_cache[(nt.segid, int(nt.resid))] = tort
-
-
-def _refine_eps_zeta(
-    chain_ordered_5prime: list,
-    predictions: dict,
-    torsions_cache: Dict[Tuple[Any, int], np.ndarray],
-):
-    HP = np.pi / 2.0
-    L = len(chain_ordered_5prime)
-    for i in range(L - 1):
-        nt_curr = chain_ordered_5prime[i]
-        nt_next = chain_ordered_5prime[i + 1]
-        sid_c, rid_c = nt_curr.segid, int(nt_curr.resid)
-        sid_n, rid_n = nt_next.segid, int(nt_next.resid)
-
-        kv_c = (sid_c, rid_c)
-        tort_c = torsions_cache.get(kv_c)
-        if tort_c is None:
-            continue
-
-        c4 = predictions.get((sid_c, rid_c, "C4'"))
-        c3 = predictions.get((sid_c, rid_c, "C3'"))
-        o3_orig = predictions.get((sid_c, rid_c, "O3'"))
-        p_next = predictions.get((sid_n, rid_n, 'P'))
-        if c4 is None or c3 is None or o3_orig is None or p_next is None:
-            continue
-
-        tpl_c = _get_template(nt_curr.restype)
-        tpl_n = _get_template(nt_next.restype)
-        eps = float(tort_c[TOR_EPS])
-        r_o3 = _blen_tpl(tpl_c["O3'"], tpl_c["C3'"])
-        th_o3 = _bangle_tpl(tpl_c["C4'"], tpl_c["C3'"], tpl_c["O3'"])
-        c4f = np.asarray(c4, dtype=np.float64).reshape(3)
-        c3f = np.asarray(c3, dtype=np.float64).reshape(3)
-        pnf = np.asarray(p_next, dtype=np.float64).reshape(3)
-        o3_eps = nerf_place(c4f, c3f, pnf, r_o3, th_o3, eps - HP)
-
-        oo = np.asarray(o3_orig, dtype=np.float64).reshape(3)
-        predictions[(sid_c, rid_c, "O3'")] = 0.5 * (oo + o3_eps)
-
-        zeta = float(tort_c[TOR_ZETA])
-        o5_k = (sid_n, rid_n, "O5'")
-        o5_orig = predictions.get(o5_k)
-        if o5_orig is None:
-            continue
-        r_o5p = _blen_tpl(tpl_n["O5'"], tpl_n['P'])
-        th_z = _bangle_tpl(tpl_n["O3'"], tpl_n['P'], tpl_n["O5'"])
-        c3_use = predictions.get((sid_c, rid_c, "C3'"))
-        o3_use = predictions[(sid_c, rid_c, "O3'")]
-        c3u = np.asarray(c3_use, dtype=np.float64).reshape(3)
-        o3u = np.asarray(o3_use, dtype=np.float64).reshape(3)
-        pn2 = predictions[(sid_n, rid_n, 'P')]
-        pnf2 = np.asarray(pn2, dtype=np.float64).reshape(3)
-        o5_z = nerf_place(c3u, o3u, pnf2, r_o5p, th_z, zeta - HP)
-        oof = np.asarray(o5_orig, dtype=np.float64).reshape(3)
-        predictions[o5_k] = 0.5 * (oof + o5_z)
 
 
 def _chain_indices_5prime_to_3prime(chain):
@@ -229,7 +149,7 @@ def _window_tidx_for_chain_index(chain_len: int, j: int):
     return int(w_cent), int(c)
 
 
-def predict_backbone(input_path, ckpt_path, device='cuda'):
+def predict_backbone(input_path, ckpt_path, device='cuda', show_progress: bool = False):
     _, chain_records = utils.parse_dna(
         input_path,
         use_full_nucleotide=False,
@@ -237,7 +157,6 @@ def predict_backbone(input_path, ckpt_path, device='cuda'):
     )
     model = _load_model(ckpt_path, device)
     predictions: dict = {}
-    torsions_cache: Dict[Tuple[Any, int], np.ndarray] = {}
 
     for _chain_key, chain, windows in chain_records:
         if len(chain) < WINDOW_SIZE:
@@ -247,7 +166,13 @@ def predict_backbone(input_path, ckpt_path, device='cuda'):
         o3_prev_world: Optional[np.ndarray] = None
         ordered_j = _chain_indices_5prime_to_3prime(chain)
 
-        for j in ordered_j:
+        for j in tqdm(
+                ordered_j,
+                desc='Backbone inference',
+                leave=False,
+                disable=not show_progress,
+                colour=utils.PBAR_COLOR,
+        ):
             widx, tidx = _window_tidx_for_chain_index(L, j)
             if widx not in w_by_start:
                 continue
@@ -269,7 +194,6 @@ def predict_backbone(input_path, ckpt_path, device='cuda'):
                 dc,
                 device,
                 predictions,
-                torsions_cache,
                 window,
                 tidx,
                 o3_prev_local,
@@ -279,9 +203,6 @@ def predict_backbone(input_path, ckpt_path, device='cuda'):
             nk = (segid_, resid_, "O3'")
             if nk in predictions:
                 o3_prev_world = np.asarray(predictions[nk], dtype=np.float64)
-
-        ordered_53 = [chain[j] for j in ordered_j]
-        _refine_eps_zeta(ordered_53, predictions, torsions_cache)
 
     return predictions, chain_records
 

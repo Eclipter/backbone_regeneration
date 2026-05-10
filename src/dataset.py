@@ -3,6 +3,7 @@ import multiprocessing as mp
 import os
 import os.path as osp
 import shutil
+import sys
 import tempfile
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
@@ -368,6 +369,8 @@ class DNADataModule(pl.LightningDataModule):
         return None
 
     def setup(self, stage: Optional[str] = None):
+        sys.stderr.write(f'[train_probe] DNADataModule.setup start stage={stage!r}\n')
+        sys.stderr.flush()
         dataset = PyGDataset()
         edge_paths = self._load_edge_paths(dataset)
 
@@ -409,6 +412,12 @@ class DNADataModule(pl.LightningDataModule):
         self.train_dataset = _wrap(train_indices)
         self.val_dataset = _wrap(val_indices)
         self.test_dataset = _wrap(test_indices)
+        sys.stderr.write(
+            f'[train_probe] DNADataModule.setup done stage={stage!r} '
+            f'n_train={len(train_indices)} n_val={len(val_indices)} '
+            f'n_test={len(test_indices)} num_workers={self.num_workers}\n',
+        )
+        sys.stderr.flush()
 
     def train_dataloader(self):
         sampler = EdgeCentralTargetSampler(

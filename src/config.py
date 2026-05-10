@@ -18,14 +18,12 @@ BASE = dict(
     NUM_EPOCHS=50,
     BETA_SCHEDULE='linear',  # 'linear' | 'cosine'
     START_FROM_LAST_CKPT=False,
+    CLOSURE_LOSS_WEIGHT=1.0,
 )
 
 # One entry = one experiment. Put ONLY the deltas from BASE here
 EXPERIMENTS = [
     {},  # baseline (matches BASE)
-    {'NUM_HEADS': 3, 'HIDDEN_DIM': 255},
-    {'NUM_LAYERS': 5},
-    # {'NUM_TIMESTEPS': 150}
 ]
 
 # Run path under `logs/`

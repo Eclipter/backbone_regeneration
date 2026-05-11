@@ -220,7 +220,7 @@ def test_window_builder_uses_same_frame_convention_as_utils():
     frame, _ = torch.linalg.qr(frame)
     from torsion_geometry import world_to_local_torch
 
-    u = (o3w - ok) @ frame
+    u = torch.einsum('bi,bij->bj', o3w - ok, frame)
     v = world_to_local_torch(o3w, ok, frame)
     assert torch.allclose(u, v, atol=1e-5, rtol=1e-5)
 
@@ -264,3 +264,14 @@ def test_measured_chi_pyrimidine_matches_input():
     m = dihedral_rad(bb["O4'"], bb["C1'"], tpl_b['N1'], tpl_b['C2'])
     d = float(np.arctan2(np.sin(m - t[TOR_CHI]), np.cos(m - t[TOR_CHI])))
     assert abs(d) < 0.05
+
+
+def test_world_local_world_roundtrip_explicit_matmul():
+    """``local = (world - origin) @ R`` matches `torsion_geometry.local_to_world_points` round-trip."""
+    torch.manual_seed(0)
+    origin = torch.randn(4, 3)
+    frame, _ = torch.linalg.qr(torch.randn(4, 3, 3))
+    x_w = torch.randn(4, 3)
+    local = (x_w - origin) @ frame
+    x_back = local @ frame.transpose(-1, -2) + origin
+    assert torch.allclose(x_w, x_back, atol=1e-5, rtol=1e-5)

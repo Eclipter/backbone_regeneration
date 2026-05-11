@@ -24,6 +24,13 @@ def test_predict_default_uses_window_builder_flag():
     assert inference_uses_window_builder(True) is False
 
 
+def test_predict_has_full_window_inference_for_default_path():
+    import predict as pred_mod
+
+    text = Path(pred_mod.__file__).read_text()
+    assert '_predict_full_window_predictions_dict' in text
+
+
 def test_predict_module_imports_batch_window_builder():
     import predict as pred_mod
 

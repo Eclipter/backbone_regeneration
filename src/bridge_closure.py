@@ -19,6 +19,8 @@ from torsion_geometry import (
 )
 from utils import backbone_atoms
 
+_BASE_LETTERS = ('A', 'C', 'G', 'T')
+
 # Geometry hyperparameters (single source; training reads overrides via ``geometry`` dict).
 CLOSURE_SIGMA_BOND_A = 0.035
 CLOSURE_SIGMA_ANGLE_RAD = math.radians(4.0)
@@ -27,36 +29,105 @@ CLOSURE_FAIL_THRESHOLD_BOND_SIGMA = 3.0
 CLOSURE_FAIL_THRESHOLD_ANGLE_SIGMA = 3.0
 CLOSURE_FAIL_THRESHOLD_TORSION_SIGMA = 3.0
 
-_BRIDGE_ANGLE_REF_CACHE: Optional[tuple[np.ndarray, np.ndarray, np.ndarray]] = None
+_PAIR_BRIDGE_ANGLE_CACHE: Optional[np.ndarray] = None
 
 
-def _bridge_template_angle_refs() -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Reference angles (rad) per restype index 0..3 from canonical templates."""
-    global _BRIDGE_ANGLE_REF_CACHE
-    if _BRIDGE_ANGLE_REF_CACHE is not None:
-        return _BRIDGE_ANGLE_REF_CACHE
+def canonical_two_residue_bridge_positions_numpy(rest_prev: str, rest_next: str) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Prev / next backbone for a contiguous pair (prev O3' at origin).
 
-    def _ang(tpl: dict, a: str, b: str, c: str) -> float:
-        va = tpl[a] - tpl[b]
-        vc = tpl[c] - tpl[b]
-        la = float(np.linalg.norm(va)) + 1e-12
-        lc = float(np.linalg.norm(vc)) + 1e-12
-        cos_t = float(np.dot(va, vc) / (la * lc))
-        cos_t = float(np.clip(cos_t, -1.0 + 1e-9, 1.0 - 1e-9))
-        return float(np.arccos(cos_t))
+    Next residue is placed as a rigid translate of ``rest_next`` aligned so ``P_next``
+    sits on the ``O3'_{prev}-P_bridge`` chord at template ``bond_p_o3_inter[rest_next]``.
+    This preserves intra-residue P– O5′ and sugar bond lengths unlike rescaling ``P``
+    alone, which inflated ``bond_p_o5`` mismatch in closure loss fixtures.
+    """
+    tp = _get_template(rest_prev)
+    tn_raw = _get_template(rest_next)
+    o3_prev = np.asarray(tp["O3'"], dtype=np.float64)
+    prev = {k: np.asarray(tp[k], dtype=np.float64) - o3_prev for k in backbone_atoms if k in tp}
 
-    c3_o3_p, o3_p_o5, p_o5_c5 = [], [], []
-    for rt in ('A', 'C', 'G', 'T'):
-        tpl = _get_template(rt)
-        c3_o3_p.append(_ang(tpl, "C3'", "O3'", 'P'))
-        o3_p_o5.append(_ang(tpl, "O3'", 'P', "O5'"))
-        p_o5_c5.append(_ang(tpl, 'P', "O5'", "C5'"))
-    _BRIDGE_ANGLE_REF_CACHE = (
-        np.asarray(c3_o3_p, dtype=np.float64),
-        np.asarray(o3_p_o5, dtype=np.float64),
-        np.asarray(p_o5_c5, dtype=np.float64),
+    _ri = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
+    inc = _ri[rest_next]
+    tt = _get_template_tensors('cpu')
+    bond_o3_p = float(tt['bond_p_o3_inter'][inc].numpy())
+
+    vp = np.asarray(tp['P'], dtype=np.float64) - o3_prev
+    vn = vp / (np.linalg.norm(vp) + 1e-12)
+    p_tgt = prev["O3'"] + vn * bond_o3_p
+
+    p_tpl_next = np.asarray(tn_raw['P'], dtype=np.float64)
+    nxt = {
+        nm: np.asarray(tn_raw[nm], dtype=np.float64) - p_tpl_next + p_tgt
+        for nm in backbone_atoms
+        if nm in tn_raw
+    }
+    return prev, nxt
+
+
+def _bond_angle_np(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
+    """Interior angle ∠(a–b–c) in radians (numpy copy of ``_bond_angle_torch``)."""
+    ba = a - b
+    bc = c - b
+    denom = float(np.linalg.norm(ba)) * float(np.linalg.norm(bc)) + 1e-12
+    cos_t = float(np.dot(ba, bc)) / denom
+    cos_t = float(np.clip(cos_t, -1.0 + 1e-9, 1.0 - 1e-9))
+    return float(np.arccos(cos_t))
+
+
+def paired_bridge_corner_angles_numpy(rest_prev: str, rest_next: str) -> tuple[float, float, float]:
+    """Three bridge-angle targets at residue boundary (prev → next), radians.
+
+    Must match angles in ``compute_bridge_closure_loss``::
+        ∠(C3'ᵢ,O3'ᵢ,Pᵢ₊₁), ∠(O3'ᵢ,Pᵢ₊₁,O5'ᵢ₊₁), ∠(Pᵢ₊₁,O5'ᵢ₊₁,C5'ᵢ₊₁).
+    These differ from naive single-template corners that use intra-residue C3–O3–P_same.
+    """
+    prev, nxt = canonical_two_residue_bridge_positions_numpy(rest_prev, rest_next)
+    c3_p = prev["C3'"]
+    o3_p = prev["O3'"]
+    p_n = nxt['P']
+    o5_n = nxt["O5'"]
+    c5_n = nxt["C5'"]
+    return (
+        _bond_angle_np(c3_p, o3_p, p_n),
+        _bond_angle_np(o3_p, p_n, o5_n),
+        _bond_angle_np(p_n, o5_n, c5_n),
     )
-    return _BRIDGE_ANGLE_REF_CACHE
+
+
+def _paired_bridge_corner_angles_lookup() -> np.ndarray:
+    """``[4, 4, 3]``: prev restype × next restype × (angle1, angle2, angle3) in radians."""
+    global _PAIR_BRIDGE_ANGLE_CACHE
+    if _PAIR_BRIDGE_ANGLE_CACHE is not None:
+        return _PAIR_BRIDGE_ANGLE_CACHE
+
+    tbl = np.zeros((4, 4, 3), dtype=np.float64)
+    for ip, rp in enumerate(_BASE_LETTERS):
+        for jn, rn in enumerate(_BASE_LETTERS):
+            a1, a2, a3 = paired_bridge_corner_angles_numpy(rp, rn)
+            tbl[ip, jn, 0] = a1
+            tbl[ip, jn, 1] = a2
+            tbl[ip, jn, 2] = a3
+    _PAIR_BRIDGE_ANGLE_CACHE = tbl
+    return tbl
+
+
+def canonical_two_residue_bridge_bb_tensor(
+        rest_prev: str = 'A',
+        rest_next: str = 'A',
+        *,
+        dtype=torch.float64,
+        device: torch.device | str = 'cpu',
+) -> torch.Tensor:
+    """Aligned with ``tests.test_bridge_closure_loss._ideal_bridge_bb_and_targets`` layout ``[2, n_bb, 3]``."""
+    dev = device if isinstance(device, torch.device) else torch.device(device)
+    prev, nxt = canonical_two_residue_bridge_positions_numpy(rest_prev, rest_next)
+    name_to_j = {nm: j for j, nm in enumerate(backbone_atoms)}
+    bb = torch.full((2, len(backbone_atoms), 3), float('nan'), dtype=dtype, device=dev)
+    for nm, j in name_to_j.items():
+        if nm in prev:
+            bb[0, j] = torch.as_tensor(prev[nm], dtype=dtype, device=dev)
+        if nm in nxt:
+            bb[1, j] = torch.as_tensor(nxt[nm], dtype=dtype, device=dev)
+    return bb
 
 
 def _bond_angle_torch(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, eps: float) -> torch.Tensor:
@@ -230,18 +301,20 @@ def compute_bridge_closure_loss(
     d2 = (o5_n - p_n).norm(dim=-1)
     bond_sq = ((d1 - d0_o3p) / (sigma_d + eps)) ** 2 + ((d2 - d0_po5) / (sigma_d + eps)) ** 2
 
-    ang_ref_c3, ang_ref_o3p, ang_ref_po5 = _bridge_template_angle_refs()
-    ar_c3 = torch.as_tensor(ang_ref_c3, device=dev, dtype=dtype)[ri_prev]
-    ar_o3 = torch.as_tensor(ang_ref_o3p, device=dev, dtype=dtype)[ri_next]
-    ar_po5 = torch.as_tensor(ang_ref_po5, device=dev, dtype=dtype)[ri_next]
+    ang_lut_np = _paired_bridge_corner_angles_lookup()
+    ang_lut = torch.as_tensor(ang_lut_np, device=dev, dtype=dtype)
+
+    ar_angle1 = ang_lut[ri_prev.long(), ri_next.long(), 0]
+    ar_angle2 = ang_lut[ri_prev.long(), ri_next.long(), 1]
+    ar_angle3 = ang_lut[ri_prev.long(), ri_next.long(), 2]
 
     a1 = _bond_angle_torch(c3_p, o3_p, p_n, eps)
     a2 = _bond_angle_torch(o3_p, p_n, o5_n, eps)
     a3 = _bond_angle_torch(p_n, o5_n, c5_n, eps)
     angle_sq = (
-        ((a1 - ar_c3) / (sigma_a + eps)) ** 2
-        + ((a2 - ar_o3) / (sigma_a + eps)) ** 2
-        + ((a3 - ar_po5) / (sigma_a + eps)) ** 2
+        ((a1 - ar_angle1) / (sigma_a + eps)) ** 2
+        + ((a2 - ar_angle2) / (sigma_a + eps)) ** 2
+        + ((a3 - ar_angle3) / (sigma_a + eps)) ** 2
     )
 
     eps_pred = dihedral_rad_torch(c4_p, c3_p, o3_p, p_n)
@@ -273,10 +346,10 @@ def compute_bridge_closure_loss(
     )
     angle_norm = torch.maximum(
         torch.maximum(
-            (a1 - ar_c3).abs() / (sigma_a + eps),
-            (a2 - ar_o3).abs() / (sigma_a + eps),
+            (a1 - ar_angle1).abs() / (sigma_a + eps),
+            (a2 - ar_angle2).abs() / (sigma_a + eps),
         ),
-        (a3 - ar_po5).abs() / (sigma_a + eps),
+        (a3 - ar_angle3).abs() / (sigma_a + eps),
     )
     tor_abs = torch.maximum(
         torch.maximum(e_eps.abs(), e_ze.abs()),
@@ -314,7 +387,7 @@ def compute_bridge_closure_loss(
     closure = wb * bond_mean + wa * angle_mean + wt * torsion_mean
 
     bond_mae = ((d1 - d0_o3p).abs() + (d2 - d0_po5).abs()) * 0.5
-    ang_mae = (a1 - ar_c3).abs() + (a2 - ar_o3).abs() + (a3 - ar_po5).abs()
+    ang_mae = (a1 - ar_angle1).abs() + (a2 - ar_angle2).abs() + (a3 - ar_angle3).abs()
     ang_mae = ang_mae / 3.0
     tor_mae = (e_eps.abs() + e_ze.abs() + e_al.abs() + e_be.abs()) / 4.0
 

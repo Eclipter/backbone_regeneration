@@ -17,6 +17,7 @@ from torsion_geometry import (
 from utils import N_CHAIN_END_CLASSES, backbone_atoms, base_to_idx
 from wrapped_score_diffusion import (
     decode_torsions,
+    encode_torsions,
     estimate_theta_tau_from_score_ve,
     perturb_torsions,
     reverse_ve_score_step,
@@ -208,6 +209,8 @@ class PytorchLightningModule(pl.LightningModule):
 
         restype = batch.base_types.view(b, ws, len(base_to_idx)).argmax(-1)
         mask = batch.torsion_mask.view(b, ws, N_TORSIONS)
+        origins = batch.nt_origins_world.view(b, ws, 3)
+        frames = batch.nt_frames_world.view(b, ws, 3, 3)
 
         bb = build_batch_window_backbone_from_torsions_torch(
             tors_m.float(),
@@ -465,8 +468,26 @@ class PytorchLightningModule(pl.LightningModule):
             )
         ])
 
+    def _val_closure_tensorboard_keys(self):
+        """TensorBoard extras when validation logs bridge closure diagnostics."""
+        if not bool(self.hparams.get('log_closure_metrics_val', False)):
+            return []
+        return [
+            'val/closure_loss',
+            'val/closure_bond_loss',
+            'val/closure_angle_loss',
+            'val/closure_torsion_loss',
+            'val/closure_valid_bridge_fraction',
+            'val/closure_num_valid_bridges',
+            'val/closure_fail_rate',
+            'val/bridge_bond_mae',
+            'val/bridge_angle_mae_deg',
+            'val/bridge_torsion_mae_deg',
+        ]
+
     def on_validation_epoch_end(self):
         self._write_rmsd_scalars('val')
+        self._write_epoch_scalars(self._val_closure_tensorboard_keys())
 
     def on_test_epoch_end(self):
         self._write_rmsd_scalars('test')
@@ -647,6 +668,19 @@ class PytorchLightningModule(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         _, (pred_theta, pred_tau_m) = self.p_sample_loop(batch)
         self._log_rmsd('val', pred_theta, pred_tau_m, batch)
+        if bool(self.hparams.get('log_closure_metrics_val', False)):
+            pred_x0 = encode_torsions(pred_theta, pred_tau_m)
+            clo = self._bridge_closure_metrics(pred_x0, batch)
+            for key, val in clo.items():
+                self.log(
+                    f'val/{key}',
+                    val,
+                    on_epoch=True,
+                    on_step=False,
+                    sync_dist=True,
+                    batch_size=batch.num_graphs,
+                    logger=False,
+                )
 
     def test_step(self, batch, _):
         _, (pred_theta, pred_tau_m) = self.p_sample_loop(batch)

@@ -6,14 +6,11 @@ import numpy as np
 import pytest
 import torch
 
+from bridge_closure import canonical_two_residue_bridge_positions_numpy
+
+import utils
 from torsion_geometry import (
     N_TORSIONS,
-    TOR_ALPHA,
-    TOR_BETA,
-    TOR_CHI,
-    TOR_EPS,
-    TOR_GAMMA,
-    TOR_ZETA,
     _get_template,
     _get_template_tensors,
     add_exocyclic_sugar_atoms_torch,
@@ -28,6 +25,25 @@ from torsion_geometry import (
     nus_rad_from_P_tau_torch,
     wrap_dihedral_diff_torch,
 )
+
+
+def _assert_window_bb_finiteness_design(bb: torch.Tensor) -> None:
+    """Row 0: no upstream bridge ⇒ P / OPs may stay NaN; all other backbone rows/columns finite."""
+    ph = frozenset({
+        utils.backbone_atoms.index('P'),
+        utils.backbone_atoms.index('OP1'),
+        utils.backbone_atoms.index('OP2'),
+    })
+    assert bb.dim() == 4 and bb.shape[-1] == 3
+    for j in range(bb.shape[2]):
+        if j in ph:
+            assert torch.all(torch.isfinite(bb[:, 1:, j, :])), (
+                'Phosphate/inter-bridge atoms must be finite for k≥1.'
+            )
+        else:
+            assert torch.all(torch.isfinite(bb[:, :, j, :])), (
+                f'Non-terminal-phosphate backbone column {utils.backbone_atoms[j]} includes NaNs.'
+            )
 
 
 def _template_tc(dev):
@@ -122,31 +138,37 @@ def test_gamma_places_o5(device):
 
 
 def test_phosphate_bridge_uses_all_four_torsions(device):
-    tpl = _get_template('C')
-    xyz_prev = {"O3'": tpl["O3'"].copy()}
-    xyz_next = {'P': tpl['P'].copy(), "O5'": tpl["O5'"].copy()}
-    t, *_ = nucleotide_torsions_numpy(tpl, xyz_prev, xyz_next, 'C')
-    e_t = float(t[TOR_EPS])
-    z_t = float(t[TOR_ZETA])
-    a_t = float(t[TOR_ALPHA])
-    b_t = float(t[TOR_BETA])
+    # Single isolated template has O3'–O5' span >> r_O3'+l_PO5 ⇒ no phosphate circle ⇒ φ scan ineffective.
+    # Use a contiguous C–C pair so the inter-residue chord is chemically feasible for ``close_phosphate_bridge_multi_torch``.
+    rest = 'C'
+    prev_np, next_np = canonical_two_residue_bridge_positions_numpy(rest, rest)
 
     dev = device
-    ri = torch.tensor([1], dtype=torch.long, device=dev)
-    o3p = torch.tensor(tpl["O3'"], dtype=torch.float32, device=dev).unsqueeze(0)
-    c3p = torch.tensor(tpl["C3'"], dtype=torch.float32, device=dev).unsqueeze(0)
-    c4p = torch.tensor(tpl["C4'"], dtype=torch.float32, device=dev).unsqueeze(0)
-    o5n = torch.tensor(tpl["O5'"], dtype=torch.float32, device=dev).unsqueeze(0)
-    c5n = torch.tensor(tpl["C5'"], dtype=torch.float32, device=dev).unsqueeze(0)
-    c4n = c4p.clone()
+    ri = torch.tensor([{'A': 0, 'C': 1, 'G': 2, 'T': 3}[rest]], dtype=torch.long, device=dev)
+
+    def _pv(d: dict, name: str) -> torch.Tensor:
+        return torch.tensor(d[name], dtype=torch.float32, device=dev).unsqueeze(0)
+
+    o3p = _pv(prev_np, "O3'")
+    c3p = _pv(prev_np, "C3'")
+    c4p = _pv(prev_np, "C4'")
+    o5n = _pv(next_np, "O5'")
+    c5n = _pv(next_np, "C5'")
+    c4n = _pv(next_np, "C4'")
+    p_gt = _pv(next_np, 'P')
+
+    # Targets match the phosphate decoder's χ definitions for this aligned geometry (ground-truth bridge P).
+    e_t = float(
+        dihedral_rad_torch(c4p.squeeze(0), c3p.squeeze(0), o3p.squeeze(0), p_gt.squeeze(0)).item(),
+    )
+    z_t = float(
+        dihedral_rad_torch(c3p.squeeze(0), o3p.squeeze(0), p_gt.squeeze(0), o5n.squeeze(0)).item(),
+    )
+    a_t = float(dihedral_rad_torch(o3p.squeeze(0), p_gt.squeeze(0), o5n.squeeze(0), c5n.squeeze(0)).item())
+    b_t = float(dihedral_rad_torch(p_gt.squeeze(0), o5n.squeeze(0), c5n.squeeze(0), c4n.squeeze(0)).item())
 
     prev_atoms = {"O3'": o3p, "C3'": c3p, "C4'": c4p}
-    next_atoms = {
-        "O5'": o5n,
-        "C5'": c5n,
-        "C4'": c4n,
-        '_ri': ri,
-    }
+    next_atoms = {"O5'": o5n, "C5'": c5n, "C4'": c4n, '_ri': ri}
     et = torch.tensor([e_t], device=dev)
     zt = torch.tensor([z_t], device=dev)
     at = torch.tensor([a_t], device=dev)
@@ -168,9 +190,7 @@ def test_phosphate_bridge_uses_all_four_torsions(device):
     tc = _template_tc(dev)
     target_len = tc['bond_p_o3_inter'][ri].item()
     d_po3 = float(torch.linalg.vector_norm(p - o3p.squeeze(0)).item())
-    # Circle intersection can fail on raw template neighbours; then ``close_phosphate_bridge_multi_torch`` uses midpoint fallback.
-    if d_po3 < target_len + 0.65:
-        assert abs(d_po3 - target_len) < 0.55
+    assert abs(d_po3 - target_len) < 0.12
 
     eps_m = dihedral_rad_torch(c4p.squeeze(0), c3p.squeeze(0), o3p.squeeze(0), p)
     ze_m = dihedral_rad_torch(c3p.squeeze(0), o3p.squeeze(0), p, o5n.squeeze(0))
@@ -250,4 +270,4 @@ def test_window_builder_batch_size_gt_one_finite(device):
     mask = torch.ones(B, W, N_TORSIONS, dtype=torch.bool, device=device)
     bb = build_batch_window_backbone_from_torsions_torch(theta, tau, ri, origins, frm, mask)
     assert bb.shape[0] == B and bb.shape[1] == W
-    assert torch.isfinite(bb).all()
+    _assert_window_bb_finiteness_design(bb)

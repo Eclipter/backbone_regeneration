@@ -7,14 +7,16 @@ import numpy as np
 import pytest
 import torch
 
-from bridge_closure import compute_bridge_closure_loss
+from bridge_closure import (
+    canonical_two_residue_bridge_bb_tensor,
+    compute_bridge_closure_loss,
+)
 from torsion_geometry import (
     N_TORSIONS,
     TOR_ALPHA,
     TOR_BETA,
     TOR_EPS,
     TOR_ZETA,
-    _get_template,
     dihedral_rad_torch,
     wrap_dihedral_diff_torch,
 )
@@ -22,36 +24,11 @@ from utils import backbone_atoms
 
 
 def _ideal_bridge_bb_and_targets(dtype=torch.float64, device='cpu'):
-    """Two stacked 'A' templates: residue 0 O3′ at origin; residue 1 rigid-translated; P at O3'_0–P target length."""
-    tp = _get_template('A')
-    tn = _get_template('A')
-    o3_ref = tp["O3'"]
-    prev = {k: tp[k] - o3_ref for k in backbone_atoms if k in tp}
-
-    vp = tp['P'] - tp["O3'"]
-    shift_next = vp - tn['P']
-    nxt = {k: tn[k] + shift_next for k in backbone_atoms if k in tn}
-
-    po5_tar = float(np.linalg.norm(tp['P'] - tp["O5'"]))
-    dv = np.asarray(nxt['P'], dtype=np.float64) - np.asarray(prev["O3'"], dtype=np.float64)
-    dn = float(np.linalg.norm(dv))
-    if dn > 1e-9:
-        p_old = np.asarray(nxt['P'], dtype=np.float64).copy()
-        nxt['P'] = np.asarray(prev["O3'"], dtype=np.float64) + dv * (po5_tar / dn)
-        dp = np.asarray(nxt['P'], dtype=np.float64) - p_old
-        for suf in ('OP1', 'OP2'):
-            if suf in nxt:
-                nxt[suf] = np.asarray(nxt[suf], dtype=np.float64) + dp
-
+    """Aligned with bridge closure refs: canonical A–A pair bb from ``bridge_closure`` helpers."""
     B, W = 1, 2
-    n_bb = len(backbone_atoms)
-    bb = torch.full((B, W, n_bb, 3), float('nan'), dtype=dtype, device=device)
     nj = {nm: j for j, nm in enumerate(backbone_atoms)}
-    for nm in backbone_atoms:
-        if nm in prev:
-            bb[0, 0, nj[nm]] = torch.as_tensor(prev[nm], dtype=dtype, device=device)
-        if nm in nxt:
-            bb[0, 1, nj[nm]] = torch.as_tensor(nxt[nm], dtype=dtype, device=device)
+    bb2 = canonical_two_residue_bridge_bb_tensor('A', 'A', dtype=dtype, device=device)
+    bb = bb2.unsqueeze(0)
 
     j_c4, j_c3, j_o3 = nj["C4'"], nj["C3'"], nj["O3'"]
     j_p, j_o5, j_c5 = nj['P'], nj["O5'"], nj["C5'"]

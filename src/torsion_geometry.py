@@ -422,7 +422,7 @@ def _get_template_tensors(device_str: str) -> dict:
 
 _GEO_EPS = 1e-8
 _PHI_SUGAR_GRID = 128
-_PHI_PHOS_GRID = 64
+_PHI_PHOS_GRID = 128
 
 
 def dihedral_rad_torch(
@@ -675,6 +675,7 @@ def build_sugar_ring_grid_closed_torch(
     return out
 
 
+# Backward-compatible alias; implementation is grid-closed, not analytic.
 build_sugar_ring_analytic_torch = build_sugar_ring_grid_closed_torch
 
 
@@ -887,13 +888,15 @@ def close_phosphate_bridge_multi_torch(
         )
     )
 
-    p0 = c4p.unsqueeze(1)
-    p1 = c3p.unsqueeze(1)
-    p2 = o3p.unsqueeze(1)
+    p0 = c4p.unsqueeze(1).expand(-1, n_grid, -1)
+    p1 = c3p.unsqueeze(1).expand(-1, n_grid, -1)
+    p2 = o3p.unsqueeze(1).expand(-1, n_grid, -1)
     p3 = p_cands
     eps_m = dihedral_rad_torch(
-        p0.reshape(-1, 3), p1.reshape(-1, 3),
-        p2.reshape(-1, 3), p3.reshape(-1, 3),
+        p0.reshape(-1, 3),
+        p1.reshape(-1, 3),
+        p2.reshape(-1, 3),
+        p3.reshape(-1, 3),
     ).reshape(B, n_grid)
 
     ze_m = dihedral_rad_torch(

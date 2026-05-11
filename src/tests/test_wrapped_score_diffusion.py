@@ -6,8 +6,9 @@ from typing import Any, cast
 import pytest
 import torch
 
+import utils
 from model import PytorchLightningModule
-from torsion_constants import N_LATENT, N_TORSIONS, TORSION_NAMES
+from torsion_constants import LOG_TAU_M_MAX, N_LATENT, N_TORSIONS, TORSION_NAMES
 from wrapped_score_diffusion import (
     decode_torsions,
     gaussian_score,
@@ -20,6 +21,20 @@ from wrapped_score_diffusion import (
     wrapped_angle_diff,
     wrapped_normal_score,
 )
+
+
+def _assert_window_bb_finiteness_design(bb: torch.Tensor) -> None:
+    ph = frozenset({
+        utils.backbone_atoms.index('P'),
+        utils.backbone_atoms.index('OP1'),
+        utils.backbone_atoms.index('OP2'),
+    })
+    assert bb.dim() == 4 and bb.shape[-1] == 3
+    for j in range(bb.shape[2]):
+        if j in ph:
+            assert torch.all(torch.isfinite(bb[:, 1:, j, :]))
+        else:
+            assert torch.all(torch.isfinite(bb[:, :, j, :]))
 
 
 def test_wrapped_normal_score_small_sigma_matches_gaussian_near_zero():
@@ -38,12 +53,18 @@ def test_wrapped_normal_score_periodic_boundary():
         assert torch.isfinite(s).all()
 
 
+test_wrapped_normal_score_finite_near_boundary = test_wrapped_normal_score_periodic_boundary
+
+
 def test_wrapped_normal_score_shape_broadcast():
     B, W, C = 4, 5, 7
     x = torch.randn(B, W, C)
     sigma = torch.randn(B) * 0.05 + 0.2
     s = wrapped_normal_score(x, sigma)
     assert s.shape == x.shape
+
+
+test_wrapped_normal_score_broadcast_shape = test_wrapped_normal_score_shape_broadcast
 
 
 def test_perturb_torsions_shapes():
@@ -93,38 +114,12 @@ def test_score_target_differs_from_naive_gaussian_score_when_wrapping_matters():
     assert float(diff) > 5e-3
 
 
-def test_model_output_dim_is_8():
-    hp = dict(
-        hidden_dim=16,
-        num_heads=4,
-        num_layers=1,
-        num_timesteps=3,
-        batch_size=1,
-        lr=1e-3,
-        lr_scheduler=None,
-        lr_scheduler_patience=1,
-        lr_scheduler_threshold=0.1,
-        lr_scheduler_cooldown=0,
-        angular_sigma_min=0.05,
-        angular_sigma_max=1.0,
-        tau_sigma_min=0.05,
-        tau_sigma_max=1.0,
-        tau_loss_weight=1.0,
-        score_loss_weighting='sigma2',
-        weight_decay=0.01,
-        closure_loss_weight=0.0,
-        closure_bond_weight=1.0,
-        closure_angle_weight=1.0,
-        closure_torsion_weight=1.0,
-        log_closure_metrics_train=False,
-        log_closure_metrics_val=True,
-    )
-    pl = PytorchLightningModule(**cast(Any, hp)).float()
-    assert pl.denoiser.out.out_features == N_LATENT == 8
-
-
 def test_no_sincos_latent_constants():
     assert N_LATENT == 8 and N_TORSIONS == 7
+    assert 'delta' not in TORSION_NAMES
+
+
+test_wrapped_constants_layout = test_no_sincos_latent_constants
 
 
 def test_delta_absent():
@@ -160,6 +155,9 @@ def test_gaussian_ve_step_reduces_magnitude():
     d2 = sigma_cur ** 2 - sigma_next ** 2
     x_next = x_t + d2 * score
     assert abs(float(x_next)) < abs(float(x_t))
+
+
+test_reverse_score_step_sign_unwrapped = test_gaussian_ve_step_reduces_magnitude
 
 
 def test_wrapped_small_angle_ve_step_reduces_magnitude():
@@ -235,8 +233,59 @@ def test_synthetic_perturb_decode_window_builder_closure_finite():
     bb = build_batch_window_backbone_from_torsions_torch(
         th2.float(), tau2.float(), ri.long(), ori.float(), frm.float(), m,
     )
-    assert torch.isfinite(bb).all()
+    _assert_window_bb_finiteness_design(bb)
     pm = torch.ones(B, W - 1, dtype=torch.bool)
     clo = compute_bridge_closure_loss(bb, theta0, m, ri.long(), valid_pair_mask=pm)
     assert torch.isfinite(clo['closure_loss']).all()
 
+
+def test_perturb_log_tau_forward_no_clamp_before_gaussian_score(monkeypatch):
+    """Forward noising path must remain Gaussian matching ``tau_score_target``."""
+    import wrapped_score_diffusion as m
+
+    def _flat_sigma(t, *_a, **_k):
+        return torch.full_like(t, 120.0, dtype=torch.float32)
+
+    monkeypatch.setattr(m, 'sigma_schedule', _flat_sigma)
+    log_tau_0 = torch.zeros((2, 1), dtype=torch.float32)
+    pert = perturb_torsions(
+        torch.zeros((2, N_TORSIONS)),
+        log_tau_0,
+        torch.ones(2),
+        1.0,
+        2.0,
+        1.0,
+        2.0,
+    )
+    assert float(pert['log_tau_t'].max()) > float(LOG_TAU_M_MAX)
+
+
+def test_torsion_denoiser_out_features_is_packed_latent():
+    hp = dict(
+        hidden_dim=16,
+        num_heads=4,
+        num_layers=1,
+        num_timesteps=3,
+        batch_size=1,
+        lr=1e-3,
+        lr_scheduler=None,
+        lr_scheduler_patience=1,
+        lr_scheduler_threshold=0.1,
+        lr_scheduler_cooldown=0,
+        angular_sigma_min=0.05,
+        angular_sigma_max=1.0,
+        tau_sigma_min=0.05,
+        tau_sigma_max=1.0,
+        tau_loss_weight=1.0,
+        score_loss_weighting='sigma2',
+        weight_decay=0.01,
+        closure_loss_weight=0.0,
+        closure_bond_weight=1.0,
+        closure_angle_weight=1.0,
+        closure_torsion_weight=1.0,
+        log_closure_metrics_train=False,
+        log_closure_metrics_val=True,
+    )
+    pl_mod = PytorchLightningModule(**cast(Any, hp)).float()
+    assert pl_mod.denoiser.out.out_features == N_LATENT == 8
+    assert pl_mod.denoiser.out.out_features != N_TORSIONS * 2 + 1

@@ -120,8 +120,12 @@ def _predict_window(
     return preds, torsions_np
 
 
-def _apply_inference_pos_mask(sample_data):
-    """Replace data-derived masks with positional chain-end masking (distribution shift fix)."""
+def _inference_chain_end_mask_tensor(sample_data):
+    """Boolean mask over window torsions: chain terminals disable α (5′) / ε ζ (3′).
+
+    Used with window-level inference so phosphate bridges consume predicted ε ζ / α β on
+    both sides rather than pretending base-only placeholders are trustworthy.
+    """
     pos_mask = torch.ones(WINDOW_SIZE, N_TORSIONS, dtype=torch.bool)
     for i in range(WINDOW_SIZE):
         ce = sample_data.chain_end_class[i]
@@ -130,7 +134,67 @@ def _apply_inference_pos_mask(sample_data):
         if ce[CHAIN_END_CLASS_3_PRIME].item():
             pos_mask[i, TOR_EPS] = False
             pos_mask[i, TOR_ZETA] = False
-    sample_data.torsion_mask = pos_mask
+    return pos_mask
+
+
+@torch.no_grad()
+def _predict_full_window_predictions_dict(model, sample_data, device) -> dict[Any, Any]:
+    """Infer all window residues, then assemble world coords with phosphate bridges once.
+
+    Each index k ∈ {0,…,W−1} is sampled with the checkpoint’s target-only denoiser; overlaps
+    between sliding windows merge by last-write in ``predict_backbone``.
+    """
+    window = getattr(sample_data, '_window_ref', None)
+    if window is None:
+        return {}
+
+    theta_acc = sample_data.torsions.clone()
+    tau_acc = sample_data.tau_m.clone()
+
+    for k in range(WINDOW_SIZE):
+        dc = sample_data.clone()
+        dc.target_nt_idx = torch.tensor(k, dtype=torch.long)
+        is_target = torch.zeros(WINDOW_SIZE, dtype=torch.float32)
+        is_target[k] = 1.0
+        dc.is_target_nt = is_target
+        o_t = dc.nt_origins_world[k]
+        r_t = dc.nt_frames_world[k]
+        dc.rel_origins = ((dc.nt_origins_world - o_t) @ r_t).float()
+        dc.rel_frames = torch.einsum('ji,njk->nik', r_t, dc.nt_frames_world).float()
+
+        dc.pair_rel_origins = ((dc.pair_origins_world - o_t) @ r_t).float()
+        dc.pair_rel_frames = torch.einsum('ji,njk->nik', r_t, dc.pair_frames_world).float()
+
+        batch = Batch.from_data_list([dc]).to(device)
+        pred_theta, pred_tau_m = model.sample(batch)
+        theta_acc[k] = pred_theta[0].detach().cpu()
+        tau_acc[k] = pred_tau_m[0].detach().cpu()
+
+    theta_w = theta_acc.unsqueeze(0).float().to(device)
+    tau_w = tau_acc.unsqueeze(0).float().to(device).clamp(min=TAU_M_MIN, max=TAU_M_MAX)
+    mask = _inference_chain_end_mask_tensor(sample_data).unsqueeze(0).to(device)
+    ri = sample_data.base_types.argmax(dim=-1).unsqueeze(0).long().to(device)
+    origins_w = sample_data.nt_origins_world.float().unsqueeze(0).to(device)
+    frames_w = sample_data.nt_frames_world.float().unsqueeze(0).to(device)
+
+    bb_t = build_batch_window_backbone_from_torsions_torch(
+        theta_w, tau_w, ri, origins_w, frames_w, mask,
+    )
+
+    preds: dict[Any, Any] = {}
+    coords = bb_t[0].cpu().numpy()
+    for local_i, nt in enumerate(window):
+        row_w = coords[local_i]
+        for j_atom, nm in enumerate(utils.backbone_atoms):
+            pos = row_w[j_atom]
+            if np.isfinite(pos).all():
+                preds[(nt.segid, int(nt.resid), nm)] = pos
+    return preds
+
+
+def _apply_inference_pos_mask(sample_data):
+    """Legacy single-target inference: positional chain-end masking on `sample_data`."""
+    sample_data.torsion_mask = _inference_chain_end_mask_tensor(sample_data)
 
 
 def inference_uses_window_builder(legacy_target_builder: bool) -> bool:
@@ -203,9 +267,50 @@ def predict_backbone(
             continue
         w_by_start = {widx: (w, d.clone()) for w, widx, d in windows}
         L = len(chain)
-        o3_prev_world: Optional[np.ndarray] = None
         ordered_j = _chain_indices_5prime_to_3prime(chain)
 
+        if legacy_target_builder:
+            o3_prev_world: Optional[np.ndarray] = None
+            for j in tqdm(
+                    ordered_j,
+                    desc='Backbone inference',
+                    leave=False,
+                    disable=not show_progress,
+                    colour=utils.PBAR_COLOR,
+            ):
+                widx, tidx = _window_tidx_for_chain_index(L, j)
+                if widx not in w_by_start:
+                    continue
+                window, data = w_by_start[widx]
+                nt = chain[j]
+                o_t = data.nt_origins_world[tidx]
+                R_t = data.nt_frames_world[tidx]
+                onp = o_t.numpy().reshape(3)
+                Rnp = R_t.numpy().reshape(3, 3)
+
+                o3_prev_local: Optional[np.ndarray] = None
+                if o3_prev_world is not None:
+                    o3_prev_local = (o3_prev_world - onp) @ Rnp
+
+                dc = data.clone()
+                dc._window_ref = window
+                _run_target(
+                    model,
+                    dc,
+                    device,
+                    predictions,
+                    window,
+                    tidx,
+                    o3_prev_local,
+                    legacy_target_builder=True,
+                )
+
+                nk = (nt.segid, int(nt.resid), "O3'")
+                if nk in predictions:
+                    o3_prev_world = np.asarray(predictions[nk], dtype=np.float64)
+            continue
+
+        cached: dict[int, dict[Any, Any]] = {}
         for j in tqdm(
                 ordered_j,
                 desc='Backbone inference',
@@ -213,37 +318,15 @@ def predict_backbone(
                 disable=not show_progress,
                 colour=utils.PBAR_COLOR,
         ):
-            widx, tidx = _window_tidx_for_chain_index(L, j)
+            widx, _tidx = _window_tidx_for_chain_index(L, j)
             if widx not in w_by_start:
                 continue
             window, data = w_by_start[widx]
-            nt = chain[j]
-            o_t = data.nt_origins_world[tidx]
-            R_t = data.nt_frames_world[tidx]
-            onp = o_t.numpy().reshape(3)
-            Rnp = R_t.numpy().reshape(3, 3)
-
-            o3_prev_local: Optional[np.ndarray] = None
-            if o3_prev_world is not None:
-                o3_prev_local = (o3_prev_world - onp) @ Rnp
-
-            dc = data.clone()
-            dc._window_ref = window
-            _run_target(
-                model,
-                dc,
-                device,
-                predictions,
-                window,
-                tidx,
-                o3_prev_local,
-                legacy_target_builder=legacy_target_builder,
-            )
-
-            segid_, resid_ = nt.segid, int(nt.resid)
-            nk = (segid_, resid_, "O3'")
-            if nk in predictions:
-                o3_prev_world = np.asarray(predictions[nk], dtype=np.float64)
+            if widx not in cached:
+                dc = data.clone()
+                dc._window_ref = window
+                cached[widx] = _predict_full_window_predictions_dict(model, dc, device)
+            predictions.update(cached[widx])
 
     return predictions, chain_records
 

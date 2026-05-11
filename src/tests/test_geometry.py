@@ -33,7 +33,7 @@ def _decode(latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _apply_inf_mask(sample_data: Data):
-    """Mirror predict._apply_inference_pos_mask without importing utils/predict."""
+    """Apply the same chain-end torsion mask as inference uses on window batches."""
     WINDOW_SIZE = 3
     CHAIN_END_CLASS_5_PRIME = 1
     CHAIN_END_CLASS_3_PRIME = 2
@@ -264,6 +264,20 @@ def test_measured_chi_pyrimidine_matches_input():
     m = dihedral_rad(bb["O4'"], bb["C1'"], tpl_b['N1'], tpl_b['C2'])
     d = float(np.arctan2(np.sin(m - t[TOR_CHI]), np.cos(m - t[TOR_CHI])))
     assert abs(d) < 0.05
+
+
+def test_world_local_matches_project_helpers():
+    """Same row-vector convention as builder/inference: local = (world - origin) @ R."""
+    from torsion_geometry import local_to_world_points, world_to_local_points
+
+    torch.manual_seed(2)
+    b = 5
+    origin = torch.randn(b, 3)
+    q, _ = torch.linalg.qr(torch.randn(b, 3, 3))
+    world = torch.randn(b, 3)
+    local = torch.einsum('bi,bij->bj', world - origin, q)
+    assert torch.allclose(local, world_to_local_points(world, origin, q), atol=1e-5, rtol=1e-5)
+    assert torch.allclose(world, local_to_world_points(local, origin, q), atol=1e-5, rtol=1e-5)
 
 
 def test_world_local_world_roundtrip_explicit_matmul():

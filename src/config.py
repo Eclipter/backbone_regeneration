@@ -34,7 +34,7 @@ BASE = dict(
     START_FROM_LAST_CKPT=True,
 )
 
-# One entry = one experiment. Put ONLY the deltas from BASE here
+# One entry = one experiment. Put ONLY the overrides from BASE here
 EXPERIMENTS = [
     {},  # baseline (matches BASE)
 ]

@@ -13,6 +13,7 @@ from torsion_geometry import (
     N_TORSIONS,
     _get_template,
     _get_template_tensors,
+    _RING_TORSION_DEFS,
     add_exocyclic_sugar_atoms_torch,
     add_o5_from_gamma_torch,
     build_backbone_from_torsions_torch,
@@ -53,6 +54,49 @@ def _template_tc(dev):
 @pytest.fixture
 def device():
     return torch.device('cpu')
+
+
+def test_chi_scan_matches_measured_dihedral_preserves_pucker_and_sugar_metric(device):
+    """Same P and τ_m; varying χ: measured χ matches input; ν/Puncher from ring atoms unchanged."""
+    ri = torch.tensor([2], device=device, dtype=torch.long)
+    P = torch.tensor([0.18], device=device)
+    tau_m = torch.tensor([0.31], device=device)
+    chis = torch.linspace(-0.95, 0.95, 5, device=device)
+    tgt_nu = nus_rad_from_P_tau_torch(P, tau_m)
+    tc = _get_template_tensors(str(device))
+    n_atom = tc['chi_n'][ri].reshape(1, 3)
+    c_atom = tc['chi_c'][ri].reshape(1, 3)
+    dist_ref = None
+    for chi in chis:
+        ring = build_sugar_ring_grid_closed_torch(chi.unsqueeze(0), P, tau_m, ri)
+        atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=ri)
+        mchi = dihedral_rad_torch(
+            atoms["O4'"].reshape(1, 3),
+            atoms["C1'"].reshape(1, 3),
+            n_atom,
+            c_atom,
+        )
+        assert wrap_dihedral_diff_torch(mchi, chi.unsqueeze(0)).abs().item() < 0.09
+        nu_meas = []
+        for a0n, a1n, a2n, a3n in _RING_TORSION_DEFS:
+            nu_meas.append(
+                dihedral_rad_torch(
+                    atoms[a0n].reshape(1, 3),
+                    atoms[a1n].reshape(1, 3),
+                    atoms[a2n].reshape(1, 3),
+                    atoms[a3n].reshape(1, 3),
+                ),
+            )
+        nu_st = torch.cat(nu_meas, dim=-1)
+        err_nu = wrap_dihedral_diff_torch(nu_st, tgt_nu).abs().max().item()
+        assert err_nu < 0.55
+        sugar_names = ["O4'", "C2'", "C3'", "C4'", "C5'", "O3'"]
+        pts = torch.stack([atoms[nm].reshape(3) for nm in sugar_names], dim=0)
+        dmat = torch.cdist(pts.unsqueeze(0), pts.unsqueeze(0)).squeeze(0)
+        if dist_ref is None:
+            dist_ref = dmat
+        else:
+            assert torch.allclose(dmat, dist_ref, atol=5e-4, rtol=2e-3)
 
 
 def test_pseudorotation_torsions_consistent(device):

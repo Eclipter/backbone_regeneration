@@ -88,8 +88,7 @@ def _require_window_batch_fields(batch) -> None:
     for name in _N:
         if not hasattr(batch, name):
             raise ValueError(
-                f'Batch missing `{name}` for window-level geometry (wrapped torsions layout). '
-                'Regenerate the processed dataset.',
+                f'Batch missing `{name}` for window-level geometry (wrapped torsions layout).',
             )
 
 
@@ -461,11 +460,9 @@ class PytorchLightningModule(pl.LightningModule):
 
     def _write_rmsd_scalars(self, prefix):
         self._write_epoch_scalars([
-            f'{prefix}_{k}' for k in (
-                'rmsd',
-                'rmsd_central',
-                'rmsd_edge',
-            )
+            f'{prefix}/rmsd_oracle_context',
+            f'{prefix}/rmsd_oracle_context_central',
+            f'{prefix}/rmsd_oracle_context_edge',
         ])
 
     def _val_closure_tensorboard_keys(self):
@@ -565,8 +562,8 @@ class PytorchLightningModule(pl.LightningModule):
         _require_window_batch_fields(batch)
         if batch.torsions.shape[-1] != N_TORSIONS:
             raise ValueError(
-                f'Expected batch.torsions last dim {N_TORSIONS} (wrapped layout); '
-                f'got {batch.torsions.shape[-1]}. Regenerate the processed dataset.',
+                f'Expected batch.torsions last dim {N_TORSIONS}; '
+                f'got {batch.torsions.shape[-1]}.',
             )
 
         b, ws = self._b_ws(batch)
@@ -646,7 +643,7 @@ class PytorchLightningModule(pl.LightningModule):
     def _log_rmsd(
         self, prefix: str, pred_theta: torch.Tensor, pred_tau_m: torch.Tensor, batch,
     ):
-        """Accumulate per-step RMSD (all / central / edge) for later TensorBoard write."""
+        """Oracle-context window RMSD (GT neighbor torsions, predicted target); TensorBoard step log."""
         per_graph_rmsd = self._compute_rmsd_per_graph_local(
             pred_theta, pred_tau_m, batch,
         )
@@ -654,9 +651,9 @@ class PytorchLightningModule(pl.LightningModule):
         finite = torch.isfinite(per_graph_rmsd)
 
         for name, mask in [
-            (f'{prefix}_rmsd', finite),
-            (f'{prefix}_rmsd_central', (~is_edge) & finite),
-            (f'{prefix}_rmsd_edge', is_edge & finite),
+            (f'{prefix}/rmsd_oracle_context', finite),
+            (f'{prefix}/rmsd_oracle_context_central', (~is_edge) & finite),
+            (f'{prefix}/rmsd_oracle_context_edge', is_edge & finite),
         ]:
             if mask.any():
                 self.log(
@@ -710,5 +707,5 @@ class PytorchLightningModule(pl.LightningModule):
         )
         return {
             'optimizer': optimizer,
-            'lr_scheduler': {'scheduler': scheduler, 'monitor': 'val_rmsd'},
+            'lr_scheduler': {'scheduler': scheduler, 'monitor': 'val/rmsd_oracle_context'},
         }

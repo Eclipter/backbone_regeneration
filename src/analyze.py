@@ -631,13 +631,13 @@ def scalars_to_dataframe(ea, tag):
 
 
 metric_tags = {
-    'train_loss':           ('all',     'train_loss'),
-    'val_rmsd':             ('all',     'val_rmsd'),
-    'val_rmsd_central':     ('central', 'val_rmsd'),
-    'val_rmsd_edge':        ('edge',    'val_rmsd'),
-    'test_rmsd':            ('all',     'test_rmsd'),
-    'test_rmsd_central':    ('central', 'test_rmsd'),
-    'test_rmsd_edge':       ('edge',    'test_rmsd'),
+    'train_loss':                          ('all',     'train_loss'),
+    'val/rmsd_oracle_context':             ('all',     'val_rmsd_oracle_context'),
+    'val/rmsd_oracle_context_central':     ('central', 'val_rmsd_oracle_context'),
+    'val/rmsd_oracle_context_edge':        ('edge',    'val_rmsd_oracle_context'),
+    'test/rmsd_oracle_context':            ('all',     'test_rmsd_oracle_context'),
+    'test/rmsd_oracle_context_central':    ('central', 'test_rmsd_oracle_context'),
+    'test/rmsd_oracle_context_edge':       ('edge',    'test_rmsd_oracle_context'),
 }
 tracked_tags = set(metric_tags)
 
@@ -716,11 +716,11 @@ fig, ax = plt.subplots(figsize=(7, 4))
 ax.tick_params(axis='both', labelsize=15)
 for mode in target_modes:
     w = wide_per_mode[mode]
-    if 'val_rmsd' in w.columns:
+    if 'val_rmsd_oracle_context' in w.columns:
         _plot_metric(
             ax,
             w,
-            'val_rmsd',
+            'val_rmsd_oracle_context',
             mode_colors[mode],
             validation_labels[mode],
             mode_linestyles[mode],
@@ -738,7 +738,7 @@ plt.show()
 fig, ax = plt.subplots(figsize=(6, 3))
 ax.tick_params(axis='both', labelsize=15)
 test_values = [
-    float(wide_per_mode[mode]['test_rmsd'].dropna().iloc[-1])
+    float(wide_per_mode[mode]['test_rmsd_oracle_context'].dropna().iloc[-1])
     for mode in target_modes
 ]
 bars = ax.barh(
@@ -1428,7 +1428,7 @@ if rmsd_values:
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.hist(rmsd_values, bins=50, color='skyblue', edgecolor='white')
     for mode, color in mode_colors.items():
-        val = float(wide_per_mode[mode]['val_rmsd'].dropna().iloc[-1])
+        val = float(wide_per_mode[mode]['val_rmsd_oracle_context'].dropna().iloc[-1])
         ax.axvline(
             val,
             color=color,
@@ -1634,6 +1634,6 @@ for _label, _mask in [
 
 print('\nModel val RMSD (last epoch):')
 for _label, _w in [('all', wide)] + [(m, wide_per_mode[m]) for m in ('central', 'edge')]:
-    if 'val_rmsd' in _w.columns:
-        _v = float(_w['val_rmsd'].dropna().iloc[-1])
+    if 'val_rmsd_oracle_context' in _w.columns:
+        _v = float(_w['val_rmsd_oracle_context'].dropna().iloc[-1])
         print(f'  {_label:>7}: {_v:.3f} Å')

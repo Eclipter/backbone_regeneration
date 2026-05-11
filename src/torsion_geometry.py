@@ -140,11 +140,11 @@ def close_phosphate_bridge(
     diff_l = abs(r_o3p - r_po5)
     eps = 1e-12
     if d > sum_l + eps or d < diff_l - eps:
-        delta = o5 - o3
-        dn = float(np.linalg.norm(delta))
+        o5_minus_o3 = o5 - o3
+        dn = float(np.linalg.norm(o5_minus_o3))
         if dn < eps:
             return o3.copy()
-        return o3 + delta * (r_o3p / sum_l)
+        return o3 + o5_minus_o3 * (r_o3p / sum_l)
     a = (r_o3p * r_o3p - r_po5 * r_po5 + d * d) / (2.0 * d)
     h = float(np.sqrt(max(r_o3p * r_o3p - a * a, 0.0)))
     axis = (o5 - o3) / d
@@ -673,10 +673,6 @@ def build_sugar_ring_grid_closed_torch(
         out, chi.reshape(B), n_atom, c_atom,
     )
     return out
-
-
-# Backward-compatible alias; implementation is grid-closed, not analytic.
-build_sugar_ring_analytic_torch = build_sugar_ring_grid_closed_torch
 
 
 def add_exocyclic_sugar_atoms_torch(

@@ -3,7 +3,7 @@ import os.path as osp
 import tempfile
 import warnings
 from argparse import ArgumentParser
-from typing import Any, Optional, Tuple
+from typing import Any, Tuple
 
 import MDAnalysis as mda
 import numpy as np
@@ -17,7 +17,6 @@ import utils
 from model import PytorchLightningModule
 from torsion_constants import TAU_M_MAX, TAU_M_MIN
 from torsion_geometry import (N_TORSIONS, TOR_ALPHA, TOR_EPS, TOR_ZETA,
-                              build_backbone_from_torsions,
                               build_batch_window_backbone_from_torsions_torch)
 from utils import (CHAIN_END_CLASS_3_PRIME, CHAIN_END_CLASS_5_PRIME,
                    resolve_run_dir)
@@ -43,107 +42,21 @@ def _chain_list_direction(chain):
     return 1 if last_resid >= first_resid else -1
 
 
-@torch.no_grad()
-def _predict_window(
-    model,
-    data,
-    device,
-    tidx: int,
-    o3_prev_local: Optional[np.ndarray] = None,
-    *,
-    legacy_target_builder: bool = False,
-) -> Tuple[dict, np.ndarray]:
-    """Sample from the model; build target backbone in world coords (window builder by default)."""
-    window = getattr(data, '_window_ref', None)
-    if window is None:
-        return {}, np.zeros(N_TORSIONS, dtype=np.float64)
-    data.target_nt_idx = torch.tensor(tidx, dtype=torch.long)
-    is_target = torch.zeros(WINDOW_SIZE, dtype=torch.float)
-    is_target[tidx] = 1.0
-    data.is_target_nt = is_target
-    o_t = data.nt_origins_world[tidx]
-    r_t = data.nt_frames_world[tidx]
-    data.rel_origins = ((data.nt_origins_world - o_t) @ r_t).float()
-    data.rel_frames = torch.einsum('ji,njk->nik', r_t, data.nt_frames_world).float()
-
-    # Partner nucleotide positions/frames in the target nucleotide's local frame
-    data.pair_rel_origins = ((data.pair_origins_world - o_t) @ r_t).float()
-    data.pair_rel_frames = torch.einsum('ji,njk->nik', r_t, data.pair_frames_world).float()
-
-    batch = Batch.from_data_list([data]).to(device)  # type: ignore[union-attr]
-    pred_theta, pred_tau_m = model.sample(batch)
-
-    nt = window[tidx]
-
-    torsions_np = pred_theta[0].cpu().numpy()
-    tau_m = float(pred_tau_m[0].clamp(min=TAU_M_MIN, max=TAU_M_MAX).item())
-
-    if legacy_target_builder:
-        o_tt = data.nt_origins_world[tidx]
-        r_tt = data.nt_frames_world[tidx]
-        o3pl = (
-            np.asarray(o3_prev_local, dtype=np.float64).reshape(3)
-            if o3_prev_local is not None
-            else None
-        )
-
-        local_bb = build_backbone_from_torsions(
-            torsions_np,
-            nt.restype,
-            o3_prev_local=o3pl,
-            tau_m=tau_m,
-        )
-        o = o_tt.cpu().numpy().reshape(3)
-        r = r_tt.cpu().numpy().reshape(3, 3)
-        world_bb = {nm: xyz @ r.T + o for nm, xyz in local_bb.items()}
-    else:
-        theta_w = data.torsions.float().unsqueeze(0).to(device)
-        tau_w = data.tau_m.float().unsqueeze(0).to(device)
-        ri = data.base_types.argmax(dim=-1).unsqueeze(0).long().to(device)
-        origins_w = data.nt_origins_world.float().unsqueeze(0).to(device)
-        frames_w = data.nt_frames_world.float().unsqueeze(0).to(device)
-        mask = data.torsion_mask.unsqueeze(0).to(device)
-        theta_w[0, tidx] = pred_theta[0]
-        tau_w[0, tidx] = pred_tau_m[0].clamp(min=TAU_M_MIN, max=TAU_M_MAX)
-        bb_t = build_batch_window_backbone_from_torsions_torch(
-            theta_w, tau_w, ri, origins_w, frames_w, mask,
-        )
-        world_coords = bb_t[0, tidx].cpu().numpy()
-        world_bb = {
-            utils.backbone_atoms[j]: world_coords[j]
-            for j in range(world_coords.shape[0])
-            if np.isfinite(world_coords[j]).all()
-        }
-
-    segid, resid = nt.segid, int(nt.resid)
-    preds = {(segid, resid, nm): pos for nm, pos in world_bb.items()}
-    return preds, torsions_np
-
-
-def _inference_chain_end_mask_tensor(sample_data):
-    """Boolean mask over window torsions: chain terminals disable α (5′) / ε ζ (3′).
-
-    Used with window-level inference so phosphate bridges consume predicted ε ζ / α β on
-    both sides rather than pretending base-only placeholders are trustworthy.
-    """
-    pos_mask = torch.ones(WINDOW_SIZE, N_TORSIONS, dtype=torch.bool)
-    for i in range(WINDOW_SIZE):
-        ce = sample_data.chain_end_class[i]
-        if ce[CHAIN_END_CLASS_5_PRIME].item():
-            pos_mask[i, TOR_ALPHA] = False
-        if ce[CHAIN_END_CLASS_3_PRIME].item():
-            pos_mask[i, TOR_EPS] = False
-            pos_mask[i, TOR_ZETA] = False
-    return pos_mask
+def _merge_window_pred_for_residue(
+    predictions: dict,
+    window_pred: dict[Any, Any],
+    nt,
+) -> None:
+    """Write backbone entries from ``window_pred`` only for residue ``nt`` (one chain step)."""
+    sk = (nt.segid, int(nt.resid))
+    for key, val in window_pred.items():
+        if key[0] == sk[0] and key[1] == sk[1]:
+            predictions[key] = val
 
 
 @torch.no_grad()
 def _predict_full_window_predictions_dict(model, sample_data, device) -> dict[Any, Any]:
-    """Infer all window residues, then assemble world coords with phosphate bridges once.
-
-    Each index k ∈ {0,…,W−1} is sampled with the checkpoint’s target-only denoiser; overlaps
-    between sliding windows merge by last-write in ``predict_backbone``.
-    """
+    """Infer all window residues once, then assemble world coords with phosphate bridges."""
     window = getattr(sample_data, '_window_ref', None)
     if window is None:
         return {}
@@ -192,38 +105,21 @@ def _predict_full_window_predictions_dict(model, sample_data, device) -> dict[An
     return preds
 
 
-def _apply_inference_pos_mask(sample_data):
-    """Legacy single-target inference: positional chain-end masking on `sample_data`."""
-    sample_data.torsion_mask = _inference_chain_end_mask_tensor(sample_data)
+def _inference_chain_end_mask_tensor(sample_data):
+    """Boolean mask over window torsions: chain terminals disable α (5′) / ε ζ (3′).
 
-
-def inference_uses_window_builder(legacy_target_builder: bool) -> bool:
-    """Test hook: default inference path must use window-level backbone builder."""
-    return not legacy_target_builder
-
-
-def _run_target(
-    model,
-    sample_data,
-    device,
-    predictions,
-    window,
-    tidx: int,
-    o3_prev_local: Optional[np.ndarray],
-    *,
-    legacy_target_builder: bool = False,
-):
-    sample_data._window_ref = window
-    _apply_inference_pos_mask(sample_data)
-    bb, tort = _predict_window(
-        model,
-        sample_data,
-        device,
-        tidx,
-        o3_prev_local=o3_prev_local,
-        legacy_target_builder=legacy_target_builder,
-    )
-    predictions.update(bb)
+    Used with window-level inference so phosphate bridges consume predicted ε ζ / α β on
+    both sides rather than pretending base-only placeholders are trustworthy.
+    """
+    pos_mask = torch.ones(WINDOW_SIZE, N_TORSIONS, dtype=torch.bool)
+    for i in range(WINDOW_SIZE):
+        ce = sample_data.chain_end_class[i]
+        if ce[CHAIN_END_CLASS_5_PRIME].item():
+            pos_mask[i, TOR_ALPHA] = False
+        if ce[CHAIN_END_CLASS_3_PRIME].item():
+            pos_mask[i, TOR_EPS] = False
+            pos_mask[i, TOR_ZETA] = False
+    return pos_mask
 
 
 def _chain_indices_5prime_to_3prime(chain):
@@ -251,9 +147,7 @@ def predict_backbone(
     ckpt_path,
     device='cuda',
     show_progress: bool = False,
-    *,
-    legacy_target_builder: bool = False,
-):
+) -> Tuple[dict, Any]:
     _, chain_records = utils.parse_dna(
         input_path,
         use_full_nucleotide=False,
@@ -269,47 +163,6 @@ def predict_backbone(
         L = len(chain)
         ordered_j = _chain_indices_5prime_to_3prime(chain)
 
-        if legacy_target_builder:
-            o3_prev_world: Optional[np.ndarray] = None
-            for j in tqdm(
-                    ordered_j,
-                    desc='Backbone inference',
-                    leave=False,
-                    disable=not show_progress,
-                    colour=utils.PBAR_COLOR,
-            ):
-                widx, tidx = _window_tidx_for_chain_index(L, j)
-                if widx not in w_by_start:
-                    continue
-                window, data = w_by_start[widx]
-                nt = chain[j]
-                o_t = data.nt_origins_world[tidx]
-                R_t = data.nt_frames_world[tidx]
-                onp = o_t.numpy().reshape(3)
-                Rnp = R_t.numpy().reshape(3, 3)
-
-                o3_prev_local: Optional[np.ndarray] = None
-                if o3_prev_world is not None:
-                    o3_prev_local = (o3_prev_world - onp) @ Rnp
-
-                dc = data.clone()
-                dc._window_ref = window
-                _run_target(
-                    model,
-                    dc,
-                    device,
-                    predictions,
-                    window,
-                    tidx,
-                    o3_prev_local,
-                    legacy_target_builder=True,
-                )
-
-                nk = (nt.segid, int(nt.resid), "O3'")
-                if nk in predictions:
-                    o3_prev_world = np.asarray(predictions[nk], dtype=np.float64)
-            continue
-
         cached: dict[int, dict[Any, Any]] = {}
         for j in tqdm(
                 ordered_j,
@@ -322,11 +175,12 @@ def predict_backbone(
             if widx not in w_by_start:
                 continue
             window, data = w_by_start[widx]
+            nt = chain[j]
             if widx not in cached:
                 dc = data.clone()
                 dc._window_ref = window
                 cached[widx] = _predict_full_window_predictions_dict(model, dc, device)
-            predictions.update(cached[widx])
+            _merge_window_pred_for_residue(predictions, cached[widx], nt)
 
     return predictions, chain_records
 
@@ -461,11 +315,6 @@ def _parse_args():
         action='store_true',
         help="Include 5'-terminal P, OP1, OP2 atoms in the output (omitted by default).",
     )
-    p.add_argument(
-        '--legacy-target-builder',
-        action='store_true',
-        help="Use per-residue phosphate builder (debug). Default: window builder (training-consistent).",
-    )
     return p.parse_args()
 
 
@@ -478,7 +327,6 @@ if __name__ == '__main__':
         args.input,
         ckpt_path,
         device=device,
-        legacy_target_builder=args.legacy_target_builder,
     )
     write_structure(
         chain_records,

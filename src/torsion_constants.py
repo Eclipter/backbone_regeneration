@@ -31,7 +31,7 @@ TORSION_IS_CIRCULAR = torch.tensor(
 
 
 def assert_torsion_layout():
-    """Debug helper: latent is 7 wrapped angles + log τ_m; δ and sin/cos layout are excluded."""
+    """Debug helper: latent is seven wrapped angles plus log τ_m."""
     assert len(TORSION_NAMES) == N_TORSIONS == 7
     assert N_LATENT == N_TORSIONS + 1 == 8
     assert 'delta' not in TORSION_NAMES

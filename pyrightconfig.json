@@ -1,6 +1,6 @@
 {
   "include": ["src"],
-  "extraPaths": ["./pynamod", "./src"],
+  "extraPaths": ["./PyNAMod", "./src"],
   "venvPath": "../.conda/envs",
   "venv": "backbone_regen"
 }

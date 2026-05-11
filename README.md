@@ -11,13 +11,20 @@ cd backbone-regeneration
 
 2. Install Conda. See [Conda Installation](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
 
-3. Create a new environment with pynamod dependencies:
+3. Install PyNAMod:
 
 ```bash
-conda env create --name backbone_regen --file pynamod/environment.yml
+git clone https://github.com/intbio/PyNAMod.git
+cd PyNAMod
 ```
 
-4. Install the project dependencies:
+4. Create a new environment with pynamod dependencies:
+
+```bash
+conda env create --name backbone_regen --file PyNAMod/environment.yml
+```
+
+5. Install the project dependencies:
 
 ```bash
 conda env update --name backbone_regen --file environment.yml

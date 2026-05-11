@@ -256,7 +256,6 @@ class WindowTargetDataset(torch.utils.data.Dataset):
         data.target_nt_idx = torch.tensor(tidx, dtype=torch.long)
 
         # per-atom flag: 1.0 for the target nucleotide, 0.0 for context
-        ws = self.base.window_size
         is_target = torch.zeros(ws, dtype=torch.float)
         is_target[tidx] = 1.0
         data.is_target_nt = is_target

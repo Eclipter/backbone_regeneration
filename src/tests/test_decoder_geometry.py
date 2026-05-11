@@ -24,7 +24,6 @@ from torsion_geometry import (
     close_phosphate_bridge_multi_torch,
     dihedral_rad,
     dihedral_rad_torch,
-    legacy_torsion8_to_new7,
     nucleotide_torsions_numpy,
     nus_rad_from_P_tau_torch,
     wrap_dihedral_diff_torch,
@@ -202,10 +201,6 @@ def test_ground_truth_torsions_from_disk():
     obj = torch.load(pth, map_location='cpu', weights_only=False)
     if isinstance(obj, dict) and 'torsions' in obj:
         t = obj['torsions'].float()
-        if int(t.shape[-1]) == 8:
-            t = torch.from_numpy(
-                legacy_torsion8_to_new7(t.numpy()).astype(np.float32),
-            )
         assert int(t.shape[-1]) == N_TORSIONS
         n = min(int(t.shape[0]), 4)
         tm = obj.get('tau_m', torch.full((n,), 0.5)).float().view(-1)[:n]

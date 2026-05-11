@@ -8,26 +8,21 @@ import torch
 from model import N_TORSIONS_LATENT, PytorchLightningModule
 from utils import base_to_idx, find_best_checkpoint, resolve_run_dir
 
-# Diffusion schedule buffers registered in PytorchLightningModule.__init__.
-# Exported JSON-side so that a consumer of model.onnx can reproduce sampling
-# without re-deriving them from (beta_schedule, num_timesteps)
-SCHEDULE_BUFFERS = (
-    'betas',
-    'alphas_cumprod',
-    'alphas_cumprod_prev',
-    'sqrt_alphas_cumprod',
-    'sqrt_one_minus_alphas_cumprod',
-    'posterior_variance',
-    'posterior_log_variance_clipped',
-    'posterior_mean_coef1',
-    'posterior_mean_coef2',
+# Keys describing denoiser I/O and σ endpoints at inference time (VE score sampler rebuilds grids).
+HPARAM_KEYS = (
+    'hidden_dim',
+    'num_heads',
+    'num_layers',
+    'num_timesteps',
+    'angular_sigma_min',
+    'angular_sigma_max',
+    'tau_sigma_min',
+    'tau_sigma_max',
+    'tau_loss_weight',
+    'score_loss_weighting',
 )
 
-# Keys from self.hparams that describe what the denoiser expects and how to
-# wrap it into reverse-diffusion sampling at inference time
-HPARAM_KEYS = ('hidden_dim', 'num_heads', 'num_layers', 'num_timesteps', 'beta_schedule')
-
-# Inference window (nucleotides). Legacy ``torch.onnx.export`` fixes this axis in the graph; only
+# Inference window (nucleotides). ``torch.onnx.export`` fixes this axis in the graph; only
 # batch ``B`` is dynamic — do not declare ``L`` in ``dynamic_axes`` or consumers may assume any length.
 ONNX_EXPORT_SEQ_LEN = 3
 
@@ -35,7 +30,7 @@ ONNX_EXPORT_SEQ_LEN = 3
 def export_to_onnx(ckpt_path, out_dir=None, opset=17):
     """Export the torsion Transformer denoiser from a Lightning checkpoint to ONNX.
 
-    Writes ``model.onnx`` (single forward: node features -> epsilon) and ``model.json``.
+    Writes ``model.onnx`` (single forward: node features → predicted score) and ``model.json``.
     Tensors are ``[B, ONNX_EXPORT_SEQ_LEN, node_dim]`` and ``[B, ONNX_EXPORT_SEQ_LEN, N_TORSIONS_LATENT]``;
     only the batch axis ``B`` is dynamic in the ONNX graph.
     """
@@ -60,10 +55,10 @@ def export_to_onnx(ckpt_path, out_dir=None, opset=17):
         (x,),
         onnx_path,
         input_names=['node_features'],
-        output_names=['eps'],
+        output_names=['score'],
         dynamic_axes={
             'node_features': {0: 'B'},
-            'eps': {0: 'B'},
+            'score': {0: 'B'},
         },
         opset_version=opset,
         do_constant_folding=True,
@@ -71,15 +66,10 @@ def export_to_onnx(ckpt_path, out_dir=None, opset=17):
 
     # Everything the ONNX graph deliberately leaves out goes into model.json.
     hp = pl_module.hparams
-    schedule = {
-        name: getattr(pl_module, name).detach().cpu().tolist()
-        for name in SCHEDULE_BUFFERS
-    }
     meta = {
         'hyperparameters': {k: getattr(hp, k) for k in HPARAM_KEYS},
         'N_TORSIONS_LATENT': N_TORSIONS_LATENT,
         'base_to_idx': base_to_idx,
-        'schedule_buffers': schedule,
         'opset_version': opset,
         'source_checkpoint': osp.basename(ckpt_path),
     }

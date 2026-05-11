@@ -7,19 +7,29 @@ import time
 import lightning.pytorch as pl
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from bridge_closure import compute_bridge_closure_loss
 from torsion_geometry import (
+    N_LATENT,
     N_TORSIONS,
     build_batch_window_backbone_from_torsions_torch,
 )
 from utils import N_CHAIN_END_CLASSES, backbone_atoms, base_to_idx
+from wrapped_score_diffusion import (
+    decode_torsions,
+    estimate_theta_tau_from_score_ve,
+    perturb_torsions,
+    reverse_ve_score_step,
+    sigma_schedule,
+    ve_sigma_grid,
+    weighted_score_mse,
+    wrap_angle,
+)
 
-# Sin/cos latent per torsion angle plus log τ_m (must match denoiser output width).
-N_TORSIONS_LATENT = N_TORSIONS * 2 + 1
+# Same dimension constant name as in ONNX companion JSON (`N_TORSIONS_LATENT`).
+N_TORSIONS_LATENT = N_LATENT
 
 
 def _fitdbg(msg: str) -> None:
@@ -59,34 +69,6 @@ class SinusoidalPositionalEmbeddings(nn.Module):
         return embeddings
 
 
-def get_beta_schedule(beta_schedule, num_timesteps):
-    def linear_beta_schedule(num_timesteps):
-        scale = 1000 / num_timesteps
-        beta_start = scale * 0.0001
-        beta_end = scale * 0.02
-        return torch.linspace(beta_start, beta_end, num_timesteps, dtype=torch.float32)
-
-    def cosine_beta_schedule(num_timesteps, s=0.008):
-        steps = num_timesteps + 1
-        x = torch.linspace(0, num_timesteps, steps, dtype=torch.float32)
-        alphas_cumprod = torch.cos(((x / num_timesteps) + s) / (1 + s) * torch.pi * 0.5) ** 2
-        alphas_cumprod = alphas_cumprod / alphas_cumprod[0]
-        betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
-        return torch.clip(betas, 0, 0.999)
-
-    if beta_schedule == 'linear':
-        return linear_beta_schedule(num_timesteps)
-    if beta_schedule == 'cosine':
-        return cosine_beta_schedule(num_timesteps)
-    raise NotImplementedError(f'unknown beta schedule: {beta_schedule}')
-
-
-def extract(a, t, x_shape):
-    b, *_ = t.shape
-    out = a.gather(-1, t)
-    return out.reshape(b, *((1,) * (len(x_shape) - 1)))
-
-
 class TorsionDenoiser(nn.Module):
     def __init__(self, node_dim, hidden_dim, num_heads, num_layers, dropout=0.0):
         super().__init__()
@@ -113,7 +95,7 @@ class TorsionDenoiser(nn.Module):
         self.tr = nn.TransformerEncoder(
             enc_layer, num_layers=num_layers, enable_nested_tensor=False,
         )
-        self.out = nn.Linear(hidden_dim, N_TORSIONS_LATENT)
+        self.out = nn.Linear(hidden_dim, N_LATENT)
 
     def forward(self, x):
         h = self.in_mlp(x)
@@ -125,11 +107,15 @@ class PytorchLightningModule(pl.LightningModule):
     def __init__(
         self, hidden_dim, num_heads, num_layers, num_timesteps, batch_size, lr,
         lr_scheduler, lr_scheduler_patience, lr_scheduler_threshold, lr_scheduler_cooldown,
-        beta_schedule, weight_decay,
+        angular_sigma_min, angular_sigma_max,
+        tau_sigma_min, tau_sigma_max,
+        tau_loss_weight, weight_decay,
+        score_loss_weighting: str = 'sigma2',
         closure_loss_weight: float = 0.0,
         closure_bond_weight: float = 1.0,
         closure_angle_weight: float = 1.0,
         closure_torsion_weight: float = 1.0,
+        log_tau_init_noise_scale: float | None = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -146,10 +132,10 @@ class PytorchLightningModule(pl.LightningModule):
             + 1
             + N_CHAIN_END_CLASSES
             + 1
-            + N_TORSIONS_LATENT
+            + N_LATENT
             + self.time_emb_dim
             + N_TORSIONS
-            + N_TORSIONS_LATENT
+            + N_LATENT
         )
 
         self.denoiser = TorsionDenoiser(
@@ -159,34 +145,7 @@ class PytorchLightningModule(pl.LightningModule):
             num_layers=num_layers,
         )
 
-        betas = get_beta_schedule(beta_schedule, num_timesteps=num_timesteps)
-        alphas = 1. - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.)
-
-        posterior_variance = betas * (1. - alphas_cumprod_prev) / (1. - alphas_cumprod)
-
-        self.register_buffer('betas', betas)
-        self.register_buffer('alphas_cumprod', alphas_cumprod)
-        self.register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
-        self.register_buffer('sqrt_alphas_cumprod', torch.sqrt(alphas_cumprod))
-        self.register_buffer('sqrt_one_minus_alphas_cumprod', torch.sqrt(1. - alphas_cumprod))
-        self.register_buffer('posterior_variance', posterior_variance)
-        self.register_buffer('posterior_log_variance_clipped', torch.log(posterior_variance.clamp(min=1e-20)))
-        self.register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
-        self.register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
-
     def load_state_dict(self, state_dict, strict=True):  # type: ignore[no-untyped-def]
-        _out_w = next(
-            (v for k, v in state_dict.items() if str(k).endswith('denoiser.out.weight')),
-            None,
-        )
-        if _out_w is not None and _out_w.shape[0] != N_TORSIONS_LATENT:
-            raise RuntimeError(
-                f'Checkpoint denoiser output dim is {_out_w.shape[0]}, '
-                f'expected {N_TORSIONS_LATENT} (interleaved sin/cos torsions + log τ_m). '
-                'Use a checkpoint trained with matching latent layout.',
-            )
         # Checkpoints saved with torch.compile(denoiser) use denoiser._orig_mod.*; eager module expects denoiser.*.
         _orig = 'denoiser._orig_mod.'
         if any(str(k).startswith(_orig) for k in state_dict):
@@ -195,29 +154,6 @@ class PytorchLightningModule(pl.LightningModule):
                 for k, v in state_dict.items()
             }
         return super().load_state_dict(state_dict, strict=strict)
-
-    @staticmethod
-    def encode_torsions(theta: torch.Tensor, tau_m: torch.Tensor) -> torch.Tensor:
-        """[..., N_TORSIONS], [...] → [..., N_TORSIONS_LATENT]: interleaved sin/cos + log τ_m."""
-        sc = torch.stack([theta.sin(), theta.cos()], dim=-1).flatten(-2)
-        log_tau = torch.log(tau_m.clamp(min=1e-3)).unsqueeze(-1)
-        return torch.cat([sc, log_tau], dim=-1)
-
-    @staticmethod
-    def decode_torsions(latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """[..., N_TORSIONS_LATENT] → (theta [..., N_TORSIONS], τ_m [...])."""
-        theta = torch.atan2(
-            latent[..., 0::2][..., :N_TORSIONS],
-            latent[..., 1::2][..., :N_TORSIONS],
-        )
-        tau_m = torch.exp(latent[..., -1].clamp(max=2.0))
-        return theta, tau_m
-
-    def _expand_latent_mask(self, torsion_mask: torch.Tensor, tau_m_mask: torch.Tensor) -> torch.Tensor:
-        """[b, N_TORSIONS], [b] → [b, N_TORSIONS_LATENT]."""
-        b = torsion_mask.shape[0]
-        pair = torsion_mask.unsqueeze(-1).expand(-1, -1, 2).reshape(b, N_TORSIONS * 2)
-        return torch.cat([pair, tau_m_mask.unsqueeze(-1)], dim=-1)
 
     def on_test_start(self):
         if self.trainer is None or not self.trainer.is_global_zero:
@@ -228,28 +164,6 @@ class PytorchLightningModule(pl.LightningModule):
         if log_dir is None or dm is None:
             return
         torch.save(dm.test_dataset, osp.join(log_dir, 'test_dataset.pt'))
-
-    def q_sample(self, theta_start: torch.Tensor, tau_m_start: torch.Tensor, t, noise=None):
-        x_start = self.encode_torsions(theta_start, tau_m_start)
-        if noise is None:
-            noise = torch.randn_like(x_start)
-        sa = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
-        s1 = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
-        return sa * x_start + s1 * noise, noise
-
-    def q_posterior_mean_variance(self, x_start, x_t, t):
-        posterior_mean = (
-            extract(self.posterior_mean_coef1, t, x_t.shape) * x_start
-            + extract(self.posterior_mean_coef2, t, x_t.shape) * x_t
-        )
-        posterior_variance = extract(self.posterior_variance, t, x_t.shape)
-        posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
-        return posterior_mean, posterior_variance, posterior_log_variance_clipped
-
-    def _decode_epsilon_to_x0(self, x_t, pred_noise, t):
-        sa = extract(self.sqrt_alphas_cumprod, t, x_t.shape).clamp(min=1e-8)
-        s1 = extract(self.sqrt_one_minus_alphas_cumprod, t, x_t.shape).clamp(min=1e-8)
-        return (x_t - s1 * pred_noise) / sa
 
     def _b_ws(self, batch):
         b = batch.num_graphs
@@ -277,12 +191,12 @@ class PytorchLightningModule(pl.LightningModule):
         ti = batch.target_nt_idx.long()
         bi = torch.arange(b, device=pred_x0.device)
 
-        pred_theta, pred_tau_m = self.decode_torsions(pred_x0)
+        pred_theta, pred_tau_m = decode_torsions(pred_x0)
 
         tors_m = batch.torsions.view(b, ws, N_TORSIONS).clone()
         tau_m = batch.tau_m.view(b, ws).clone()
         tors_m[bi, ti] = pred_theta
-        tau_m[bi, ti] = pred_tau_m.clamp(min=1e-3)
+        tau_m[bi, ti] = pred_tau_m.clamp(min=1e-6)
 
         restype = batch.base_types.view(b, ws, len(base_to_idx)).argmax(-1)
         mask = batch.torsion_mask.view(b, ws, N_TORSIONS)
@@ -349,7 +263,7 @@ class PytorchLightningModule(pl.LightningModule):
     def _closure_loss(self, pred_x0: torch.Tensor, batch) -> torch.Tensor:
         return self._bridge_closure_metrics(pred_x0, batch)['closure_loss']
 
-    def _build_x(self, batch, x_t_latent, t_per_graph, sc):
+    def _build_x(self, batch, x_t_latent, log_sigma_per_graph, sc):
         b, ws = self._b_ws(batch)
         rel_o = batch.rel_origins.view(b, ws, 3)
         rel_R = batch.rel_frames.view(b, ws, 9)
@@ -363,20 +277,20 @@ class PytorchLightningModule(pl.LightningModule):
         bi = torch.arange(b, device=rel_o.device)
         pad = torch.zeros(
             b, ws,
-            N_TORSIONS_LATENT + self.time_emb_dim + N_TORSIONS + N_TORSIONS_LATENT,
+            N_LATENT + self.time_emb_dim + N_TORSIONS + N_LATENT,
             device=rel_o.device, dtype=rel_o.dtype,
         )
-        te_all = self.time_mlp(t_per_graph.float())
+        te_all = self.time_mlp(log_sigma_per_graph.float())
         o = 0
-        pad[bi, tidx, o:o + N_TORSIONS_LATENT] = x_t_latent
-        o += N_TORSIONS_LATENT
+        pad[bi, tidx, o:o + N_LATENT] = x_t_latent
+        o += N_LATENT
         pad[bi, tidx, o:o + self.time_emb_dim] = te_all
         o += self.time_emb_dim
         pad[bi, tidx, o:o + N_TORSIONS] = (
             batch.torsion_mask.view(b, ws, N_TORSIONS)[bi, tidx].float()
         )
         o += N_TORSIONS
-        pad[bi, tidx, o:o + N_TORSIONS_LATENT] = sc
+        pad[bi, tidx, o:o + N_LATENT] = sc
         return torch.cat([rel_o, rel_R, pair_o, pair_R, base, hp, ce, it, pad], dim=-1)
 
     def on_fit_start(self):
@@ -397,15 +311,19 @@ class PytorchLightningModule(pl.LightningModule):
             f'(sampling+RMSD может занять много времени — не путать с зависанием)',
         )
 
-    def forward_denoiser(self, batch, x_t_latent, t_per_graph, sc):
+    def forward_denoiser(self, batch, x_t_latent, log_sigma_per_graph, sc):
         b, _ = self._b_ws(batch)
-        x = self._build_x(batch, x_t_latent, t_per_graph, sc)
-        eps_all = self.denoiser(x)
-        bi = torch.arange(b, device=eps_all.device)
-        return eps_all[bi, batch.target_nt_idx.long()]
+        x = self._build_x(batch, x_t_latent, log_sigma_per_graph, sc)
+        score_all = self.denoiser(x)
+        bi = torch.arange(b, device=score_all.device)
+        return score_all[bi, batch.target_nt_idx.long()]
 
     def training_step(self, batch, batch_idx):
         theta0, m, tau0, tau_mk, _ = self._theta_mask_target(batch)
+        if theta0.shape[-1] != N_TORSIONS:
+            raise ValueError(
+                f'Expected torsions last dim {N_TORSIONS}, got {theta0.shape[-1]}',
+            )
         b = batch.num_graphs
         _, ws = self._b_ws(batch)
         _fitdbg(
@@ -414,36 +332,98 @@ class PytorchLightningModule(pl.LightningModule):
         )
         tau_safe = torch.where(
             tau_mk,
-            tau0.clamp(min=1e-3),
+            tau0.clamp(min=1e-6),
             torch.full_like(tau0, 0.611),
         )
-        t = torch.randint(0, self.hparams['num_timesteps'], (b,), device=self.device).long()
-        x_t, noise = self.q_sample(theta0, tau_safe, t)
-        mask_latent = self._expand_latent_mask(m, tau_mk)
+        log_tau_0 = torch.log(tau_safe.clamp(min=1e-6)).unsqueeze(-1)
+        t_unif = torch.rand((b,), device=self.device, dtype=torch.float32)
+        pert = perturb_torsions(
+            theta0,
+            log_tau_0,
+            t_unif,
+            float(self.hparams['angular_sigma_min']),
+            float(self.hparams['angular_sigma_max']),
+            float(self.hparams['tau_sigma_min']),
+            float(self.hparams['tau_sigma_max']),
+        )
+        log_tau_t = pert['log_tau_t']
+        x_t = torch.cat([pert['theta_t'], log_tau_t], dim=-1)
+        mask_theta = m.float()
+        mask_tau = tau_mk.float().unsqueeze(-1)
 
         sc = torch.zeros_like(x_t)
-        do_self_cond = torch.rand(1).item() < 0.5
-        if do_self_cond:
-            _fitdbg(f'train_step batch_idx={batch_idx}: self-conditioning forward (no_grad)')
-            with torch.no_grad():
-                pred_first = self.forward_denoiser(batch, x_t, t, sc)
-                sc = self._decode_epsilon_to_x0(x_t, pred_first, t).detach()
-            _fitdbg(f'train_step batch_idx={batch_idx}: self-conditioning done')
-
+        sigma_theta_b = sigma_schedule(
+            t_unif,
+            float(self.hparams['angular_sigma_min']),
+            float(self.hparams['angular_sigma_max']),
+        )
+        log_sigma_cond = torch.log(sigma_theta_b.clamp(min=1e-8))
         _fitdbg(f'train_step batch_idx={batch_idx}: forward_denoiser')
-        pred = self.forward_denoiser(batch, x_t, t, sc)
+        pred = self.forward_denoiser(batch, x_t, log_sigma_cond, sc)
         _fitdbg(f'train_step batch_idx={batch_idx}: forward_denoiser OK')
-        mse = (
-            (pred - noise) ** 2 * mask_latent.float()
-        ).sum() / mask_latent.float().sum().clamp(min=1.0)
-        pred_x0_cl = self._decode_epsilon_to_x0(x_t, pred, t)
-        _fitdbg(f'train_step batch_idx={batch_idx}: MSE ok, start closure_loss')
+        sw = str(self.hparams.get('score_loss_weighting', 'sigma2'))
+        lam_theta = (pert['sigma_theta'] ** 2) if sw == 'sigma2' else None
+        lam_tau = (pert['sigma_tau'] ** 2) if sw == 'sigma2' else None
+        mse_theta = weighted_score_mse(
+            pred[..., :N_TORSIONS],
+            pert['angular_score_target'],
+            mask_theta,
+            lam_theta,
+            weighting='sigma2' if sw == 'sigma2' else 'none',
+        )
+        mse_tau = weighted_score_mse(
+            pred[..., N_TORSIONS:N_LATENT],
+            pert['tau_score_target'],
+            mask_tau,
+            lam_tau,
+            weighting='sigma2' if sw == 'sigma2' else 'none',
+        )
+        tw = float(self.hparams.get('tau_loss_weight', 1.0))
+        mse = mse_theta + tw * mse_tau
+        pred_x0_cl = estimate_theta_tau_from_score_ve(
+            pert['theta_t'],
+            log_tau_t,
+            pred,
+            pert['sigma_theta'],
+            pert['sigma_tau'],
+        )
+        _fitdbg(f'train_step batch_idx={batch_idx}: score loss ok, start closure_loss')
         clo_metrics = self._bridge_closure_metrics(pred_x0_cl, batch)
         cl = clo_metrics['closure_loss']
         loss = mse + float(self.hparams.get('closure_loss_weight', 0.0)) * cl
         _fitdbg(f'train_step batch_idx={batch_idx}: closure_loss OK')
         self.log(
             'train_loss', mse,
+            on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
+        )
+        self.log(
+            'train/angular_score_loss', mse_theta,
+            on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
+        )
+        self.log(
+            'train/tau_score_loss', mse_tau,
+            on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
+        )
+        self.log(
+            'train/score_norm', pred.square().mean(),
+            on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
+        )
+        tgt = torch.cat(
+            [pert['angular_score_target'], pert['tau_score_target'].reshape(b, N_LATENT - N_TORSIONS)],
+            dim=-1,
+        )
+        self.log(
+            'train/target_score_norm', tgt.square().mean(),
+            on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
+        )
+        self.log(
+            'train/sigma_theta_mean',
+            pert['sigma_theta'].mean(),
+            on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
+        )
+        self.log(
+            'train/sigma_tau_mean',
+            pert['sigma_tau'].mean(),
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
         )
         self.log(
@@ -479,6 +459,12 @@ class PytorchLightningModule(pl.LightningModule):
     def on_train_epoch_end(self):
         self._write_epoch_scalars([
             'train_loss',
+            'train/angular_score_loss',
+            'train/tau_score_loss',
+            'train/score_norm',
+            'train/target_score_norm',
+            'train/sigma_theta_mean',
+            'train/sigma_tau_mean',
             'train_closure',
             'closure_loss',
             'closure_bond_loss',
@@ -525,26 +511,64 @@ class PytorchLightningModule(pl.LightningModule):
     def p_sample_loop(self, batch):
         theta0, _, _, _, _ = self._theta_mask_target(batch)
         b = batch.num_graphs
-        x_t = torch.randn(b, N_TORSIONS_LATENT, device=self.device)
+        dev = self.device
+        dtype = torch.float32
+        num_steps = int(self.hparams['num_timesteps'])
+        sig_theta = ve_sigma_grid(
+            float(self.hparams['angular_sigma_max']),
+            float(self.hparams['angular_sigma_min']),
+            num_steps,
+            device=torch.device(dev),
+            dtype=dtype,
+        )
+        sig_tau = ve_sigma_grid(
+            float(self.hparams['tau_sigma_max']),
+            float(self.hparams['tau_sigma_min']),
+            num_steps,
+            device=torch.device(dev),
+            dtype=dtype,
+        )
+        theta = wrap_angle(
+            torch.rand(b, N_TORSIONS, device=dev, dtype=dtype) * (2.0 * math.pi) - math.pi,
+        )
+        lt_scale = self.hparams.get('log_tau_init_noise_scale')
+        if lt_scale is None:
+            lt_scale = float(self.hparams['tau_sigma_max'])
+        logt = torch.randn(b, 1, device=dev, dtype=dtype) * float(lt_scale)
+        x_t = torch.cat([theta, logt], dim=-1)
         sc = torch.zeros_like(x_t)
-        for step in reversed(range(self.hparams['num_timesteps'])):
-            t = torch.full((b,), step, device=x_t.device, dtype=torch.long)
-            x_t, sc = self.p_sample(x_t, t, batch, sc)
+        zero = torch.tensor(0.0, device=dev, dtype=dtype)
+        n_sg = sig_theta.shape[0]
+        for i in range(n_sg):
+            sigma_cur_th = sig_theta[i]
+            sigma_next_th = sig_theta[i + 1] if i + 1 < n_sg else zero
+            sigma_cur_tau = sig_tau[i]
+            sigma_next_tau = sig_tau[i + 1] if i + 1 < n_sg else zero
+            log_s = torch.full(
+                (b,),
+                math.log(float(sigma_cur_th.clamp(min=1e-8))),
+                device=dev,
+                dtype=dtype,
+            )
+            pred = self.forward_denoiser(batch, x_t, log_s, sc)
+            theta, logt = reverse_ve_score_step(
+                x_t[..., :N_TORSIONS],
+                x_t[..., N_TORSIONS:N_LATENT],
+                pred,
+                sigma_cur_th,
+                sigma_next_th,
+                sigma_cur_tau,
+                sigma_next_tau,
+            )
+            x_t = torch.cat([theta, logt], dim=-1)
+            sc = torch.zeros_like(x_t)
             if not torch.isfinite(x_t).all():
-                x_t = torch.nan_to_num(x_t, nan=0.0, posinf=1.0, neginf=-1.0)
-            if not torch.isfinite(sc).all():
-                sc = torch.nan_to_num(sc, nan=0.0, posinf=1.0, neginf=-1.0)
-        pred_theta, pred_tau_m = self.decode_torsions(x_t)
+                x_t = torch.nan_to_num(x_t, nan=0.0, posinf=math.pi, neginf=-math.pi)
+                theta = wrap_angle(x_t[..., :N_TORSIONS])
+                logt = x_t[..., N_TORSIONS:N_LATENT]
+                x_t = torch.cat([theta, logt], dim=-1)
+        pred_theta, pred_tau_m = decode_torsions(x_t)
         return theta0, (pred_theta, pred_tau_m)
-
-    @torch.no_grad()
-    def p_sample(self, x_t, t, batch, sc):
-        pred_noise = self.forward_denoiser(batch, x_t, t, sc)
-        pred_x0 = self._decode_epsilon_to_x0(x_t, pred_noise, t)
-        model_mean, _, model_log_var = self.q_posterior_mean_variance(pred_x0, x_t, t)
-        noise = torch.randn_like(x_t) * (t > 0).float().unsqueeze(-1)
-        x_prev = model_mean + (0.5 * model_log_var).exp() * noise
-        return x_prev, pred_x0
 
     def _compute_rmsd_per_graph_local(
         self,
@@ -579,7 +603,7 @@ class PytorchLightningModule(pl.LightningModule):
         with torch.no_grad():
             pred_bb = build_backbone_from_torsions_torch(
                 pred_torsions.float(),
-                pred_tau_m.clamp(min=1e-3).float(),
+                pred_tau_m.clamp(min=1e-6).float(),
                 restype_idx,
                 o3_prev_local=o3_prev_input,
             )

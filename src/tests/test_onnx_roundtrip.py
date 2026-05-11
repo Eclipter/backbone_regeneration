@@ -30,7 +30,12 @@ class _DummyHParams(TypedDict):
     lr_scheduler_patience: int
     lr_scheduler_threshold: float
     lr_scheduler_cooldown: int
-    beta_schedule: str
+    angular_sigma_min: float
+    angular_sigma_max: float
+    tau_sigma_min: float
+    tau_sigma_max: float
+    score_loss_weighting: str
+    tau_loss_weight: float
     weight_decay: float
     closure_loss_weight: float
     closure_bond_weight: float
@@ -49,7 +54,12 @@ _DUMMY_HP: _DummyHParams = {
     'lr_scheduler_patience': 5,
     'lr_scheduler_threshold': 0.1,
     'lr_scheduler_cooldown': 2,
-    'beta_schedule': 'linear',
+    'angular_sigma_min': 1e-4,
+    'angular_sigma_max': 0.5,
+    'tau_sigma_min': 1e-4,
+    'tau_sigma_max': 0.5,
+    'score_loss_weighting': 'sigma2',
+    'tau_loss_weight': 1.0,
     'weight_decay': 0.01,
     'closure_loss_weight': 0.0,
     'closure_bond_weight': 1.0,
@@ -67,10 +77,10 @@ def _export(net, dummy_input, dest):
         (dummy_input,),
         dest,
         input_names=['node_features'],
-        output_names=['eps'],
+        output_names=['score'],
         dynamic_axes={
             'node_features': {0: 'B'},
-            'eps': {0: 'B'},
+            'score': {0: 'B'},
         },
         opset_version=17,
         do_constant_folding=True,
@@ -124,7 +134,7 @@ def test_onnx_valid(exported_onnx):
     inp = model_proto.graph.input[0]
     outp = model_proto.graph.output[0]
     assert inp.name == 'node_features'
-    assert outp.name == 'eps'
+    assert outp.name == 'score'
 
     assert inp.type.tensor_type.elem_type == onnx.TensorProto.FLOAT
     assert outp.type.tensor_type.elem_type == onnx.TensorProto.FLOAT
@@ -154,7 +164,7 @@ def test_numeric_match(exported_onnx, B, L):
         pt_out = net(x).numpy()
 
     sess = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
-    ort_out = np.asarray(sess.run(['eps'], {'node_features': x.numpy()})[0], dtype=np.float32)
+    ort_out = np.asarray(sess.run(['score'], {'node_features': x.numpy()})[0], dtype=np.float32)
     np.testing.assert_allclose(pt_out, ort_out, rtol=1e-4, atol=1e-5)
 
 
@@ -172,7 +182,7 @@ def test_output_shape(exported_onnx, B, L):
     _, onnx_path = exported_onnx
     sess = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
     x = torch.zeros(B, L, NODE_DIM)
-    out = np.asarray(sess.run(['eps'], {'node_features': x.numpy()})[0], dtype=np.float32)
+    out = np.asarray(sess.run(['score'], {'node_features': x.numpy()})[0], dtype=np.float32)
     assert out.shape == (B, L, N_TORSIONS_LATENT)
 
 
@@ -188,5 +198,7 @@ def test_export_uses_correct_node_dim(tmp_path):
 
     with open(json_path) as f:
         meta = json.load(f)
-    assert 'schedule_buffers' in meta
     assert 'hyperparameters' in meta
+    hp = meta['hyperparameters']
+    assert hp['score_loss_weighting'] == 'sigma2'
+    assert 'angular_sigma_min' in hp and 'tau_sigma_max' in hp and 'tau_loss_weight' in hp

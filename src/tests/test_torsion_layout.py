@@ -7,9 +7,12 @@ from pathlib import Path
 import pytest
 import torch
 
-from torsion_geometry import (
+from torsion_constants import (
+    N_LATENT,
     N_TORSIONS,
     N_TORSIONS_LATENT,
+)
+from torsion_geometry import (
     build_backbone_from_torsions,
     build_backbone_from_torsions_torch,
 )
@@ -21,13 +24,14 @@ _MODEL_PY = _SRC / 'model.py'
 
 def test_torsion_counts():
     assert N_TORSIONS == 7
-    assert N_TORSIONS_LATENT == 8
+    assert N_LATENT == 8
+    assert N_TORSIONS_LATENT == N_LATENT
 
 
-def test_model_denoiser_output_is_ntorsions_latent():
+def test_model_denoiser_output_is_n_latent():
     text = _MODEL_PY.read_text()
     assert re.search(
-        r'self\.out\s*=\s*nn\.Linear\(\s*hidden_dim\s*,\s*N_TORSIONS_LATENT\s*\)',
+        r'self\.out\s*=\s*nn\.Linear\(\s*hidden_dim\s*,\s*N_LATENT\s*\)',
         text,
     )
 

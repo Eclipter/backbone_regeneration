@@ -8,35 +8,20 @@ from typing import Optional
 import numpy as np
 import torch
 
-N_TORSIONS = 7
-# 0:α 1:β 2:γ 3:ε 4:ζ 5:χ 6:P   (backbone δ removed from generative set)
-
-# True = circular (S¹); used for circular-aware diffusion
-TORSION_IS_CIRCULAR = torch.tensor(
-    [True, True, True, True, True, True, True],
-    dtype=torch.bool,
-)  # α β γ ε ζ χ P
-TOR_ALPHA = 0
-TOR_BETA = 1
-TOR_GAMMA = 2
-TOR_EPS = 3
-TOR_ZETA = 4
-TOR_CHI = 5
-TOR_PUCKER_P = 6
-
-N_TORSIONS_LATENT = N_TORSIONS + 1  # 8: 7 angles + log τ_m
-
-
-def legacy_torsion8_to_new7(t_old: np.ndarray) -> np.ndarray:
-    """Convert legacy 8-vector (…,δ,…) to 7-vector by dropping index 3 (δ)."""
-    t_old = np.asarray(t_old)
-    if t_old.shape[-1] == N_TORSIONS:
-        return t_old
-    if t_old.shape[-1] != 8:
-        raise ValueError(
-            f'Expected last dim 7 or 8, got {t_old.shape[-1]}',
-        )
-    return np.concatenate([t_old[..., :3], t_old[..., 4:]], axis=-1)
+from torsion_constants import (
+    N_LATENT,
+    N_TORSIONS,
+    N_TORSIONS_LATENT,
+    TOR_ALPHA,
+    TOR_BETA,
+    TOR_CHI,
+    TOR_EPS,
+    TOR_GAMMA,
+    TOR_PUCKER_P,
+    TOR_ZETA,
+    TORSION_IS_CIRCULAR,
+    TORSION_NAMES,
+)
 
 
 def wrap_angle_rad(x):
@@ -332,7 +317,7 @@ def _get_template_tensors(device_str: str) -> dict:
     def _dr(tpl, a, b, c, d):
         return float(dihedral_rad(tpl[a], tpl[b], tpl[c], tpl[d]))
 
-    keys_3d = ['c1', 'o4', 'c4_ref']
+    keys_3d = ['c1', 'o4', 'c4_ref', 'chi_n', 'chi_c']
     keys_1d = [
         'bl_c2_c1', 'ba_o4_c1_c2',
         'bl_c3_c2', 'ba_c1_c2_c3',
@@ -356,6 +341,12 @@ def _get_template_tensors(device_str: str) -> dict:
         rows_3d['c1'].append(tpl["C1'"])
         rows_3d['o4'].append(tpl["O4'"])
         rows_3d['c4_ref'].append(tpl["C4'"])
+        if rt in ('A', 'G'):
+            rows_3d['chi_n'].append(tpl['N9'])
+            rows_3d['chi_c'].append(tpl['C4'])
+        else:
+            rows_3d['chi_n'].append(tpl['N1'])
+            rows_3d['chi_c'].append(tpl['C2'])
 
         rows_1d['bl_c2_c1'].append(_bl(tpl, "C2'", "C1'"))
         rows_1d['ba_o4_c1_c2'].append(_ba(tpl, "O4'", "C1'", "C2'"))
@@ -479,6 +470,27 @@ def _rodrigues_rotate_point_torch(
     )
 
 
+def _apply_chi_rotation_to_sugar_ring_torch(
+    ring: dict[str, torch.Tensor],
+    chi_target: torch.Tensor,
+    n_atom: torch.Tensor,
+    c_atom: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Align χ(O4', C1', N, base_C) with chi_target by rotating ring atoms around C1'→N."""
+    c1 = ring["C1'"]
+    o4 = ring["O4'"]
+    axis = n_atom - c1
+    axn = axis.norm(dim=-1, keepdim=True).clamp(min=_GEO_EPS)
+    u = axis / axn
+    chi_meas = dihedral_rad_torch(o4, c1, n_atom, c_atom)
+    dchi = wrap_dihedral_diff_torch(chi_target, chi_meas)
+    out = dict(ring)
+    for nm in ("O4'", "C2'", "C3'", "C4'"):
+        v = ring[nm] - c1
+        out[nm] = _rodrigues_rotate_point_torch(v, u, dchi) + c1
+    return out
+
+
 def build_sugar_ring_analytic_torch(
     chi: torch.Tensor,
     P: torch.Tensor,
@@ -488,11 +500,11 @@ def build_sugar_ring_analytic_torch(
     bond_lengths: Optional[dict] = None,
     bond_angles: Optional[dict] = None,
 ) -> dict[str, torch.Tensor]:
-    """Build sugar ring atoms in local base frame (χ reserved; ring anchors match template).
+    """Build sugar ring atoms in local base frame; χ orients the ring vs template base atoms.
 
     Returns O4', C1', C2', C3', C4' with shapes [..., 3].
     """
-    _ = bond_lengths, bond_angles, chi  # API compatibility; χ does not alter sugar-only coords here
+    _ = bond_lengths, bond_angles
     if P.shape != tau_m.shape or P.shape != restype_indices.shape:
         raise ValueError('P, tau_m, restype_indices must share the same leading shape.')
     if P.ndim == 0:
@@ -617,6 +629,11 @@ def build_sugar_ring_analytic_torch(
         "C4'": c4[idx, best],
         "O4'": o4,
     }
+    n_atom = tc['chi_n'][ri].reshape(B, 3)
+    c_atom = tc['chi_c'][ri].reshape(B, 3)
+    out = _apply_chi_rotation_to_sugar_ring_torch(
+        out, chi.reshape(B), n_atom, c_atom,
+    )
     return out
 
 
@@ -681,7 +698,7 @@ def add_o5_from_gamma_torch(
     restype_indices: Optional[torch.Tensor] = None,
     geometry: Optional[dict] = None,
 ) -> dict[str, torch.Tensor]:
-    """Place O5' using γ = O5'–C5'–C4'–C3' (NeRF chain, same bond/angle prior as legacy)."""
+    """Place O5' using γ = O5'–C5'–C4'–C3' (NeRF chain, same bond/angle prior as main decoder)."""
     _ = geometry
     c3 = atoms["C3'"]
     c4 = atoms["C4'"]
@@ -977,6 +994,31 @@ def build_backbone_from_torsions(
         nu0 - _HP,
     )
 
+    chi_tgt = float(torsions[TOR_CHI])
+    _o4n, _c1n, n_nm, c_nm = _chi_quads(restype)
+    _ = _o4n, _c1n
+    n_xyz = np.asarray(tpl[n_nm], dtype=np.float64).reshape(3)
+    c_xyz = np.asarray(tpl[c_nm], dtype=np.float64).reshape(3)
+    chi_meas = dihedral_rad(o4, c1, n_xyz, c_xyz)
+    dchi = float(wrap_angle_rad(chi_tgt - chi_meas))
+    ax = n_xyz - c1
+    la = float(np.linalg.norm(ax))
+    if la > 1e-10:
+        u_ax = ax / la
+
+        def _rot_vec(v: np.ndarray) -> np.ndarray:
+            vv = np.asarray(v, dtype=np.float64).reshape(3) - c1
+            co = np.cos(dchi)
+            si = np.sin(dchi)
+            vc = np.cross(u_ax, vv)
+            dp = float(np.dot(u_ax, vv))
+            return (vv * co + vc * si + u_ax * dp * (1.0 - co)) + c1
+
+        o4 = _rot_vec(o4)
+        c2 = _rot_vec(c2)
+        c3 = _rot_vec(c3)
+        c4 = _rot_vec(c4)
+
     psi_c5 = dihedral_rad(o4, tpl["C3'"], tpl["C4'"], tpl["C5'"])
     c5 = nerf_place(
         o4, c3, c4,
@@ -1051,187 +1093,6 @@ def build_backbone_from_torsions(
         for nm in ('P', 'OP1', 'OP2'):
             if nm in tpl:
                 out[nm] = tpl[nm].copy()
-
-    return out
-
-
-def build_backbone_from_torsions_legacy_torch(
-    torsions: 'torch.Tensor',          # [B, N_TORSIONS]
-    tau_m: 'torch.Tensor',             # [B]
-    restype_indices: 'torch.Tensor',   # [B] long, 0=A 1=C 2=G 3=T
-    o3_prev_local: Optional[torch.Tensor] = None,  # [B, 3] or None
-) -> dict[str, torch.Tensor]:
-    """Legacy NeRF sugar + template-ψ O3′ + α-only phosphate circle search (preserved for comparison)."""
-    import torch
-
-    B = torsions.shape[0]
-    dev = torsions.device
-    _HP = torch.pi / 2.0
-
-    tc = _get_template_tensors(str(dev))
-    ri = restype_indices  # [B]
-
-    # Anchor atoms from template (same for all samples of same restype)
-    c1 = tc['c1'][ri]      # [B, 3]
-    o4 = tc['o4'][ri]      # [B, 3]
-    c4_ref = tc['c4_ref'][ri]  # [B, 3]
-
-    # Torsions
-    alpha = torsions[:, TOR_ALPHA]
-    gamma = torsions[:, TOR_GAMMA]
-    P_rad = torsions[:, TOR_PUCKER_P]
-    tau_m_c = tau_m.clamp(min=1e-3)
-
-    # Altona-Sundaralingam puckering [B, 5]
-    offsets = torch.tensor(
-        [0., 4., 8., 2., 6.],
-        dtype=torch.float32, device=dev,
-    ) * (torch.pi / 5.0)
-    nus = tau_m_c.unsqueeze(-1) * torch.cos(
-        P_rad.unsqueeze(-1) + offsets.unsqueeze(0),
-    )
-    nu0, nu3, nu4 = nus[:, 3], nus[:, 1], nus[:, 2]
-
-    def bl(key):
-        return tc[key][ri]
-
-    def ba(key):
-        return tc[key][ri]
-
-    # Sugar ring — all NeRF calls are fully batched [B, 3]
-    c2 = nerf_place_torch(
-        c4_ref, o4, c1,
-        bl('bl_c2_c1'), ba('ba_o4_c1_c2'), nu3 - _HP,
-    )
-    c3 = nerf_place_torch(
-        o4, c1, c2,
-        bl('bl_c3_c2'), ba('ba_c1_c2_c3'), nu4 - _HP,
-    )
-    c4 = nerf_place_torch(
-        c1, c2, c3,
-        bl('bl_c4_c3'), ba('ba_c2_c3_c4'), nu0 - _HP,
-    )
-    c5 = nerf_place_torch(
-        o4, c3, c4,
-        bl('bl_c5_c4'), ba('ba_c3_c4_c5'),
-        tc['psi_c5'][ri] - _HP,
-    )
-    o5 = nerf_place_torch(
-        c3, c4, c5,
-        bl('bl_o5_c5'), ba('ba_c4_c5_o5'), gamma - _HP,
-    )
-    o3 = nerf_place_torch(
-        c5, c4, c3,
-        bl('bl_o3_c3'), ba('ba_c4_c3_o3'), tc['psi_o3'][ri] - _HP,
-    )
-
-    out = {
-        "C1'": c1, "C2'": c2, "C3'": c3, "C4'": c4,
-        "C5'": c5, "O4'": o4, "O3'": o3, "O5'": o5,
-    }
-
-    if o3_prev_local is None:
-        return out
-
-    o3p = o3_prev_local  # [B, 3]
-
-    # P placement via NeRF from O3'_prev
-    r_o3p = bl('bl_o3_p')  # |O3'−P|
-    l_po5 = bl('r_po3')  # |P−O5'|
-    theta_po3 = torch.full(
-        (B,),
-        float(np.deg2rad(119.0)),
-        dtype=torch.float32, device=dev,
-    )
-    p_built = nerf_place_torch(
-        c5, o5, o3p, r_o3p, theta_po3,
-        -alpha - _HP,
-    )  # [B, 3]
-
-    # Vectorized circle closure for feasible samples
-    d_o3_o5 = (o3p - o5).norm(dim=-1)  # [B]
-    feasible = (d_o3_o5 >= (r_o3p - l_po5).abs()) \
-        & (d_o3_o5 <= r_o3p + l_po5)
-
-    if feasible.any():
-        d_f = d_o3_o5[feasible]
-        o3f = o3p[feasible]
-        o5f = o5[feasible]
-        c5f = c5[feasible]
-        r_f = r_o3p[feasible]
-        l_f = l_po5[feasible]
-        alp_f = alpha[feasible]
-
-        a_coef = (r_f**2 - l_f**2 + d_f**2) / (2.0 * d_f)
-        h_val = (r_f**2 - a_coef**2).clamp(min=0.0).sqrt()
-        axis = (o5f - o3f) / (d_f.unsqueeze(-1) + 1e-12)
-        mid = o3f + a_coef.unsqueeze(-1) * axis
-
-        tmp = torch.zeros_like(axis)
-        tmp[:, 0] = 1.0
-        use_y = axis[:, 0].abs() >= 0.9
-        tmp[use_y, 0] = 0.0
-        tmp[use_y, 1] = 1.0
-        v1 = torch.linalg.cross(tmp, axis)
-        v1 = v1 / (v1.norm(dim=-1, keepdim=True) + 1e-12)
-        v2 = torch.linalg.cross(axis, v1)
-
-        N_SAMP = 360
-        ts = torch.linspace(
-            0, 2 * torch.pi, N_SAMP,
-            dtype=torch.float32, device=dev,
-        )
-        p_cands = (
-            mid.unsqueeze(1)
-            + h_val[:, None, None]
-            * (
-                torch.cos(ts)[None, :, None] * v1.unsqueeze(1)
-                + torch.sin(ts)[None, :, None] * v2.unsqueeze(1)
-            )
-        )
-
-        def _batch_dihedral(p0, p1, p2, p3):
-            b1 = p1 - p0.unsqueeze(1)
-            b2 = p2.unsqueeze(1) - p1
-            b3 = p3.unsqueeze(1) - p2.unsqueeze(1)
-            n1 = torch.linalg.cross(b1, b2)
-            n2 = torch.linalg.cross(b2, b3)
-            b2u = b2 / (b2.norm(dim=-1, keepdim=True) + 1e-12)
-            m1 = torch.linalg.cross(
-                n1 / (n1.norm(dim=-1, keepdim=True) + 1e-12),
-                b2u,
-            )
-            n1u = n1 / (n1.norm(dim=-1, keepdim=True) + 1e-12)
-            n2u = n2 / (n2.norm(dim=-1, keepdim=True) + 1e-12)
-            x = (n1u * n2u).sum(-1)
-            y = (m1 * n2u).sum(-1)
-            return torch.atan2(y, x)
-
-        dihed = _batch_dihedral(o3f, p_cands, o5f, c5f)
-        err = (dihed - alp_f.unsqueeze(-1)).remainder(2 * torch.pi)
-        err = torch.where(err > torch.pi, 2 * torch.pi - err, err)
-        best = err.argmin(dim=-1)
-        p_closed = p_cands[
-            torch.arange(p_cands.shape[0], device=dev),
-            best,
-        ]
-
-        p_built = p_built.clone()
-        p_built[feasible] = p_closed
-
-    op1 = nerf_place_torch(
-        o3p, o5, p_built,
-        bl('bl_op1'), ba('ang_op1'),
-        tc['psi_op1'][ri] - _HP,
-    )
-    op2 = nerf_place_torch(
-        o3p, o5, p_built,
-        bl('bl_op2'), ba('ang_op2'),
-        tc['psi_op2'][ri] - _HP,
-    )
-    out['P'] = p_built
-    out['OP1'] = op1
-    out['OP2'] = op2
 
     return out
 
@@ -1394,10 +1255,11 @@ def build_batch_window_backbone_from_torsions_torch(
         if torsion_mask is None:
             we = wz = wa = wb = 1.0
         else:
-            we = torsion_mask[idx, k - 1, TOR_EPS].to(dtype=dtype)
-            wz = torsion_mask[idx, k - 1, TOR_ZETA].to(dtype=dtype)
-            wa = torsion_mask[idx, k, TOR_ALPHA].to(dtype=dtype)
-            wb = torsion_mask[idx, k, TOR_BETA].to(dtype=dtype)
+            # Scalar floats for closure API typing (mask values are 0/1).
+            we = float(torsion_mask[idx, k - 1, TOR_EPS])
+            wz = float(torsion_mask[idx, k - 1, TOR_ZETA])
+            wa = float(torsion_mask[idx, k, TOR_ALPHA])
+            wb = float(torsion_mask[idx, k, TOR_BETA])
 
         phosph = close_phosphate_bridge_multi_torch(
             prev_loc,

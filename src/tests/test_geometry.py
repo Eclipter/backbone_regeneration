@@ -21,15 +21,15 @@ from torsion_geometry import (
 )
 
 
+from wrapped_score_diffusion import decode_torsions, encode_torsions, wrap_angle
+
+
 def _encode(theta: torch.Tensor, tau_m: torch.Tensor) -> torch.Tensor:
-    log_tau = torch.log(tau_m.clamp(min=1e-3)).unsqueeze(-1)
-    return torch.cat([theta, log_tau], dim=-1)
+    return encode_torsions(theta, tau_m)
 
 
 def _decode(latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    theta = latent[..., :N_TORSIONS]
-    tau_m = torch.exp(latent[..., -1])
-    return theta, tau_m
+    return decode_torsions(latent)
 
 
 def _apply_inf_mask(sample_data: Data):
@@ -98,7 +98,7 @@ def test_tau_m_encode_decode_roundtrip():
     tau = torch.exp(torch.randn(4, generator=rng) * 0.1 + 0.2)
     z = _encode(theta, tau)
     th2, t2 = _decode(z)
-    assert torch.allclose(th2, theta, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(th2, wrap_angle(theta), atol=1e-5, rtol=1e-5)
     assert torch.allclose(t2, tau, atol=1e-4, rtol=1e-4)
 
 

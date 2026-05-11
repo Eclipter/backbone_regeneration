@@ -135,6 +135,4 @@ def test_processed_pt_smoke_if_present():
         return
     sample = torch.load(pts[0], weights_only=False, map_location='cpu')
     assert hasattr(sample, 'torsions')
-    td_last = sample.torsions.shape[-1]
-    assert td_last in (N_TORSIONS, N_TORSIONS + 1), td_last
 

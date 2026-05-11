@@ -1,3 +1,5 @@
+import math
+
 # Base config: applied to every run. Change values here to affect all experiments at once
 BASE = dict(
     HIDDEN_DIM=256,  # Must be divisible by NUM_HEADS
@@ -16,13 +18,18 @@ BASE = dict(
     SWA_LR=0.1,
     SWA_EPOCH_START=40,
     NUM_EPOCHS=50,
-    BETA_SCHEDULE='linear',  # 'linear' | 'cosine'
-    CLOSURE_LOSS_WEIGHT=1.0,
+    ANGULAR_SIGMA_MIN=0.01 * math.pi,
+    ANGULAR_SIGMA_MAX=math.pi,
+    TAU_SIGMA_MIN=0.01 * math.pi,
+    TAU_SIGMA_MAX=math.pi,
+    SCORE_LOSS_WEIGHTING='sigma2',
+    TAU_LOSS_WEIGHT=1.0,
+    CLOSURE_LOSS_WEIGHT=0.0,
     CLOSURE_BOND_WEIGHT=1.0,
     CLOSURE_ANGLE_WEIGHT=1.0,
     CLOSURE_TORSION_WEIGHT=1.0,
     TORCH_COMPILE=True,
-    START_FROM_LAST_CKPT=True
+    START_FROM_LAST_CKPT=True,
 )
 
 # One entry = one experiment. Put ONLY the deltas from BASE here
@@ -43,6 +50,5 @@ SEED = 42
 # Decrease batch size
 # Experiment with large window sizes
 # Experiment with edge weight
-# Try DDIM
 # Distillate like in paper: https://openreview.net/forum?id=8NuN5UzXLC
 ########################

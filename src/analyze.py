@@ -29,7 +29,7 @@ import utils
 from dataset import DNADataModule, PyGDataset
 from model import PytorchLightningModule
 from predict import predict_backbone, write_structure
-from torsion_geometry import N_TORSIONS, N_TORSIONS_LATENT, build_backbone_from_torsions
+from torsion_geometry import build_backbone_from_torsions
 
 # Angle channel order in tensors: α, β, γ, ε, ζ, χ, P (no backbone δ; τ_m is separate / log τ in latent).
 TOR_NAMES = ['α', 'β', 'γ', 'ε', 'ζ', 'χ', 'P']
@@ -390,7 +390,7 @@ hidden_dim = int(hp['hidden_dim'])
 num_layers = int(hp['num_layers'])
 time_emb_dim = 32
 node_dim = int(model.node_dim)
-torsion_latent_dim = N_TORSIONS_LATENT
+torsion_latent_dim = N_LATENT
 
 
 def draw_box(x, y, width, height, title, desc, color):
@@ -456,8 +456,8 @@ draw_box(
     r'Входное окно ($x_t$)',
     '• rel_origins, rel_frames\n'
     '• base_type, has_pair, chain_end_class, is_target\n'
-    f'• зашумленный торсионный латент ({torsion_latent_dim})\n'
-    f'• embedding шага ({time_emb_dim}), torsion mask, self-conditioning',
+    f'• зашумлённый латент [θ (7), log τ_m] ({N_LATENT})\n'
+    f'• embedding log σ ({time_emb_dim}), маска торсионов (без self-conditioning)',
     palette['input'],
 )
 draw_arrow(main_x + main_width / 2, input_y - MAX_Y * 0.01, main_x + main_width / 2, input_y - MAX_Y * 0.04)
@@ -484,7 +484,7 @@ draw_box(
     '• rel_origin (3) + rel_frame (9)\n'
     '• тип основания (4) + has pair (1)\n'
     '• chain-end class (3) + is_target (1)\n'
-    f'• торсионный латент ({torsion_latent_dim}) + time ({time_emb_dim})',
+    f'• торсионный латент ({torsion_latent_dim}) + log σ ({time_emb_dim})',
     palette['detail'],
 )
 draw_arrow(detail_x, prep_y + main_height * 0.55, main_x + main_width * 1.04, prep_y + main_height * 0.55)
@@ -522,9 +522,8 @@ draw_box(
     main_width,
     main_height,
     'Голова предсказания',
-    f'Linear({hidden_dim} → {N_TORSIONS_LATENT})\n'
-    '• шум в sin/cos торсионном латенте\n'
-    '• log τ_m',
+    f'Linear({hidden_dim} → {N_LATENT})\n'
+    '• predicted score (∇ log noisy density) для 7 углов и log τ_m',
     palette['output'],
 )
 draw_arrow(main_x + main_width / 2, output_y - MAX_Y * 0.01, main_x + main_width / 2, output_y - MAX_Y * 0.04)
@@ -535,9 +534,10 @@ draw_box(
     main_width,
     main_height,
     'Обратная диффузия',
-    f'• {int(hp["num_timesteps"])} шагов DDPM\n'
-    f'• beta schedule: {hp["beta_schedule"]}\n'
-    '• sampled torsions -> восстановление остова',
+    f'• {int(hp["num_timesteps"])} шагов reverse VE score\n'
+    f'• θ: σ∈[{hp.get("angular_sigma_min", "?")}, {hp.get("angular_sigma_max", "?")}], '
+    f'log τ: σ∈[{hp.get("tau_sigma_min", "?")}, {hp.get("tau_sigma_max", "?")}]\n'
+    '• ancestral sampler по углам с wrap + канал log τ_m',
     palette['detail'],
 )
 
@@ -573,7 +573,7 @@ ax.add_patch(FancyArrowPatch(
 ax.text(
     loop_x - 0.2,
     MAX_Y / 2,
-    r'$x_t \rightarrow x_{t-1}$' + '\n' + r'$(T \text{ шагов DDPM})$',
+    r'$x_t \rightarrow x_{t-\Delta}$' + '\n' + r'$(T \text{ шагов reverse VE score})$',
     fontsize=15,
     rotation=90,
     ha='center',

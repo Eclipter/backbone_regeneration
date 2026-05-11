@@ -1,10 +1,9 @@
 """Tests for phosphate bridge closure loss (bonds, angles, wrapped torsions)."""
 
-from __future__ import annotations
-
 import math
 from pathlib import Path
 
+import pytest
 import torch
 
 from bridge_closure import compute_bridge_closure_loss
@@ -125,6 +124,23 @@ def test_delta_absent_from_closure_loss():
     text = Path(__file__).resolve().parents[1] / 'bridge_closure.py'
     low = text.read_text().lower()
     assert 'delta' not in low
+
+
+def test_bridge_closure_valid_pair_mask_wrong_shape_raises():
+    bb, tors, mask, valid, ri = _ideal_bridge_bb_and_targets()
+    bad = torch.ones(1, 2, dtype=torch.bool)
+    with pytest.raises(ValueError, match='valid_pair_mask'):
+        compute_bridge_closure_loss(bb, tors, mask, valid, ri, valid_pair_mask=bad)
+
+
+def test_bridge_closure_ignores_pairs_masked_by_valid_pair_mask():
+    bb, tors, mask, valid, ri = _ideal_bridge_bb_and_targets()
+    pm_zero = torch.zeros(1, 1, dtype=torch.bool, device=bb.device)
+    out = compute_bridge_closure_loss(bb, tors, mask, valid, ri, valid_pair_mask=pm_zero)
+    assert float(out['closure_loss']) == 0.0
+    pm_one = torch.ones(1, 1, dtype=torch.bool, device=bb.device)
+    out_one = compute_bridge_closure_loss(bb, tors, mask, valid, ri, valid_pair_mask=pm_one)
+    assert float(out_one['closure_valid_bridge_fraction']) > 0.0
 
 
 def test_processed_pt_smoke_if_present():

@@ -1,8 +1,5 @@
 import math
-import os
 import os.path as osp
-import sys
-import time
 
 import lightning.pytorch as pl
 import torch
@@ -11,6 +8,7 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from bridge_closure import compute_bridge_closure_loss
+from torsion_constants import LOG_TAU_M_MAX, LOG_TAU_M_MIN, TAU_M_MAX, TAU_M_MIN
 from torsion_geometry import (
     N_LATENT,
     N_TORSIONS,
@@ -30,28 +28,6 @@ from wrapped_score_diffusion import (
 
 # Same dimension constant name as in ONNX companion JSON (`N_TORSIONS_LATENT`).
 N_TORSIONS_LATENT = N_LATENT
-
-
-def _fitdbg(msg: str) -> None:
-    """Stdout probe for hangs under DDP / heavy steps. Off: FITDBG=0 (or false/off/no).
-
-    Extra GPU sync before each line: FITDBG_SYNC_CUDA=1.
-    """
-    flag = os.environ.get('FITDBG', '1').strip().lower()
-    if flag in ('0', 'false', 'no', 'off'):
-        return
-    if (
-        os.environ.get('FITDBG_SYNC_CUDA', '').lower() in ('1', 'true', 'yes')
-        and torch.cuda.is_available()
-    ):
-        torch.cuda.synchronize()
-    lr = os.environ.get('LOCAL_RANK', '?')
-    rk = os.environ.get('RANK', '?')
-    sys.stderr.write(
-        f'[fitdbg t={time.monotonic():.3f}s pid={os.getpid()} '
-        f'RANK={rk} LOCAL_RANK={lr}] {msg}\n',
-    )
-    sys.stderr.flush()
 
 
 class SinusoidalPositionalEmbeddings(nn.Module):
@@ -103,6 +79,35 @@ class TorsionDenoiser(nn.Module):
         return self.out(h)
 
 
+_N = ('torsions', 'tau_m', 'bb_xyz_world', 'nt_origins_world', 'nt_frames_world', 'base_types',
+       'torsion_mask', 'target_nt_idx')
+
+
+def _require_window_batch_fields(batch) -> None:
+    for name in _N:
+        if not hasattr(batch, name):
+            raise ValueError(
+                f'Batch missing `{name}` for window-level geometry (wrapped torsions layout). '
+                'Regenerate the processed dataset.',
+            )
+
+
+def _zero_bridge_closure_metrics(pred_x0: torch.Tensor) -> dict[str, torch.Tensor]:
+    z = pred_x0.sum() * 0.0
+    zf = pred_x0.new_zeros(())
+    return {
+        'closure_loss': z,
+        'closure_bond_loss': z,
+        'closure_angle_loss': z,
+        'closure_torsion_loss': z,
+        'closure_valid_bridge_fraction': zf,
+        'closure_fail_rate': zf,
+        'bridge_bond_mae': zf,
+        'bridge_angle_mae_deg': zf,
+        'bridge_torsion_mae_deg': zf,
+    }
+
+
 class PytorchLightningModule(pl.LightningModule):
     def __init__(
         self, hidden_dim, num_heads, num_layers, num_timesteps, batch_size, lr,
@@ -115,6 +120,8 @@ class PytorchLightningModule(pl.LightningModule):
         closure_bond_weight: float = 1.0,
         closure_angle_weight: float = 1.0,
         closure_torsion_weight: float = 1.0,
+        log_closure_metrics_train: bool = False,
+        log_closure_metrics_val: bool = True,
         log_tau_init_noise_scale: float | None = None,
     ):
         super().__init__()
@@ -196,17 +203,13 @@ class PytorchLightningModule(pl.LightningModule):
         tors_m = batch.torsions.view(b, ws, N_TORSIONS).clone()
         tau_m = batch.tau_m.view(b, ws).clone()
         tors_m[bi, ti] = pred_theta
-        tau_m[bi, ti] = pred_tau_m.clamp(min=1e-6)
+        tau_m[bi, ti] = pred_tau_m.clamp(min=TAU_M_MIN, max=TAU_M_MAX)
 
         restype = batch.base_types.view(b, ws, len(base_to_idx)).argmax(-1)
         mask = batch.torsion_mask.view(b, ws, N_TORSIONS)
         origins = batch.nt_origins_world.view(b, ws, 3)
         frames = batch.nt_frames_world.view(b, ws, 3, 3)
 
-        _fitdbg(
-            f'_bridge_closure_metrics: build_batch_window_backbone B={b} W={ws}',
-        )
-        t_bb = time.perf_counter()
         bb = build_batch_window_backbone_from_torsions_torch(
             tors_m.float(),
             tau_m.float(),
@@ -214,9 +217,6 @@ class PytorchLightningModule(pl.LightningModule):
             origins.float(),
             frames.float(),
             mask,
-        )
-        _fitdbg(
-            f'_bridge_closure_metrics: backbone done in {time.perf_counter() - t_bb:.3f}s',
         )
 
         n_bb = len(backbone_atoms)
@@ -238,8 +238,13 @@ class PytorchLightningModule(pl.LightningModule):
             & torch.isfinite(bb_gt[..., j_c5]).all(dim=-1)
             & torch.isfinite(bb_gt[..., j_c4]).all(dim=-1)
         )
-        is_edge = batch.is_chain_edge_nt.view(b, ws)
-        valid_nt_mask = (~is_edge) & fin_prev & fin_next
+        valid_nt_mask = fin_prev & fin_next
+
+        pair_mask = torch.zeros(b, ws - 1, dtype=torch.bool, device=pred_x0.device)
+        mk_l = ti > 0
+        pair_mask[bi[mk_l], ti[mk_l] - 1] = True
+        mk_r = ti < ws - 1
+        pair_mask[bi[mk_r], ti[mk_r]] = True
 
         same_chain_mask = None
 
@@ -256,6 +261,7 @@ class PytorchLightningModule(pl.LightningModule):
             valid_nt_mask,
             restype.long(),
             same_chain_mask,
+            valid_pair_mask=pair_mask,
             weights=weights,
             grad_prop_tensor=pred_theta,
         )
@@ -293,30 +299,18 @@ class PytorchLightningModule(pl.LightningModule):
         pad[bi, tidx, o:o + N_LATENT] = sc
         return torch.cat([rel_o, rel_R, pair_o, pair_R, base, hp, ce, it, pad], dim=-1)
 
-    def on_fit_start(self):
-        ws = int(self.trainer.world_size) if self.trainer else -1
-        _fitdbg(
-            f'on_fit_start world_size={ws} '
-            f'num_nodes={getattr(self.trainer, "num_nodes", "?")}',
-        )
-
-    def on_train_epoch_start(self):
-        ep = int(getattr(self, 'current_epoch', -1))
-        _fitdbg(f'on_train_epoch_start epoch={ep}')
-
-    def on_validation_epoch_start(self):
-        ep = int(getattr(self, 'current_epoch', -1))
-        _fitdbg(
-            f'on_validation_epoch_start epoch={ep} '
-            f'(sampling+RMSD может занять много времени — не путать с зависанием)',
-        )
-
     def forward_denoiser(self, batch, x_t_latent, log_sigma_per_graph, sc):
         b, _ = self._b_ws(batch)
         x = self._build_x(batch, x_t_latent, log_sigma_per_graph, sc)
         score_all = self.denoiser(x)
         bi = torch.arange(b, device=score_all.device)
         return score_all[bi, batch.target_nt_idx.long()]
+
+    def _should_compute_closure_train(self) -> bool:
+        return (
+            float(self.hparams.get('closure_loss_weight', 0.0)) > 0.0
+            or bool(self.hparams.get('log_closure_metrics_train', False))
+        )
 
     def training_step(self, batch, batch_idx):
         theta0, m, tau0, tau_mk, _ = self._theta_mask_target(batch)
@@ -325,17 +319,12 @@ class PytorchLightningModule(pl.LightningModule):
                 f'Expected torsions last dim {N_TORSIONS}, got {theta0.shape[-1]}',
             )
         b = batch.num_graphs
-        _, ws = self._b_ws(batch)
-        _fitdbg(
-            f'train_step batch_idx={batch_idx} num_graphs={b} ws={ws} '
-            f'device={batch.torsions.device}',
-        )
         tau_safe = torch.where(
             tau_mk,
-            tau0.clamp(min=1e-6),
+            tau0.clamp(min=TAU_M_MIN, max=TAU_M_MAX),
             torch.full_like(tau0, 0.611),
         )
-        log_tau_0 = torch.log(tau_safe.clamp(min=1e-6)).unsqueeze(-1)
+        log_tau_0 = torch.log(tau_safe.clamp(min=TAU_M_MIN, max=TAU_M_MAX)).unsqueeze(-1)
         t_unif = torch.rand((b,), device=self.device, dtype=torch.float32)
         pert = perturb_torsions(
             theta0,
@@ -358,9 +347,7 @@ class PytorchLightningModule(pl.LightningModule):
             float(self.hparams['angular_sigma_max']),
         )
         log_sigma_cond = torch.log(sigma_theta_b.clamp(min=1e-8))
-        _fitdbg(f'train_step batch_idx={batch_idx}: forward_denoiser')
         pred = self.forward_denoiser(batch, x_t, log_sigma_cond, sc)
-        _fitdbg(f'train_step batch_idx={batch_idx}: forward_denoiser OK')
         sw = str(self.hparams.get('score_loss_weighting', 'sigma2'))
         lam_theta = (pert['sigma_theta'] ** 2) if sw == 'sigma2' else None
         lam_tau = (pert['sigma_tau'] ** 2) if sw == 'sigma2' else None
@@ -387,11 +374,12 @@ class PytorchLightningModule(pl.LightningModule):
             pert['sigma_theta'],
             pert['sigma_tau'],
         )
-        _fitdbg(f'train_step batch_idx={batch_idx}: score loss ok, start closure_loss')
-        clo_metrics = self._bridge_closure_metrics(pred_x0_cl, batch)
+        if self._should_compute_closure_train():
+            clo_metrics = self._bridge_closure_metrics(pred_x0_cl, batch)
+        else:
+            clo_metrics = _zero_bridge_closure_metrics(pred_x0_cl)
         cl = clo_metrics['closure_loss']
         loss = mse + float(self.hparams.get('closure_loss_weight', 0.0)) * cl
-        _fitdbg(f'train_step batch_idx={batch_idx}: closure_loss OK')
         self.log(
             'train_loss', mse,
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
@@ -445,16 +433,7 @@ class PytorchLightningModule(pl.LightningModule):
                 key, clo_metrics[key],
                 on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
             )
-        _fitdbg(
-            f'train_step batch_idx={batch_idx}: logged metrics; return loss={float(loss.detach())}',
-        )
         return loss
-
-    def on_train_batch_end(self, outputs, batch, batch_idx):
-        _fitdbg(
-            f'on_train_batch_end batch_idx={batch_idx} '
-            f'(шаг Lightning после backward; см. следующий batch или val)',
-        )
 
     def on_train_epoch_end(self):
         self._write_epoch_scalars([
@@ -535,6 +514,7 @@ class PytorchLightningModule(pl.LightningModule):
         if lt_scale is None:
             lt_scale = float(self.hparams['tau_sigma_max'])
         logt = torch.randn(b, 1, device=dev, dtype=dtype) * float(lt_scale)
+        logt = logt.clamp(LOG_TAU_M_MIN, LOG_TAU_M_MAX)
         x_t = torch.cat([theta, logt], dim=-1)
         sc = torch.zeros_like(x_t)
         zero = torch.tensor(0.0, device=dev, dtype=dtype)
@@ -576,7 +556,12 @@ class PytorchLightningModule(pl.LightningModule):
         pred_tau_m: torch.Tensor,
         batch,
     ) -> torch.Tensor:
-        from torsion_geometry import build_backbone_from_torsions_torch
+        _require_window_batch_fields(batch)
+        if batch.torsions.shape[-1] != N_TORSIONS:
+            raise ValueError(
+                f'Expected batch.torsions last dim {N_TORSIONS} (wrapped layout); '
+                f'got {batch.torsions.shape[-1]}. Regenerate the processed dataset.',
+            )
 
         b, ws = self._b_ws(batch)
         ti = batch.target_nt_idx.long()
@@ -590,23 +575,26 @@ class PytorchLightningModule(pl.LightningModule):
         frames = batch.nt_frames_world.view(b, ws, 3, 3)[bi, ti]
         gt_local = (gt_bb_world - origins.unsqueeze(1)) @ frames
 
-        o3_prev = batch.o3_prev_local.view(b, ws, 3)[bi, ti]
-        o3_valid = batch.o3_prev_valid.view(b, ws)[bi, ti]
+        theta_w = batch.torsions.view(b, ws, N_TORSIONS).clone()
+        tau_w = batch.tau_m.view(b, ws).clone()
+        theta_w[bi, ti] = pred_torsions.float()
+        tau_w[bi, ti] = pred_tau_m.clamp(min=TAU_M_MIN, max=TAU_M_MAX).float()
 
-        base_onehot = batch.base_types.view(b, ws, len(base_to_idx))[bi, ti]
-        restype_idx = base_onehot.argmax(dim=-1)
+        restype = batch.base_types.view(b, ws, len(base_to_idx)).argmax(-1)
+        mask = batch.torsion_mask.view(b, ws, N_TORSIONS)
+        origins_w = batch.nt_origins_world.view(b, ws, 3)
+        frames_w = batch.nt_frames_world.view(b, ws, 3, 3)
 
-        o3_prev_input = torch.where(
-            o3_valid.unsqueeze(-1), o3_prev, torch.zeros_like(o3_prev),
+        coords_w = build_batch_window_backbone_from_torsions_torch(
+            theta_w,
+            tau_w,
+            restype.long(),
+            origins_w.float(),
+            frames_w.float(),
+            mask,
         )
-
-        with torch.no_grad():
-            pred_bb = build_backbone_from_torsions_torch(
-                pred_torsions.float(),
-                pred_tau_m.clamp(min=1e-6).float(),
-                restype_idx,
-                o3_prev_local=o3_prev_input,
-            )
+        pred_bb_world = coords_w[bi, ti]
+        pred_local = (pred_bb_world - origins.unsqueeze(1)) @ frames
 
         j1 = backbone_atoms.index('OP1')
         j2 = backbone_atoms.index('OP2')
@@ -616,9 +604,7 @@ class PytorchLightningModule(pl.LightningModule):
         for j, nm in enumerate(backbone_atoms):
             if nm in ('OP1', 'OP2'):
                 continue
-            if nm not in pred_bb:
-                continue
-            pred_xyz = pred_bb[nm].to(dtype=torch.float64)
+            pred_xyz = pred_local[:, j, :].to(dtype=torch.float64)
             gt_xyz = gt_local[:, j, :].to(dtype=torch.float64)
             valid = torch.isfinite(pred_xyz).all(dim=-1) & torch.isfinite(gt_xyz).all(
                 dim=-1,
@@ -628,24 +614,23 @@ class PytorchLightningModule(pl.LightningModule):
             contrib = contrib + sq * valid.to(dtype=torch.float64)
             count = count + valid.to(dtype=torch.float64)
 
-        if 'OP1' in pred_bb and 'OP2' in pred_bb:
-            p1 = pred_bb['OP1'].to(dtype=torch.float64)
-            p2 = pred_bb['OP2'].to(dtype=torch.float64)
-            g1 = gt_local[:, j1, :].to(dtype=torch.float64)
-            g2 = gt_local[:, j2, :].to(dtype=torch.float64)
-            v_op = (
-                torch.isfinite(p1).all(dim=-1)
-                & torch.isfinite(p2).all(dim=-1)
-                & torch.isfinite(g1).all(dim=-1)
-                & torch.isfinite(g2).all(dim=-1)
-            )
-            d1s, d2s = p1 - g1, p2 - g2
-            d1w, d2w = p1 - g2, p2 - g1
-            d_str = torch.einsum('bi,bi->b', d1s, d1s) + torch.einsum('bi,bi->b', d2s, d2s)
-            d_swp = torch.einsum('bi,bi->b', d1w, d1w) + torch.einsum('bi,bi->b', d2w, d2w)
-            op_sq = torch.minimum(d_str, d_swp) * 0.5
-            contrib = contrib + op_sq * v_op.to(dtype=torch.float64)
-            count = count + v_op.to(dtype=torch.float64)
+        p1 = pred_local[:, j1, :].to(dtype=torch.float64)
+        p2 = pred_local[:, j2, :].to(dtype=torch.float64)
+        g1 = gt_local[:, j1, :].to(dtype=torch.float64)
+        g2 = gt_local[:, j2, :].to(dtype=torch.float64)
+        v_op = (
+            torch.isfinite(p1).all(dim=-1)
+            & torch.isfinite(p2).all(dim=-1)
+            & torch.isfinite(g1).all(dim=-1)
+            & torch.isfinite(g2).all(dim=-1)
+        )
+        d1s, d2s = p1 - g1, p2 - g2
+        d1w, d2w = p1 - g2, p2 - g1
+        d_str = torch.einsum('bi,bi->b', d1s, d1s) + torch.einsum('bi,bi->b', d2s, d2s)
+        d_swp = torch.einsum('bi,bi->b', d1w, d1w) + torch.einsum('bi,bi->b', d2w, d2w)
+        op_sq = torch.minimum(d_str, d_swp) * 0.5
+        contrib = contrib + op_sq * v_op.to(dtype=torch.float64)
+        count = count + v_op.to(dtype=torch.float64)
 
         out = torch.full((b,), float('nan'), device=dev, dtype=torch.float64)
         ok = count > 0
@@ -656,12 +641,9 @@ class PytorchLightningModule(pl.LightningModule):
         self, prefix: str, pred_theta: torch.Tensor, pred_tau_m: torch.Tensor, batch,
     ):
         """Accumulate per-step RMSD (all / central / edge) for later TensorBoard write."""
-        _fitdbg(f'_log_rmsd `{prefix}`: start CPU geometry over B={pred_theta.shape[0]}')
-        t0 = time.perf_counter()
         per_graph_rmsd = self._compute_rmsd_per_graph_local(
             pred_theta, pred_tau_m, batch,
         )
-        _fitdbg(f'_log_rmsd `{prefix}`: RMSD compute {time.perf_counter() - t0:.3f}s')
         is_edge = self._is_edge_target(batch)
         finite = torch.isfinite(per_graph_rmsd)
 
@@ -678,17 +660,8 @@ class PytorchLightningModule(pl.LightningModule):
                 )
 
     def validation_step(self, batch, batch_idx):
-        b = batch.num_graphs
-        nt = int(self.hparams['num_timesteps'])
-        _fitdbg(
-            f'validation_step batch_idx={batch_idx} num_graphs={b} '
-            f'sampling_steps={nt} (тяжёлый проход)',
-        )
-        _fitdbg(f'validation_step batch_idx={batch_idx}: p_sample_loop …')
         _, (pred_theta, pred_tau_m) = self.p_sample_loop(batch)
-        _fitdbg(f'validation_step batch_idx={batch_idx}: p_sample_loop OK → RMSD')
         self._log_rmsd('val', pred_theta, pred_tau_m, batch)
-        _fitdbg(f'validation_step batch_idx={batch_idx}: готово')
 
     def test_step(self, batch, _):
         _, (pred_theta, pred_tau_m) = self.p_sample_loop(batch)

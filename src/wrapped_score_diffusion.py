@@ -1,12 +1,11 @@
 """Wrapped score matching on T^k for torsion angles and Gaussian score for log τ_m."""
 
-from __future__ import annotations
-
 import math
 
 import torch
 
-from torsion_constants import N_LATENT, N_TORSIONS
+from torsion_constants import (LOG_TAU_M_MAX, LOG_TAU_M_MIN, N_LATENT,
+                               N_TORSIONS, TAU_M_MAX, TAU_M_MIN)
 
 
 def wrap_angle(x: torch.Tensor) -> torch.Tensor:
@@ -79,17 +78,18 @@ def gaussian_score(
 def encode_torsions(theta: torch.Tensor, tau_m: torch.Tensor) -> torch.Tensor:
     """Concatenate wrapped θ and log τ_m → latent [..., N_LATENT]."""
     theta_w = wrap_angle(theta)
-    log_tau = torch.log(tau_m.clamp(min=1e-6))
+    log_tau = torch.log(tau_m.clamp(min=TAU_M_MIN, max=TAU_M_MAX))
     if log_tau.ndim == theta_w.ndim - 1:
         log_tau = log_tau.unsqueeze(-1)
+    log_tau = log_tau.clamp(LOG_TAU_M_MIN, LOG_TAU_M_MAX)
     return torch.cat([theta_w, log_tau], dim=-1)
 
 
 def decode_torsions(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Split latent [..., N_LATENT] into θ and τ_m."""
     theta = wrap_angle(x[..., :N_TORSIONS])
-    log_tau = x[..., N_TORSIONS]
-    tau_m = torch.exp(log_tau).clamp(min=1e-6)
+    log_tau = x[..., N_TORSIONS].clamp(LOG_TAU_M_MIN, LOG_TAU_M_MAX)
+    tau_m = torch.exp(log_tau).clamp(min=TAU_M_MIN, max=TAU_M_MAX)
     return theta, tau_m
 
 
@@ -119,7 +119,7 @@ def perturb_torsions(
     theta_t = wrap_angle(theta_0 + sigma_theta * eps_theta)
 
     eps_tau = torch.randn_like(log_tau_0)
-    log_tau_t = log_tau_0 + sigma_tau * eps_tau
+    log_tau_t = (log_tau_0 + sigma_tau * eps_tau).clamp(LOG_TAU_M_MIN, LOG_TAU_M_MAX)
 
     angular_score_target = wrapped_normal_score(
         wrapped_angle_diff(theta_t, theta_0),
@@ -155,7 +155,10 @@ def estimate_theta_tau_from_score_ve(
     while sig_tau.ndim < log_tau_t.ndim:
         sig_tau = sig_tau.unsqueeze(-1)
     theta_hat = wrap_angle(theta_t + (sig_th ** 2) * score_pred[..., :N_TORSIONS])
-    log_hat = log_tau_t + (sig_tau ** 2) * score_pred[..., N_TORSIONS:N_LATENT]
+    log_hat = (log_tau_t + (sig_tau ** 2) * score_pred[..., N_TORSIONS:N_LATENT]).clamp(
+        LOG_TAU_M_MIN,
+        LOG_TAU_M_MAX,
+    )
     return torch.cat([theta_hat, log_hat], dim=-1)
 
 
@@ -235,5 +238,7 @@ def reverse_ve_score_step(
         step_noise_tau = torch.sqrt(d2_tau.clamp(min=eps_safe)) * z_tau
 
     theta_next = wrap_angle(theta + d2_theta * score_pred[..., :N_TORSIONS] + step_noise_theta)
-    log_next = log_tau + d2_tau * score_pred[..., N_TORSIONS:N_LATENT] + step_noise_tau
+    log_next = (
+        log_tau + d2_tau * score_pred[..., N_TORSIONS:N_LATENT] + step_noise_tau
+    ).clamp(LOG_TAU_M_MIN, LOG_TAU_M_MAX)
     return theta_next, log_next

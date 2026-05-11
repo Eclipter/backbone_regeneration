@@ -15,8 +15,10 @@ from torch_geometric.data import Batch
 
 import utils
 from model import PytorchLightningModule
+from torsion_constants import TAU_M_MAX, TAU_M_MIN
 from torsion_geometry import (N_TORSIONS, TOR_ALPHA, TOR_EPS, TOR_ZETA,
-                              build_backbone_from_torsions)
+                              build_backbone_from_torsions,
+                              build_batch_window_backbone_from_torsions_torch)
 from utils import (CHAIN_END_CLASS_3_PRIME, CHAIN_END_CLASS_5_PRIME,
                    resolve_run_dir)
 
@@ -48,8 +50,10 @@ def _predict_window(
     device,
     tidx: int,
     o3_prev_local: Optional[np.ndarray] = None,
+    *,
+    legacy_target_builder: bool = False,
 ) -> Tuple[dict, np.ndarray]:
-    """Sample from the model; build local backbone → world coords for target residue `tidx`."""
+    """Sample from the model; build target backbone in world coords (window builder by default)."""
     window = getattr(data, '_window_ref', None)
     if window is None:
         return {}, np.zeros(N_TORSIONS, dtype=np.float64)
@@ -70,26 +74,47 @@ def _predict_window(
     pred_theta, pred_tau_m = model.sample(batch)
 
     nt = window[tidx]
-    o_tt = data.nt_origins_world[tidx]
-    r_tt = data.nt_frames_world[tidx]
 
     torsions_np = pred_theta[0].cpu().numpy()
-    tau_m = float(pred_tau_m[0].clamp(min=1e-3, max=7.4).item())
-    o3pl = (
-        np.asarray(o3_prev_local, dtype=np.float64).reshape(3)
-        if o3_prev_local is not None
-        else None
-    )
+    tau_m = float(pred_tau_m[0].clamp(min=TAU_M_MIN, max=TAU_M_MAX).item())
 
-    local_bb = build_backbone_from_torsions(
-        torsions_np,
-        nt.restype,
-        o3_prev_local=o3pl,
-        tau_m=tau_m,
-    )
-    o = o_tt.cpu().numpy().reshape(3)
-    r = r_tt.cpu().numpy().reshape(3, 3)
-    world_bb = {nm: xyz @ r.T + o for nm, xyz in local_bb.items()}
+    if legacy_target_builder:
+        o_tt = data.nt_origins_world[tidx]
+        r_tt = data.nt_frames_world[tidx]
+        o3pl = (
+            np.asarray(o3_prev_local, dtype=np.float64).reshape(3)
+            if o3_prev_local is not None
+            else None
+        )
+
+        local_bb = build_backbone_from_torsions(
+            torsions_np,
+            nt.restype,
+            o3_prev_local=o3pl,
+            tau_m=tau_m,
+        )
+        o = o_tt.cpu().numpy().reshape(3)
+        r = r_tt.cpu().numpy().reshape(3, 3)
+        world_bb = {nm: xyz @ r.T + o for nm, xyz in local_bb.items()}
+    else:
+        theta_w = data.torsions.float().unsqueeze(0).to(device)
+        tau_w = data.tau_m.float().unsqueeze(0).to(device)
+        ri = data.base_types.argmax(dim=-1).unsqueeze(0).long().to(device)
+        origins_w = data.nt_origins_world.float().unsqueeze(0).to(device)
+        frames_w = data.nt_frames_world.float().unsqueeze(0).to(device)
+        mask = data.torsion_mask.unsqueeze(0).to(device)
+        theta_w[0, tidx] = pred_theta[0]
+        tau_w[0, tidx] = pred_tau_m[0].clamp(min=TAU_M_MIN, max=TAU_M_MAX)
+        bb_t = build_batch_window_backbone_from_torsions_torch(
+            theta_w, tau_w, ri, origins_w, frames_w, mask,
+        )
+        world_coords = bb_t[0, tidx].cpu().numpy()
+        world_bb = {
+            utils.backbone_atoms[j]: world_coords[j]
+            for j in range(world_coords.shape[0])
+            if np.isfinite(world_coords[j]).all()
+        }
+
     segid, resid = nt.segid, int(nt.resid)
     preds = {(segid, resid, nm): pos for nm, pos in world_bb.items()}
     return preds, torsions_np
@@ -108,6 +133,11 @@ def _apply_inference_pos_mask(sample_data):
     sample_data.torsion_mask = pos_mask
 
 
+def inference_uses_window_builder(legacy_target_builder: bool) -> bool:
+    """Test hook: default inference path must use window-level backbone builder."""
+    return not legacy_target_builder
+
+
 def _run_target(
     model,
     sample_data,
@@ -116,6 +146,8 @@ def _run_target(
     window,
     tidx: int,
     o3_prev_local: Optional[np.ndarray],
+    *,
+    legacy_target_builder: bool = False,
 ):
     sample_data._window_ref = window
     _apply_inference_pos_mask(sample_data)
@@ -125,6 +157,7 @@ def _run_target(
         device,
         tidx,
         o3_prev_local=o3_prev_local,
+        legacy_target_builder=legacy_target_builder,
     )
     predictions.update(bb)
 
@@ -149,7 +182,14 @@ def _window_tidx_for_chain_index(chain_len: int, j: int):
     return int(w_cent), int(c)
 
 
-def predict_backbone(input_path, ckpt_path, device='cuda', show_progress: bool = False):
+def predict_backbone(
+    input_path,
+    ckpt_path,
+    device='cuda',
+    show_progress: bool = False,
+    *,
+    legacy_target_builder: bool = False,
+):
     _, chain_records = utils.parse_dna(
         input_path,
         use_full_nucleotide=False,
@@ -197,6 +237,7 @@ def predict_backbone(input_path, ckpt_path, device='cuda', show_progress: bool =
                 window,
                 tidx,
                 o3_prev_local,
+                legacy_target_builder=legacy_target_builder,
             )
 
             segid_, resid_ = nt.segid, int(nt.resid)
@@ -337,6 +378,11 @@ def _parse_args():
         action='store_true',
         help="Include 5'-terminal P, OP1, OP2 atoms in the output (omitted by default).",
     )
+    p.add_argument(
+        '--legacy-target-builder',
+        action='store_true',
+        help="Use per-residue phosphate builder (debug). Default: window builder (training-consistent).",
+    )
     return p.parse_args()
 
 
@@ -345,7 +391,12 @@ if __name__ == '__main__':
     ckpt_path = utils.find_best_checkpoint(resolve_run_dir(args.run_dir))
     print(f'checkpoint: {ckpt_path}')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    predictions, chain_records = predict_backbone(args.input, ckpt_path, device=device)
+    predictions, chain_records = predict_backbone(
+        args.input,
+        ckpt_path,
+        device=device,
+        legacy_target_builder=args.legacy_target_builder,
+    )
     write_structure(
         chain_records,
         predictions,

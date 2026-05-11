@@ -1,7 +1,5 @@
 """Torsion definitions, sugar puckering (Altona–Sundaralingam / MDAnalysis-compatible), and angle wrapping."""
 
-from __future__ import annotations
-
 import functools
 from typing import Optional
 
@@ -22,6 +20,24 @@ from torsion_constants import (
     TORSION_IS_CIRCULAR,
     TORSION_NAMES,
 )
+
+
+def world_to_local_points(
+    x_world: torch.Tensor,
+    origin: torch.Tensor,
+    frame: torch.Tensor,
+) -> torch.Tensor:
+    """Row-vector convention: ``local = (world - origin) @ frame`` (same as training frames)."""
+    return torch.matmul(x_world - origin, frame)
+
+
+def local_to_world_points(
+    x_local: torch.Tensor,
+    origin: torch.Tensor,
+    frame: torch.Tensor,
+) -> torch.Tensor:
+    """Row-vector convention: ``world = local @ frame.T + origin``."""
+    return torch.matmul(x_local, frame.transpose(-2, -1)) + origin
 
 
 def wrap_angle_rad(x):
@@ -386,7 +402,7 @@ def _get_template_tensors(device_str: str) -> dict:
     return out
 
 
-# --- Torch geometry decoder (analytic ring + stereo exocyclic + multi-torsion phosphate) ---
+# --- Torch geometry decoder (deterministic sugar ring closure via grid/argmin; see build_sugar_ring) ---
 
 _GEO_EPS = 1e-8
 _PHI_SUGAR_GRID = 128
@@ -501,6 +517,9 @@ def build_sugar_ring_analytic_torch(
     bond_angles: Optional[dict] = None,
 ) -> dict[str, torch.Tensor]:
     """Build sugar ring atoms in local base frame; χ orients the ring vs template base atoms.
+
+    Branch choice uses a finite grid and deterministic argmin over ring-closure residuals — not a
+    single closed-form algebraic solve. Differentiable w.r.t. inputs except at argmin boundaries.
 
     Returns O4', C1', C2', C3', C4' with shapes [..., 3].
     """
@@ -1108,7 +1127,7 @@ def build_backbone_from_torsions_torch(
     restype_indices: 'torch.Tensor',
     o3_prev_local: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
-    """Batched decoder: analytic sugar ring, stereo exocyclic O3′/C5′, γ→O5′.
+    """Batched decoder: deterministic sugar ring closure, stereo exocyclic O3′/C5′, γ→O5′.
 
     Phosphate uses ``close_phosphate_bridge_multi_torch``; without prior-nucleotide ε/ζ in this API,
     only α and β targets are weighted (incoming bridge from o3_prev in target frame).
@@ -1214,10 +1233,7 @@ def build_batch_window_backbone_from_torsions_torch(
     bb_flat = torch.full((BW, n_bb, 3), float('nan'), device=dev, dtype=dtype)
     for nm in ("C1'", "C2'", "C3'", "C4'", "C5'", "O4'", "O3'", "O5'"):
         local = atoms[nm]
-        bb_flat[:, name_to_j[nm]] = torch.bmm(
-            local.unsqueeze(1),
-            Ri_flat.transpose(-2, -1),
-        ).squeeze(1) + ok_flat
+        bb_flat[:, name_to_j[nm]] = local_to_world_points(local, ok_flat, Ri_flat)
 
     bb = bb_flat.view(B, W, n_bb, 3)
 
@@ -1236,19 +1252,15 @@ def build_batch_window_backbone_from_torsions_torch(
         ok = nt_origins_world[idx, k]
         Rk = nt_frames_world[idx, k]
 
-        def _wl(vw: torch.Tensor) -> torch.Tensor:
-            dv = vw - ok
-            return torch.bmm(dv.unsqueeze(1), Rk.transpose(-2, -1)).squeeze(1)
-
         prev_loc = {
-            "O3'": _wl(bb[idx, k - 1, name_to_j["O3'"]]),
-            "C3'": _wl(bb[idx, k - 1, name_to_j["C3'"]]),
-            "C4'": _wl(bb[idx, k - 1, name_to_j["C4'"]]),
+            "O3'": world_to_local_points(bb[idx, k - 1, name_to_j["O3'"]], ok, Rk),
+            "C3'": world_to_local_points(bb[idx, k - 1, name_to_j["C3'"]], ok, Rk),
+            "C4'": world_to_local_points(bb[idx, k - 1, name_to_j["C4'"]], ok, Rk),
         }
         next_loc = {
-            "O5'": _wl(bb[idx, k, name_to_j["O5'"]]),
-            "C5'": _wl(bb[idx, k, name_to_j["C5'"]]),
-            "C4'": _wl(bb[idx, k, name_to_j["C4'"]]),
+            "O5'": world_to_local_points(bb[idx, k, name_to_j["O5'"]], ok, Rk),
+            "C5'": world_to_local_points(bb[idx, k, name_to_j["C5'"]], ok, Rk),
+            "C4'": world_to_local_points(bb[idx, k, name_to_j["C4'"]], ok, Rk),
             '_ri': restype_indices[idx, k],
         }
 
@@ -1277,15 +1289,9 @@ def build_batch_window_backbone_from_torsions_torch(
         loc_p = phosph['P']
         loc_o1 = phosph['OP1']
         loc_o2 = phosph['OP2']
-        bb[idx, k, name_to_j['P']] = torch.bmm(
-            loc_p.unsqueeze(1), Rk.transpose(-2, -1),
-        ).squeeze(1) + ok
-        bb[idx, k, name_to_j['OP1']] = torch.bmm(
-            loc_o1.unsqueeze(1), Rk.transpose(-2, -1),
-        ).squeeze(1) + ok
-        bb[idx, k, name_to_j['OP2']] = torch.bmm(
-            loc_o2.unsqueeze(1), Rk.transpose(-2, -1),
-        ).squeeze(1) + ok
+        bb[idx, k, name_to_j['P']] = local_to_world_points(loc_p, ok, Rk)
+        bb[idx, k, name_to_j['OP1']] = local_to_world_points(loc_o1, ok, Rk)
+        bb[idx, k, name_to_j['OP2']] = local_to_world_points(loc_o2, ok, Rk)
 
     return bb
 
@@ -1318,3 +1324,51 @@ def build_window_backbone_from_torsions_torch(
         torsion_mask.unsqueeze(0) if torsion_mask is not None else None,
     )
     return bb_b.squeeze(0)
+
+
+def build_chain_backbone_from_predictions(
+    theta: torch.Tensor,
+    tau_m: torch.Tensor,
+    restype_indices: torch.Tensor,
+    nt_origins_world: torch.Tensor,
+    nt_frames_world: torch.Tensor,
+    torsion_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """World backbone from wrapped torsions + τ_m for a single window/chain slice (training builder).
+
+    Shapes: ``theta`` is ``[N, N_TORSIONS]`` or ``[1, N, N_TORSIONS]``; ``tau_m`` matches the
+    leading structure (``[N]`` or ``[1, N]``). Returns ``[N, n_bb, 3]`` (atom order =
+    ``utils.backbone_atoms`` / ``_BACKBONE_ATOM_ORDER``). For B>1 batches use
+    ``build_batch_window_backbone_from_torsions_torch`` directly.
+    """
+    if theta.dim() == 2:
+        if tau_m.dim() != 1 or restype_indices.dim() != 1:
+            raise ValueError(
+                f'Expected tau_m [N], restype [N] with theta [N,7]; '
+                f'got tau {tuple(tau_m.shape)}, ri {tuple(restype_indices.shape)}',
+            )
+        if nt_origins_world.shape[0] != theta.shape[0] or nt_frames_world.shape[0] != theta.shape[0]:
+            raise ValueError('nt_origins_world / nt_frames_world must have length N matching theta')
+        return build_window_backbone_from_torsions_torch(
+            theta,
+            tau_m,
+            restype_indices,
+            nt_origins_world,
+            nt_frames_world,
+            torsion_mask,
+        )
+    if theta.dim() == 3:
+        if theta.shape[0] != 1:
+            raise ValueError(
+                'build_chain_backbone_from_predictions supports batch size 1 only; '
+                'use build_batch_window_backbone_from_torsions_torch for B>1',
+            )
+        tm = tau_m.squeeze(0) if tau_m.dim() == 2 else tau_m
+        ri = restype_indices.squeeze(0) if restype_indices.dim() == 2 else restype_indices
+        oo = nt_origins_world.squeeze(0) if nt_origins_world.dim() == 3 else nt_origins_world
+        rr = nt_frames_world.squeeze(0) if nt_frames_world.dim() == 4 else nt_frames_world
+        m = torsion_mask.squeeze(0) if torsion_mask is not None and torsion_mask.dim() == 3 else torsion_mask
+        return build_window_backbone_from_torsions_torch(
+            theta.squeeze(0), tm, ri, oo, rr, m,
+        )
+    raise ValueError(f'theta must be [N, {N_TORSIONS}] or [1, N, {N_TORSIONS}], got {tuple(theta.shape)}')

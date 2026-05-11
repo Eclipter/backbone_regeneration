@@ -41,6 +41,8 @@ class _DummyHParams(TypedDict):
     closure_bond_weight: float
     closure_angle_weight: float
     closure_torsion_weight: float
+    log_closure_metrics_train: bool
+    log_closure_metrics_val: bool
 
 
 _DUMMY_HP: _DummyHParams = {
@@ -65,6 +67,8 @@ _DUMMY_HP: _DummyHParams = {
     'closure_bond_weight': 1.0,
     'closure_angle_weight': 1.0,
     'closure_torsion_weight': 1.0,
+    'log_closure_metrics_train': False,
+    'log_closure_metrics_val': True,
 }
 _MODULE = PytorchLightningModule(**_DUMMY_HP).float().eval()
 NODE_DIM = _MODULE.node_dim

@@ -1,7 +1,5 @@
 """Phosphate bridge closure loss: O3′_i – P_{i+1} – O5′_{i+1} (bonds, angles, wrapped torsions)."""
 
-from __future__ import annotations
-
 import math
 from typing import Optional
 
@@ -78,6 +76,7 @@ def compute_bridge_closure_loss(
     valid_nt_mask: torch.Tensor,
     restype_indices: torch.Tensor,
     same_chain_mask: Optional[torch.Tensor] = None,
+    valid_pair_mask: Optional[torch.Tensor] = None,
     *,
     geometry: Optional[dict] = None,
     weights: Optional[dict] = None,
@@ -98,6 +97,9 @@ def compute_bridge_closure_loss(
     same_chain_mask
         Optional ``[B, W-1]`` mask for consecutive pairs. If ``None``, adjacent positions
         are treated as same-chain neighbors (sliding windows are contiguous).
+    valid_pair_mask
+        Optional ``[B, W-1]``. If set, only these candidate bridges are counted toward
+        loss and ``closure_valid_bridge_fraction`` (e.g. target-adjacent pairs).
 
     Returns
     -------
@@ -159,6 +161,12 @@ def compute_bridge_closure_loss(
     pair_valid = valid_nt_mask[:, :-1] & valid_nt_mask[:, 1:]
     if same_chain_mask is not None:
         pair_valid = pair_valid & same_chain_mask
+    if valid_pair_mask is not None:
+        if valid_pair_mask.shape != (B, W - 1):
+            raise ValueError(
+                f'valid_pair_mask must be [B, W-1]=[{B}, {W - 1}], got {tuple(valid_pair_mask.shape)}',
+            )
+        pair_valid = pair_valid & valid_pair_mask
 
     tor_obs = (
         prev_tm[..., TOR_EPS]
@@ -235,7 +243,10 @@ def compute_bridge_closure_loss(
         + (e_be / (sigma_t + eps)) ** 2
     )
 
-    n_br = float(max(B * (W - 1), 1))
+    if valid_pair_mask is not None:
+        n_br = float(max(valid_pair_mask.float().sum().item(), 1.0))
+    else:
+        n_br = float(max(B * (W - 1), 1))
     n_ok = bridge_ok.float().sum().clamp(min=0.0)
 
     bond_norm = torch.maximum(

@@ -1,8 +1,15 @@
 """Single source for torsion order and latent width (angles + log τ_m channel)."""
 
-from __future__ import annotations
+import math
 
 import torch
+
+# Pseudorotational puckering amplitude τ_m (radians; see ``nucleotide_torsions_numpy`` / sugar fit).
+# Typical DNA ~0.35–0.55; canonical templates ~0.61. Wide bounds are conservative; refine from dataset stats.
+TAU_M_MIN = 0.05
+TAU_M_MAX = 1.5
+LOG_TAU_M_MIN = math.log(TAU_M_MIN)
+LOG_TAU_M_MAX = math.log(TAU_M_MAX)
 
 TORSION_NAMES = ('alpha', 'beta', 'gamma', 'epsilon', 'zeta', 'chi', 'P')
 N_TORSIONS = len(TORSION_NAMES)

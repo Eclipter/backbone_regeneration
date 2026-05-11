@@ -1,7 +1,5 @@
 """Unit tests for wrapped-normal scores, perturbation, and VE sampler primitives."""
 
-from __future__ import annotations
-
 import math
 from typing import Any, cast
 
@@ -11,6 +9,7 @@ import torch
 from model import PytorchLightningModule
 from torsion_constants import N_LATENT, N_TORSIONS, TORSION_NAMES
 from wrapped_score_diffusion import (
+    decode_torsions,
     gaussian_score,
     perturb_torsions,
     reverse_ve_score_step,
@@ -117,6 +116,8 @@ def test_model_output_dim_is_8():
         closure_bond_weight=1.0,
         closure_angle_weight=1.0,
         closure_torsion_weight=1.0,
+        log_closure_metrics_train=False,
+        log_closure_metrics_val=True,
     )
     pl = PytorchLightningModule(**cast(Any, hp)).float()
     assert pl.denoiser.out.out_features == N_LATENT == 8
@@ -128,6 +129,18 @@ def test_no_sincos_latent_constants():
 
 def test_delta_absent():
     assert 'delta' not in TORSION_NAMES
+
+
+def test_decode_clamps_extreme_log_tau():
+    from torsion_constants import TAU_M_MAX, TAU_M_MIN
+
+    x = torch.zeros(2, N_LATENT)
+    x[:, N_TORSIONS] = 10.0
+    _, tau = decode_torsions(x)
+    assert float(tau.max()) <= TAU_M_MAX + 1e-4
+    x[:, N_TORSIONS] = -10.0
+    _, tau2 = decode_torsions(x)
+    assert float(tau2.min()) >= TAU_M_MIN - 1e-4
 
 
 @pytest.mark.parametrize('weighting', ('none', 'sigma2'))

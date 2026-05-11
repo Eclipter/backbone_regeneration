@@ -74,6 +74,8 @@ def train_one(cfg):
         closure_bond_weight=cfg['CLOSURE_BOND_WEIGHT'],
         closure_angle_weight=cfg['CLOSURE_ANGLE_WEIGHT'],
         closure_torsion_weight=cfg['CLOSURE_TORSION_WEIGHT'],
+        log_closure_metrics_train=cfg['LOG_CLOSURE_METRICS_TRAIN'],
+        log_closure_metrics_val=cfg['LOG_CLOSURE_METRICS_VAL'],
     )
 
     log_dir, run_name, run_version, ckpt_path = _get_run_paths(cfg)

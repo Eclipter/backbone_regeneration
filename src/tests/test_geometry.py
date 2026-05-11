@@ -92,10 +92,12 @@ def test_alpha_roundtrip_from_template():
 
 
 def test_tau_m_encode_decode_roundtrip():
+    from torsion_constants import TAU_M_MAX, TAU_M_MIN
+
     rng = torch.Generator().manual_seed(0)
     n = N_TORSIONS
     theta = torch.randn(4, n, generator=rng)
-    tau = torch.exp(torch.randn(4, generator=rng) * 0.1 + 0.2)
+    tau = torch.exp(torch.randn(4, generator=rng) * 0.1 + 0.2).clamp(TAU_M_MIN, TAU_M_MAX)
     z = _encode(theta, tau)
     th2, t2 = _decode(z)
     assert torch.allclose(th2, wrap_angle(theta), atol=1e-5, rtol=1e-5)
@@ -195,3 +197,57 @@ def test_beta_gamma_paths_close_on_canonical_template():
 
     d_geom = float(np.linalg.norm(o5_ga - o5_beta))
     assert d_geom <= 0.5 + 1e-6
+
+
+def test_world_local_roundtrip():
+    from torsion_geometry import local_to_world_points, world_to_local_points
+
+    torch.manual_seed(0)
+    origin = torch.randn(2, 3)
+    a = torch.randn(2, 3, 3)
+    frame, _ = torch.linalg.qr(a)
+    x_local = torch.randn(2, 3)
+    x_w = local_to_world_points(x_local, origin, frame)
+    x2 = world_to_local_points(x_w, origin, frame)
+    assert (x2 - x_local).abs().max() < 1e-5
+
+
+def test_chi_changes_sugar_coordinates():
+    tpl, xyz_prev, xyz_next = _shifted_neighbor_tpl('A')
+    t, mask, tau_m_val, ok = nucleotide_torsions_numpy(tpl, xyz_prev, xyz_next, 'A')
+    assert ok
+    o3_prev = np.asarray(xyz_prev["O3'"], dtype=np.float64)
+    t_lo = np.array(t, copy=True)
+    t_hi = np.array(t, copy=True)
+    t_lo[TOR_CHI] = -1.2
+    t_hi[TOR_CHI] = 1.2
+    b_lo = build_backbone_from_torsions(t_lo, 'A', o3_prev_local=o3_prev, tau_m=tau_m_val)
+    b_hi = build_backbone_from_torsions(t_hi, 'A', o3_prev_local=o3_prev, tau_m=tau_m_val)
+    d = float(np.linalg.norm(b_lo["C4'"] - b_hi["C4'"]))
+    assert d > 1e-3
+
+
+def test_measured_chi_purine_matches_input():
+    restype = 'G'
+    tpl, xyz_prev, xyz_next = _shifted_neighbor_tpl(restype)
+    t, mask, tau_m_val, ok = nucleotide_torsions_numpy(tpl, xyz_prev, xyz_next, restype)
+    assert ok
+    o3_prev = np.asarray(xyz_prev["O3'"], dtype=np.float64)
+    bb = build_backbone_from_torsions(t, restype, o3_prev_local=o3_prev, tau_m=tau_m_val)
+    tpl_b = _get_template(restype)
+    m = dihedral_rad(bb["O4'"], bb["C1'"], tpl_b['N9'], tpl_b['C4'])
+    d = float(np.arctan2(np.sin(m - t[TOR_CHI]), np.cos(m - t[TOR_CHI])))
+    assert abs(d) < 0.05
+
+
+def test_measured_chi_pyrimidine_matches_input():
+    restype = 'C'
+    tpl, xyz_prev, xyz_next = _shifted_neighbor_tpl(restype)
+    t, mask, tau_m_val, ok = nucleotide_torsions_numpy(tpl, xyz_prev, xyz_next, restype)
+    assert ok
+    o3_prev = np.asarray(xyz_prev["O3'"], dtype=np.float64)
+    bb = build_backbone_from_torsions(t, restype, o3_prev_local=o3_prev, tau_m=tau_m_val)
+    tpl_b = _get_template(restype)
+    m = dihedral_rad(bb["O4'"], bb["C1'"], tpl_b['N1'], tpl_b['C2'])
+    d = float(np.arctan2(np.sin(m - t[TOR_CHI]), np.cos(m - t[TOR_CHI])))
+    assert abs(d) < 0.05

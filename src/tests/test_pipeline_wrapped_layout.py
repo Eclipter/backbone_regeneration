@@ -13,9 +13,22 @@ def test_val_rmsd_impl_calls_window_backbone_builder_only():
     assert 'build_backbone_from_torsions_torch' not in src
 
 
+def test_val_rmsd_logger_uses_short_metric_names():
+    src = inspect.getsource(PytorchLightningModule._log_rmsd)
+    assert "f'{prefix}_rmsd'" in src
+    assert 'rmsd_window_builder' not in src
+
+
 def test_predict_default_uses_window_builder_flag():
     assert inference_uses_window_builder(False) is True
     assert inference_uses_window_builder(True) is False
+
+
+def test_predict_module_imports_batch_window_builder():
+    import predict as pred_mod
+
+    src = inspect.getsource(pred_mod._predict_window)
+    assert 'build_batch_window_backbone_from_torsions_torch' in src
 
 
 def test_training_module_has_no_ddpm_alpha_bar_in_source():

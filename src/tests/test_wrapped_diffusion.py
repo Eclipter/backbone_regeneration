@@ -8,12 +8,14 @@ from typing import Any, cast
 import torch
 
 from model import PytorchLightningModule, TorsionDenoiser
+from torsion_constants import assert_torsion_layout
 from torsion_geometry import (
     N_LATENT,
     N_TORSIONS,
     TORSION_NAMES,
-    build_sugar_ring_analytic_torch,
+    build_sugar_ring_grid_closed_torch,
     dihedral_rad_torch,
+    wrap_dihedral_diff_torch,
 )
 from wrapped_score_diffusion import encode_torsions, decode_torsions, perturb_torsions, wrap_angle
 
@@ -79,6 +81,10 @@ def test_model_output_shape_wrapped():
     assert out.shape == (2, 3, N_LATENT)
 
 
+def test_torsion_constants_consistent():
+    assert_torsion_layout()
+
+
 def test_delta_absent_everywhere():
     assert 'delta' not in TORSION_NAMES
     assert N_TORSIONS == 7
@@ -101,8 +107,8 @@ def test_chi_affects_coordinates():
     tau = torch.tensor([0.33])
     chi_a = torch.tensor([-0.55])
     chi_b = torch.tensor([1.1])
-    r_a = build_sugar_ring_analytic_torch(chi_a, P, tau, ri)
-    r_b = build_sugar_ring_analytic_torch(chi_b, P, tau, ri)
+    r_a = build_sugar_ring_grid_closed_torch(chi_a, P, tau, ri)
+    r_b = build_sugar_ring_grid_closed_torch(chi_b, P, tau, ri)
     assert not torch.allclose(r_a["O4'"], r_b["O4'"], atol=1e-4)
     from torsion_geometry import _get_template_tensors
 
@@ -116,6 +122,26 @@ def test_chi_affects_coordinates():
         c_atom,
     )
     assert abs(float(meas.item()) - float(chi_a.item())) < 0.06
+
+
+def test_chi_torch_pyrimidine_matches_measured_dihedral():
+    ri = torch.tensor([1])
+    P = torch.tensor([0.12])
+    tau = torch.tensor([0.34])
+    chi_tgt = torch.tensor([-0.4])
+    r = build_sugar_ring_grid_closed_torch(chi_tgt, P, tau, ri)
+    from torsion_geometry import _get_template_tensors
+
+    tc = _get_template_tensors('cpu')
+    n_atom = tc['chi_n'][ri].reshape(1, 3)
+    c_atom = tc['chi_c'][ri].reshape(1, 3)
+    meas = dihedral_rad_torch(
+        r["O4'"].reshape(1, 3),
+        r["C1'"].reshape(1, 3),
+        n_atom,
+        c_atom,
+    )
+    assert wrap_dihedral_diff_torch(meas, chi_tgt).abs().item() < 0.07
 
 
 def test_world_local_roundtrip():

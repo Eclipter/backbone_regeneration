@@ -73,10 +73,11 @@ def compute_bridge_closure_loss(
     bb_xyz_world: torch.Tensor,
     target_torsions: torch.Tensor,
     torsion_mask: torch.Tensor,
-    valid_nt_mask: torch.Tensor,
     restype_indices: torch.Tensor,
+    valid_nt_mask: Optional[torch.Tensor] = None,
     same_chain_mask: Optional[torch.Tensor] = None,
     valid_pair_mask: Optional[torch.Tensor] = None,
+    valid_bridge_mask: Optional[torch.Tensor] = None,
     *,
     geometry: Optional[dict] = None,
     weights: Optional[dict] = None,
@@ -92,20 +93,25 @@ def compute_bridge_closure_loss(
         ``[B, W, N_TORSIONS]`` reference torsions (ε, ζ on residue i; α, β on i+1).
     torsion_mask
         ``[B, W, N_TORSIONS]`` boolean observability mask.
+    restype_indices
+        ``[B, W]`` residue-type indices into A/C/G/T templates.
     valid_nt_mask
-        ``[B, W]`` True when a residue may participate in a bridge (non-terminal, etc.).
+        Unused (kept for call-site compatibility). Prefer ``valid_pair_mask`` / ``valid_bridge_mask``.
     same_chain_mask
         Optional ``[B, W-1]`` mask for consecutive pairs. If ``None``, adjacent positions
         are treated as same-chain neighbors (sliding windows are contiguous).
     valid_pair_mask
         Optional ``[B, W-1]``. If set, only these candidate bridges are counted toward
         loss and ``closure_valid_bridge_fraction`` (e.g. target-adjacent pairs).
+    valid_bridge_mask
+        Optional ``[B, W-1]``. When set, ``bridge_ok = valid_bridge_mask & (torsions & atoms)``
+        — use for explicit bridge gating instead of blanket per-nucleotide masks.
 
     Returns
     -------
     dict
         ``closure_loss``, component losses, ``closure_valid_bridge_fraction``,
-        ``closure_fail_rate``, and MAE metrics (Å / deg).
+        ``closure_num_valid_bridges``, ``closure_fail_rate``, and MAE metrics (Å / deg).
     """
     g = geometry or {}
     w = weights or {}
@@ -141,6 +147,7 @@ def compute_bridge_closure_loss(
             'closure_angle_loss': z,
             'closure_torsion_loss': z,
             'closure_valid_bridge_fraction': zf,
+            'closure_num_valid_bridges': zf,
             'closure_fail_rate': zf,
             'bridge_bond_mae': zf,
             'bridge_angle_mae_deg': zf,
@@ -152,21 +159,23 @@ def compute_bridge_closure_loss(
     j_c4, j_c3, j_o3 = name_to_j["C4'"], name_to_j["C3'"], name_to_j["O3'"]
     j_p, j_o5, j_c5 = name_to_j['P'], name_to_j["O5'"], name_to_j["C5'"]
 
+    _ = valid_nt_mask
+
     bb = bb_xyz_world
     prev_tm = torsion_mask[:, :-1]
     curr_tm = torsion_mask[:, 1:]
     tgt_prev = target_torsions[:, :-1]
     tgt_curr = target_torsions[:, 1:]
 
-    pair_valid = valid_nt_mask[:, :-1] & valid_nt_mask[:, 1:]
+    pair_gate = torch.ones(B, W - 1, dtype=torch.bool, device=dev)
     if same_chain_mask is not None:
-        pair_valid = pair_valid & same_chain_mask
+        pair_gate = pair_gate & same_chain_mask
     if valid_pair_mask is not None:
         if valid_pair_mask.shape != (B, W - 1):
             raise ValueError(
                 f'valid_pair_mask must be [B, W-1]=[{B}, {W - 1}], got {tuple(valid_pair_mask.shape)}',
             )
-        pair_valid = pair_valid & valid_pair_mask
+        pair_gate = pair_gate & valid_pair_mask
 
     tor_obs = (
         prev_tm[..., TOR_EPS]
@@ -191,7 +200,16 @@ def compute_bridge_closure_loss(
         & torch.isfinite(bb[:, 1:, j_c4]).all(dim=-1)
     )
 
-    bridge_ok = pair_valid & tor_obs & tor_fin & atoms_fin
+    if valid_bridge_mask is not None:
+        if valid_bridge_mask.shape != (B, W - 1):
+            raise ValueError(
+                f'valid_bridge_mask must be [B, W-1]=[{B}, {W - 1}], got {tuple(valid_bridge_mask.shape)}',
+            )
+        bridge_gate = valid_bridge_mask
+    else:
+        bridge_gate = pair_gate
+
+    bridge_ok = bridge_gate & tor_obs & tor_fin & atoms_fin
 
     c4_p = bb[:, :-1, j_c4]
     c3_p = bb[:, :-1, j_c3]
@@ -205,8 +223,8 @@ def compute_bridge_closure_loss(
     ri_prev = restype_indices[:, :-1].long()
 
     tc = _get_template_tensors(str(dev))
-    d0_o3p = tc['bl_o3_p'][ri_next]
-    d0_po5 = tc['r_po3'][ri_next]
+    d0_o3p = tc['bond_p_o3_inter'][ri_next]
+    d0_po5 = tc['bond_p_o5'][ri_next]
 
     d1 = (p_n - o3_p).norm(dim=-1)
     d2 = (o5_n - p_n).norm(dim=-1)
@@ -281,6 +299,7 @@ def compute_bridge_closure_loss(
             'closure_angle_loss': z,
             'closure_torsion_loss': z,
             'closure_valid_bridge_fraction': zf,
+            'closure_num_valid_bridges': zf,
             'closure_fail_rate': zf,
             'bridge_bond_mae': zf,
             'bridge_angle_mae_deg': zf,
@@ -310,6 +329,7 @@ def compute_bridge_closure_loss(
         'closure_angle_loss': angle_mean,
         'closure_torsion_loss': torsion_mean,
         'closure_valid_bridge_fraction': valid_frac,
+        'closure_num_valid_bridges': n_ok,
         'closure_fail_rate': fail_rate,
         'bridge_bond_mae': (bond_mae * m).sum() / (m.sum() + eps),
         'bridge_angle_mae_deg': ((ang_mae * m).sum() / (m.sum() + eps)) * rad2deg,

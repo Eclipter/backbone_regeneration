@@ -28,7 +28,10 @@ def world_to_local_points(
     frame: torch.Tensor,
 ) -> torch.Tensor:
     """Row-vector convention: ``local = (world - origin) @ frame`` (same as training frames)."""
-    return torch.matmul(x_world - origin, frame)
+    d = x_world - origin
+    if frame.dim() == 2:
+        return torch.matmul(d, frame)
+    return torch.matmul(d.unsqueeze(-2), frame).squeeze(-2)
 
 
 def local_to_world_points(
@@ -37,7 +40,14 @@ def local_to_world_points(
     frame: torch.Tensor,
 ) -> torch.Tensor:
     """Row-vector convention: ``world = local @ frame.T + origin``."""
-    return torch.matmul(x_local, frame.transpose(-2, -1)) + origin
+    r = frame.transpose(-2, -1)
+    if frame.dim() == 2:
+        return torch.matmul(x_local, r) + origin
+    return torch.matmul(x_local.unsqueeze(-2), r).squeeze(-2) + origin
+
+
+world_to_local_torch = world_to_local_points
+local_to_world_torch = local_to_world_points
 
 
 def wrap_angle_rad(x):
@@ -342,7 +352,9 @@ def _get_template_tensors(device_str: str) -> dict:
         'bl_o5_c5', 'ba_c4_c5_o5',
         'bl_o3_c3', 'ba_c4_c3_o3',
         'r_po3',
-        'bl_o3_p',
+        'bond_p_o5',
+        'bond_p_o3_inter',
+        'tpl_o3_sep_p',
         'bl_op1', 'bl_op2',
         'ang_op1', 'ang_op2',
         'psi_op1', 'psi_op2',
@@ -377,8 +389,12 @@ def _get_template_tensors(device_str: str) -> dict:
         rows_1d['ba_c4_c5_o5'].append(_ba(tpl, "C4'", "C5'", "O5'"))
         rows_1d['bl_o3_c3'].append(_bl(tpl, "O3'", "C3'"))
         rows_1d['ba_c4_c3_o3'].append(_ba(tpl, "C4'", "C3'", "O3'"))
-        rows_1d['r_po3'].append(_bl(tpl, 'P', "O5'"))
-        rows_1d['bl_o3_p'].append(_bl(tpl, "O3'", 'P'))
+        po5_len = _bl(tpl, 'P', "O5'")
+        rows_1d['r_po3'].append(po5_len)
+        rows_1d['bond_p_o5'].append(po5_len)
+        # O3'_i–P_{i+1} phosphodiester: do not use same-residue |O3'−P| (not a bonded geometry).
+        rows_1d['bond_p_o3_inter'].append(po5_len)
+        rows_1d['tpl_o3_sep_p'].append(_bl(tpl, "O3'", 'P'))
         rows_1d['bl_op1'].append(_bl(tpl, 'P', 'OP1'))
         rows_1d['bl_op2'].append(_bl(tpl, 'P', 'OP2'))
         rows_1d['ang_op1'].append(_ba(tpl, "O5'", 'P', 'OP1'))
@@ -402,7 +418,7 @@ def _get_template_tensors(device_str: str) -> dict:
     return out
 
 
-# --- Torch geometry decoder (deterministic sugar ring closure via grid/argmin; see build_sugar_ring) ---
+# --- Torch geometry decoder (deterministic sugar ring closure via φ grid + argmin; see build_sugar_ring_grid_closed_torch) ---
 
 _GEO_EPS = 1e-8
 _PHI_SUGAR_GRID = 128
@@ -507,7 +523,7 @@ def _apply_chi_rotation_to_sugar_ring_torch(
     return out
 
 
-def build_sugar_ring_analytic_torch(
+def build_sugar_ring_grid_closed_torch(
     chi: torch.Tensor,
     P: torch.Tensor,
     tau_m: torch.Tensor,
@@ -518,8 +534,11 @@ def build_sugar_ring_analytic_torch(
 ) -> dict[str, torch.Tensor]:
     """Build sugar ring atoms in local base frame; χ orients the ring vs template base atoms.
 
-    Branch choice uses a finite grid and deterministic argmin over ring-closure residuals — not a
-    single closed-form algebraic solve. Differentiable w.r.t. inputs except at argmin boundaries.
+    Uses a deterministic φ grid scan and argmin over ring-closure residuals (one branch DOF).
+    This is **not** a closed-form analytic solver nor gradient-smooth in the discrete branch choice.
+
+    TODO: replace grid branch selection with fully analytic closed-form closure if needed for
+    differentiable geometry loss through the discrete argmin boundary.
 
     Returns O4', C1', C2', C3', C4' with shapes [..., 3].
     """
@@ -654,6 +673,9 @@ def build_sugar_ring_analytic_torch(
         out, chi.reshape(B), n_atom, c_atom,
     )
     return out
+
+
+build_sugar_ring_analytic_torch = build_sugar_ring_grid_closed_torch
 
 
 def add_exocyclic_sugar_atoms_torch(
@@ -801,8 +823,8 @@ def close_phosphate_bridge_multi_torch(
         raise ValueError('close_phosphate_bridge_multi_torch needs restype_indices (next) in geometry or _ri on next_atoms.')
     ri = ri.long()
     tc = _get_template_tensors(str(dev))
-    r_o3p = tc['bl_o3_p'][ri]
-    l_po5 = tc['r_po3'][ri]
+    r_o3p = tc['bond_p_o3_inter'][ri]
+    l_po5 = tc['bond_p_o5'][ri]
 
     d_vec = o5n - o3p
     d_o3_o5 = d_vec.norm(dim=-1).clamp(min=_GEO_EPS)
@@ -1073,23 +1095,23 @@ def build_backbone_from_torsions(
 
     p_built: Optional[np.ndarray] = None
     o3p: Optional[np.ndarray] = None
-    r_po3 = 0.0
     o5 = o5_gamma.copy()
 
     if o3_prev_local is not None:
         o3p = np.asarray(o3_prev_local, dtype=np.float64).reshape(3)
-        r_po3 = _blen(tpl['P'], tpl["O5'"])
-        theta_po3 = np.deg2rad(119.0)
+        # O3'_i–P_{i+1}: use phosphodiester target (Å), same canonical value as `_get_template_tensors` ``bond_p_o3_inter``.
         l_po5 = _blen(tpl['P'], tpl["O5'"])
+        r_o3p_bridge = l_po5
+        theta_po3 = np.deg2rad(119.0)
         d_o3_o5 = float(np.linalg.norm(o3p - o5_gamma))
-        if abs(r_po3 - l_po5) <= d_o3_o5 <= r_po3 + l_po5:
+        if abs(r_o3p_bridge - l_po5) <= d_o3_o5 <= r_o3p_bridge + l_po5:
             p_built = close_phosphate_bridge(
-                o3p, o5_gamma, c5, r_po3, l_po5, alpha,
+                o3p, o5_gamma, c5, r_o3p_bridge, l_po5, alpha,
             )
         else:
             # ψ = −α aligns dihedral(O3′, P, O5′, C5′) with α given nerf_place's +π/2 offset.
             p_built = nerf_place(
-                c5, o5_gamma, o3p, r_po3, theta_po3, -alpha - _HP,
+                c5, o5_gamma, o3p, r_o3p_bridge, theta_po3, -alpha - _HP,
             )
         o5 = o5_gamma
 
@@ -1142,7 +1164,7 @@ def build_backbone_from_torsions_torch(
     beta = torsions[:, TOR_BETA]
     eps_lat = torsions[:, TOR_EPS]
     zet_lat = torsions[:, TOR_ZETA]
-    ring = build_sugar_ring_analytic_torch(chi, P, tau_m, ri)
+    ring = build_sugar_ring_grid_closed_torch(chi, P, tau_m, ri)
     atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=ri)
     atoms = add_o5_from_gamma_torch(atoms, gamma, restype_indices=ri)
 
@@ -1221,7 +1243,7 @@ def build_batch_window_backbone_from_torsions_torch(
     flat_ri = restype_indices.reshape(BW).long()
     chi = flat_t[:, TOR_CHI]
     P_rad = flat_t[:, TOR_PUCKER_P]
-    ring = build_sugar_ring_analytic_torch(chi, P_rad, flat_tm, flat_ri)
+    ring = build_sugar_ring_grid_closed_torch(chi, P_rad, flat_tm, flat_ri)
     atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=flat_ri)
     atoms = add_o5_from_gamma_torch(
         atoms, flat_t[:, TOR_GAMMA], restype_indices=flat_ri,
@@ -1264,14 +1286,17 @@ def build_batch_window_backbone_from_torsions_torch(
             '_ri': restype_indices[idx, k],
         }
 
+        nv = int(idx.shape[0])
         if torsion_mask is None:
-            we = wz = wa = wb = 1.0
+            we = torch.ones(nv, device=dev, dtype=dtype)
+            wz = torch.ones(nv, device=dev, dtype=dtype)
+            wa = torch.ones(nv, device=dev, dtype=dtype)
+            wb = torch.ones(nv, device=dev, dtype=dtype)
         else:
-            # Scalar floats for closure API typing (mask values are 0/1).
-            we = float(torsion_mask[idx, k - 1, TOR_EPS])
-            wz = float(torsion_mask[idx, k - 1, TOR_ZETA])
-            wa = float(torsion_mask[idx, k, TOR_ALPHA])
-            wb = float(torsion_mask[idx, k, TOR_BETA])
+            we = torsion_mask[idx, k - 1, TOR_EPS].to(dtype=dtype)
+            wz = torsion_mask[idx, k - 1, TOR_ZETA].to(dtype=dtype)
+            wa = torsion_mask[idx, k, TOR_ALPHA].to(dtype=dtype)
+            wb = torsion_mask[idx, k, TOR_BETA].to(dtype=dtype)
 
         phosph = close_phosphate_bridge_multi_torch(
             prev_loc,

@@ -101,6 +101,7 @@ def _zero_bridge_closure_metrics(pred_x0: torch.Tensor) -> dict[str, torch.Tenso
         'closure_angle_loss': z,
         'closure_torsion_loss': z,
         'closure_valid_bridge_fraction': zf,
+        'closure_num_valid_bridges': zf,
         'closure_fail_rate': zf,
         'bridge_bond_mae': zf,
         'bridge_angle_mae_deg': zf,
@@ -207,8 +208,6 @@ class PytorchLightningModule(pl.LightningModule):
 
         restype = batch.base_types.view(b, ws, len(base_to_idx)).argmax(-1)
         mask = batch.torsion_mask.view(b, ws, N_TORSIONS)
-        origins = batch.nt_origins_world.view(b, ws, 3)
-        frames = batch.nt_frames_world.view(b, ws, 3, 3)
 
         bb = build_batch_window_backbone_from_torsions_torch(
             tors_m.float(),
@@ -218,27 +217,6 @@ class PytorchLightningModule(pl.LightningModule):
             frames.float(),
             mask,
         )
-
-        n_bb = len(backbone_atoms)
-        bb_gt = batch.bb_xyz_world.view(b, ws, n_bb, 3)
-        j_c4 = backbone_atoms.index("C4'")
-        j_c3 = backbone_atoms.index("C3'")
-        j_o3 = backbone_atoms.index("O3'")
-        j_p = backbone_atoms.index('P')
-        j_o5 = backbone_atoms.index("O5'")
-        j_c5 = backbone_atoms.index("C5'")
-        fin_prev = (
-            torch.isfinite(bb_gt[..., j_c4]).all(dim=-1)
-            & torch.isfinite(bb_gt[..., j_c3]).all(dim=-1)
-            & torch.isfinite(bb_gt[..., j_o3]).all(dim=-1)
-        )
-        fin_next = (
-            torch.isfinite(bb_gt[..., j_p]).all(dim=-1)
-            & torch.isfinite(bb_gt[..., j_o5]).all(dim=-1)
-            & torch.isfinite(bb_gt[..., j_c5]).all(dim=-1)
-            & torch.isfinite(bb_gt[..., j_c4]).all(dim=-1)
-        )
-        valid_nt_mask = fin_prev & fin_next
 
         pair_mask = torch.zeros(b, ws - 1, dtype=torch.bool, device=pred_x0.device)
         mk_l = ti > 0
@@ -258,9 +236,8 @@ class PytorchLightningModule(pl.LightningModule):
             bb,
             batch.torsions.view(b, ws, N_TORSIONS),
             mask,
-            valid_nt_mask,
             restype.long(),
-            same_chain_mask,
+            same_chain_mask=same_chain_mask,
             valid_pair_mask=pair_mask,
             weights=weights,
             grad_prop_tensor=pred_theta,
@@ -424,6 +401,7 @@ class PytorchLightningModule(pl.LightningModule):
             'closure_angle_loss',
             'closure_torsion_loss',
             'closure_valid_bridge_fraction',
+            'closure_num_valid_bridges',
             'closure_fail_rate',
             'bridge_bond_mae',
             'bridge_angle_mae_deg',
@@ -450,6 +428,7 @@ class PytorchLightningModule(pl.LightningModule):
             'closure_angle_loss',
             'closure_torsion_loss',
             'closure_valid_bridge_fraction',
+            'closure_num_valid_bridges',
             'closure_fail_rate',
             'bridge_bond_mae',
             'bridge_angle_mae_deg',
@@ -478,7 +457,13 @@ class PytorchLightningModule(pl.LightningModule):
                 self.logger.experiment.add_scalar(key, metrics[key], self.current_epoch)
 
     def _write_rmsd_scalars(self, prefix):
-        self._write_epoch_scalars([f'{prefix}_{k}' for k in ('rmsd', 'rmsd_central', 'rmsd_edge')])
+        self._write_epoch_scalars([
+            f'{prefix}_{k}' for k in (
+                'rmsd',
+                'rmsd_central',
+                'rmsd_edge',
+            )
+        ])
 
     def on_validation_epoch_end(self):
         self._write_rmsd_scalars('val')
@@ -648,9 +633,9 @@ class PytorchLightningModule(pl.LightningModule):
         finite = torch.isfinite(per_graph_rmsd)
 
         for name, mask in [
-            (f'{prefix}_rmsd',         finite),
+            (f'{prefix}_rmsd', finite),
             (f'{prefix}_rmsd_central', (~is_edge) & finite),
-            (f'{prefix}_rmsd_edge',    is_edge & finite),
+            (f'{prefix}_rmsd_edge', is_edge & finite),
         ]:
             if mask.any():
                 self.log(

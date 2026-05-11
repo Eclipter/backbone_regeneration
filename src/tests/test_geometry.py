@@ -212,6 +212,19 @@ def test_world_local_roundtrip():
     assert (x2 - x_local).abs().max() < 1e-5
 
 
+def test_window_builder_uses_same_frame_convention_as_utils():
+    torch.manual_seed(1)
+    o3w = torch.randn(5, 3)
+    ok = torch.randn(5, 3)
+    frame = torch.randn(5, 3, 3)
+    frame, _ = torch.linalg.qr(frame)
+    from torsion_geometry import world_to_local_torch
+
+    u = (o3w - ok) @ frame
+    v = world_to_local_torch(o3w, ok, frame)
+    assert torch.allclose(u, v, atol=1e-5, rtol=1e-5)
+
+
 def test_chi_changes_sugar_coordinates():
     tpl, xyz_prev, xyz_next = _shifted_neighbor_tpl('A')
     t, mask, tau_m_val, ok = nucleotide_torsions_numpy(tpl, xyz_prev, xyz_next, 'A')

@@ -3,6 +3,7 @@
 import math
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 
@@ -21,7 +22,7 @@ from utils import backbone_atoms
 
 
 def _ideal_bridge_bb_and_targets(dtype=torch.float64, device='cpu'):
-    """Two stacked 'A' templates: residue 0 O3′ at origin; residue 1 rigid-translated so P matches."""
+    """Two stacked 'A' templates: residue 0 O3′ at origin; residue 1 rigid-translated; P at O3'_0–P target length."""
     tp = _get_template('A')
     tn = _get_template('A')
     o3_ref = tp["O3'"]
@@ -30,6 +31,17 @@ def _ideal_bridge_bb_and_targets(dtype=torch.float64, device='cpu'):
     vp = tp['P'] - tp["O3'"]
     shift_next = vp - tn['P']
     nxt = {k: tn[k] + shift_next for k in backbone_atoms if k in tn}
+
+    po5_tar = float(np.linalg.norm(tp['P'] - tp["O5'"]))
+    dv = np.asarray(nxt['P'], dtype=np.float64) - np.asarray(prev["O3'"], dtype=np.float64)
+    dn = float(np.linalg.norm(dv))
+    if dn > 1e-9:
+        p_old = np.asarray(nxt['P'], dtype=np.float64).copy()
+        nxt['P'] = np.asarray(prev["O3'"], dtype=np.float64) + dv * (po5_tar / dn)
+        dp = np.asarray(nxt['P'], dtype=np.float64) - p_old
+        for suf in ('OP1', 'OP2'):
+            if suf in nxt:
+                nxt[suf] = np.asarray(nxt[suf], dtype=np.float64) + dp
 
     B, W = 1, 2
     n_bb = len(backbone_atoms)
@@ -76,30 +88,33 @@ def _ideal_bridge_bb_and_targets(dtype=torch.float64, device='cpu'):
 
 def test_bridge_closure_loss_zero_or_low_on_reference_geometry():
     bb, tors, mask, valid, ri = _ideal_bridge_bb_and_targets()
-    out = compute_bridge_closure_loss(bb, tors, mask, valid, ri, weights={'bond': 1, 'angle': 1, 'torsion': 1})
+    out = compute_bridge_closure_loss(
+        bb, tors, mask, ri,
+        weights={'bond': 1, 'angle': 1, 'torsion': 1},
+    )
     assert torch.isfinite(out['closure_loss']).all()
     assert float(out['closure_loss']) < 1e-2
 
 
 def test_bridge_closure_loss_penalizes_broken_bond():
-    bb, tors, mask, valid, ri = _ideal_bridge_bb_and_targets()
-    base = compute_bridge_closure_loss(bb, tors, mask, valid, ri)
+    bb, tors, mask, _, ri = _ideal_bridge_bb_and_targets()
+    base = compute_bridge_closure_loss(bb, tors, mask, ri)
     j_p = backbone_atoms.index('P')
     j_o3 = backbone_atoms.index("O3'")
     bb_bad = bb.clone()
     dv = bb_bad[:, 1, j_p] - bb_bad[:, 0, j_o3]
     bb_bad[:, 1, j_p] = bb_bad[:, 1, j_p] + 0.35 * dv / (dv.norm(dim=-1, keepdim=True) + 1e-12)
-    bad = compute_bridge_closure_loss(bb_bad, tors, mask, valid, ri)
+    bad = compute_bridge_closure_loss(bb_bad, tors, mask, ri)
     assert float(bad['closure_bond_loss']) > float(base['closure_bond_loss']) + 5e-2
 
 
 def test_bridge_closure_loss_penalizes_wrong_angle():
-    bb, tors, mask, valid, ri = _ideal_bridge_bb_and_targets()
-    base = compute_bridge_closure_loss(bb, tors, mask, valid, ri)
+    bb, tors, mask, _, ri = _ideal_bridge_bb_and_targets()
+    base = compute_bridge_closure_loss(bb, tors, mask, ri)
     j_o5 = backbone_atoms.index("O5'")
     bb_bad = bb.clone()
     bb_bad[:, 1, j_o5] = bb_bad[:, 1, j_o5] + torch.tensor([0.0, 0.55, 0.0], dtype=bb.dtype, device=bb.device)
-    bad = compute_bridge_closure_loss(bb_bad, tors, mask, valid, ri)
+    bad = compute_bridge_closure_loss(bb_bad, tors, mask, ri)
     assert float(bad['closure_angle_loss']) > float(base['closure_angle_loss']) + 5e-2
 
 
@@ -113,10 +128,11 @@ def test_bridge_closure_loss_uses_wrapped_torsion_error():
 
 def test_bridge_closure_loss_ignores_invalid_bridges():
     bb, tors, mask, valid, ri = _ideal_bridge_bb_and_targets()
-    valid_z = torch.zeros_like(valid)
-    out = compute_bridge_closure_loss(bb, tors, mask, valid_z, ri)
+    pm = torch.zeros(1, 1, dtype=torch.bool, device=bb.device)
+    out = compute_bridge_closure_loss(bb, tors, mask, ri, valid_pair_mask=pm)
     assert float(out['closure_loss']) == 0.0
     assert float(out['closure_valid_bridge_fraction']) == 0.0
+    assert float(out['closure_num_valid_bridges']) == 0.0
     assert torch.isfinite(out['closure_bond_loss']).all()
 
 
@@ -130,16 +146,16 @@ def test_bridge_closure_valid_pair_mask_wrong_shape_raises():
     bb, tors, mask, valid, ri = _ideal_bridge_bb_and_targets()
     bad = torch.ones(1, 2, dtype=torch.bool)
     with pytest.raises(ValueError, match='valid_pair_mask'):
-        compute_bridge_closure_loss(bb, tors, mask, valid, ri, valid_pair_mask=bad)
+        compute_bridge_closure_loss(bb, tors, mask, ri, valid_pair_mask=bad)
 
 
 def test_bridge_closure_ignores_pairs_masked_by_valid_pair_mask():
     bb, tors, mask, valid, ri = _ideal_bridge_bb_and_targets()
     pm_zero = torch.zeros(1, 1, dtype=torch.bool, device=bb.device)
-    out = compute_bridge_closure_loss(bb, tors, mask, valid, ri, valid_pair_mask=pm_zero)
+    out = compute_bridge_closure_loss(bb, tors, mask, ri, valid_pair_mask=pm_zero)
     assert float(out['closure_loss']) == 0.0
     pm_one = torch.ones(1, 1, dtype=torch.bool, device=bb.device)
-    out_one = compute_bridge_closure_loss(bb, tors, mask, valid, ri, valid_pair_mask=pm_one)
+    out_one = compute_bridge_closure_loss(bb, tors, mask, ri, valid_pair_mask=pm_one)
     assert float(out_one['closure_valid_bridge_fraction']) > 0.0
 
 
@@ -151,4 +167,41 @@ def test_processed_pt_smoke_if_present():
         return
     sample = torch.load(pts[0], weights_only=False, map_location='cpu')
     assert hasattr(sample, 'torsions')
+
+
+def test_bridge_o3p_bond_target_is_not_intraresidue_o3_p_separation():
+    from torsion_geometry import _get_template_tensors
+
+    tc = _get_template_tensors('cpu')
+    for idx in range(4):
+        tgt = tc['bond_p_o3_inter'][idx].item()
+        wrong = tc['tpl_o3_sep_p'][idx].item()
+        po5 = tc['bond_p_o5'][idx].item()
+        assert abs(tgt - po5) < 1e-5
+        assert abs(tgt - wrong) > 0.4
+
+
+def test_bridge_mask_allows_bridge_without_full_nucleotide_validity_flags():
+    bb, tors, mask, _, ri = _ideal_bridge_bb_and_targets()
+    vb = torch.ones(1, 1, dtype=torch.bool)
+    out = compute_bridge_closure_loss(bb, tors, mask, ri, valid_bridge_mask=vb)
+    assert float(out['closure_num_valid_bridges']) >= 1.0
+    assert float(out['closure_loss']) < 1e-1
+
+
+def test_bridge_mask_rejects_when_required_bridge_atom_is_nan():
+    bb, tors, mask, _, ri = _ideal_bridge_bb_and_targets()
+    j_o3 = backbone_atoms.index("O3'")
+    bb2 = bb.clone()
+    bb2[0, 0, j_o3] = float('nan')
+    vb = torch.ones(1, 1, dtype=torch.bool)
+    out = compute_bridge_closure_loss(bb2, tors, mask, ri, valid_bridge_mask=vb)
+    assert float(out['closure_num_valid_bridges']) == 0.0
+
+
+def test_bridge_closure_valid_bridge_mask_wrong_shape_raises():
+    bb, tors, mask, _, ri = _ideal_bridge_bb_and_targets()
+    bad = torch.ones(1, 2, dtype=torch.bool)
+    with pytest.raises(ValueError, match='valid_bridge_mask'):
+        compute_bridge_closure_loss(bb, tors, mask, ri, valid_bridge_mask=bad)
 

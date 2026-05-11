@@ -214,3 +214,29 @@ def test_perturb_raises_on_wrong_torsion_width():
             1.0,
         )
 
+
+def test_synthetic_perturb_decode_window_builder_closure_finite():
+    from bridge_closure import compute_bridge_closure_loss
+    from torsion_geometry import build_batch_window_backbone_from_torsions_torch
+
+    torch.manual_seed(0)
+    B, W = 2, 4
+    theta0 = torch.randn(B, W, N_TORSIONS) * 0.05
+    lt0 = torch.log(torch.full((B, W), 0.4)).unsqueeze(-1)
+    t = torch.rand(B)
+    pert = perturb_torsions(theta0, lt0, t, 0.05, 0.2, 0.05, 0.2)
+    lat = torch.cat([pert['theta_t'], pert['log_tau_t']], dim=-1)
+    th2, tau2 = decode_torsions(lat)
+    assert torch.isfinite(th2).all() and torch.isfinite(tau2).all()
+    ri = torch.randint(0, 4, (B, W))
+    ori = torch.randn(B, W, 3)
+    frm = torch.eye(3, dtype=torch.float32).unsqueeze(0).unsqueeze(0).expand(B, W, 3, 3).contiguous()
+    m = torch.ones(B, W, N_TORSIONS, dtype=torch.bool)
+    bb = build_batch_window_backbone_from_torsions_torch(
+        th2.float(), tau2.float(), ri.long(), ori.float(), frm.float(), m,
+    )
+    assert torch.isfinite(bb).all()
+    pm = torch.ones(B, W - 1, dtype=torch.bool)
+    clo = compute_bridge_closure_loss(bb, theta0, m, ri.long(), valid_pair_mask=pm)
+    assert torch.isfinite(clo['closure_loss']).all()
+

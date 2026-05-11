@@ -2,7 +2,6 @@ import logging
 import os
 import os.path as osp
 import shutil
-import sys
 import warnings
 from datetime import datetime
 
@@ -19,14 +18,6 @@ from model import PytorchLightningModule
 
 # Suppress PyTorch FutureWarning about functools.partial in DDP comm hooks (Python 3.13 compatibility)
 warnings.filterwarnings('ignore', category=FutureWarning, module='torch.distributed.algorithms.ddp_comm_hooks')
-
-
-def _train_probe(msg: str) -> None:
-    """stderr + flush: видно в tlog/slurm даже при буферизованном stdout."""
-    lr = os.environ.get('LOCAL_RANK', '?')
-    rk = os.environ.get('RANK', '?')
-    sys.stderr.write(f'[train_probe RANK={rk} LOCAL_RANK={lr} pid={os.getpid()}] {msg}\n')
-    sys.stderr.flush()
 
 
 def _make_run_version(cfg, baseline):
@@ -55,7 +46,6 @@ def _get_run_paths(cfg):
 
 
 def train_one(cfg):
-    _train_probe('train_one: enter')
     pl.seed_everything(SEED, workers=True, verbose=False)
 
     data_module = DNADataModule(
@@ -76,13 +66,34 @@ def train_one(cfg):
         beta_schedule=cfg['BETA_SCHEDULE'],
         weight_decay=cfg['WEIGHT_DECAY'],
         closure_loss_weight=cfg['CLOSURE_LOSS_WEIGHT'],
+        closure_bond_weight=cfg['CLOSURE_BOND_WEIGHT'],
+        closure_angle_weight=cfg['CLOSURE_ANGLE_WEIGHT'],
+        closure_torsion_weight=cfg['CLOSURE_TORSION_WEIGHT'],
     )
-    _train_probe('train_one: model constructed, calling trainer.fit next')
+
+    log_dir, run_name, run_version, ckpt_path = _get_run_paths(cfg)
+
+    # Compile only when not resuming: torch.compile changes param keys (denoiser._orig_mod.*) and
+    # breaks Lightning's checkpoint load_order (eager ckpt vs compiled module).
+    if cfg['TORCH_COMPILE']:
+        if torch.cuda.is_available():
+            if ckpt_path is None:
+                rank_zero_info(
+                    'torch.compile: wrapping denoiser (first *_step will JIT-compile; exclude from timings)'
+                )
+                # OptimizedModule is not TorsionDenoiser; runtime API matches nn.Module.forward.
+                pl_module.denoiser = torch.compile(pl_module.denoiser)  # type: ignore[assignment]
+            else:
+                rank_zero_info(
+                    'TORCH_COMPILE set but resuming from checkpoint: training denoiser eager '
+                    '(compile-before-load mismatches state_dict; compile-after-load needs pre-DDP hook).'
+                )
+        else:
+            rank_zero_info('TORCH_COMPILE is True but CUDA is unavailable; skipping torch.compile')
 
     num_nodes = int(os.environ.get('SLURM_JOB_NUM_NODES', 1))
 
     # Initialize logger
-    log_dir, run_name, run_version, ckpt_path = _get_run_paths(cfg)
     logger = TensorBoardLogger(log_dir, name=run_name, version=run_version, default_hp_metric=False)
 
     # Initialize callbacks
@@ -118,17 +129,12 @@ def train_one(cfg):
         enable_model_summary=False
     )
 
-    _train_probe('train_one: Trainer ready → fit (setup/datamodule/DDP happens inside)')
     # Train and test
     trainer.fit(pl_module, datamodule=data_module, ckpt_path=ckpt_path, weights_only=False)
     trainer.test(pl_module, datamodule=data_module, ckpt_path='best', weights_only=False)
 
 
 def main():
-    os.environ.setdefault('PYTHONUNBUFFERED', '1')
-    if hasattr(sys.stdout, 'reconfigure'):
-        sys.stdout.reconfigure(line_buffering=True)
-
     torch.set_float32_matmul_precision('high')
 
     # Mute litmodels / litlogger advertisements from Lightning

@@ -5,17 +5,21 @@ import sys
 import time
 
 import lightning.pytorch as pl
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from torsion_geometry import N_TORSIONS
+from bridge_closure import compute_bridge_closure_loss
+from torsion_geometry import (
+    N_TORSIONS,
+    build_batch_window_backbone_from_torsions_torch,
+)
 from utils import N_CHAIN_END_CLASSES, backbone_atoms, base_to_idx
 
-N_TORSIONS_LATENT = N_TORSIONS * 2 + 1  # 17: 16 sin/cos + log(τ_m)
+# Sin/cos latent per torsion angle plus log τ_m (must match denoiser output width).
+N_TORSIONS_LATENT = N_TORSIONS * 2 + 1
 
 
 def _fitdbg(msg: str) -> None:
@@ -122,7 +126,10 @@ class PytorchLightningModule(pl.LightningModule):
         self, hidden_dim, num_heads, num_layers, num_timesteps, batch_size, lr,
         lr_scheduler, lr_scheduler_patience, lr_scheduler_threshold, lr_scheduler_cooldown,
         beta_schedule, weight_decay,
-        closure_loss_weight: float = 1.0,
+        closure_loss_weight: float = 0.0,
+        closure_bond_weight: float = 1.0,
+        closure_angle_weight: float = 1.0,
+        closure_torsion_weight: float = 1.0,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -169,16 +176,36 @@ class PytorchLightningModule(pl.LightningModule):
         self.register_buffer('posterior_mean_coef1', betas * torch.sqrt(alphas_cumprod_prev) / (1. - alphas_cumprod))
         self.register_buffer('posterior_mean_coef2', (1. - alphas_cumprod_prev) * torch.sqrt(alphas) / (1. - alphas_cumprod))
 
+    def load_state_dict(self, state_dict, strict=True):  # type: ignore[no-untyped-def]
+        _out_w = next(
+            (v for k, v in state_dict.items() if str(k).endswith('denoiser.out.weight')),
+            None,
+        )
+        if _out_w is not None and _out_w.shape[0] != N_TORSIONS_LATENT:
+            raise RuntimeError(
+                f'Checkpoint denoiser output dim is {_out_w.shape[0]}, '
+                f'expected {N_TORSIONS_LATENT} (interleaved sin/cos torsions + log τ_m). '
+                'Use a checkpoint trained with matching latent layout.',
+            )
+        # Checkpoints saved with torch.compile(denoiser) use denoiser._orig_mod.*; eager module expects denoiser.*.
+        _orig = 'denoiser._orig_mod.'
+        if any(str(k).startswith(_orig) for k in state_dict):
+            state_dict = {
+                ('denoiser.' + str(k)[len(_orig):] if str(k).startswith(_orig) else k): v
+                for k, v in state_dict.items()
+            }
+        return super().load_state_dict(state_dict, strict=strict)
+
     @staticmethod
     def encode_torsions(theta: torch.Tensor, tau_m: torch.Tensor) -> torch.Tensor:
-        """[..., N_TORSIONS], [...] → [..., 17]: interleaved sin/cos + log τ_m."""
+        """[..., N_TORSIONS], [...] → [..., N_TORSIONS_LATENT]: interleaved sin/cos + log τ_m."""
         sc = torch.stack([theta.sin(), theta.cos()], dim=-1).flatten(-2)
         log_tau = torch.log(tau_m.clamp(min=1e-3)).unsqueeze(-1)
         return torch.cat([sc, log_tau], dim=-1)
 
     @staticmethod
     def decode_torsions(latent: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-        """[..., 17] → (theta [..., N_TORSIONS], τ_m [...])."""
+        """[..., N_TORSIONS_LATENT] → (theta [..., N_TORSIONS], τ_m [...])."""
         theta = torch.atan2(
             latent[..., 0::2][..., :N_TORSIONS],
             latent[..., 1::2][..., :N_TORSIONS],
@@ -244,40 +271,83 @@ class PytorchLightningModule(pl.LightningModule):
         tau_mk = tmk_flat[bi, ti]
         return theta0, mk, tau0, tau_mk, ti
 
-    def _closure_loss(self, pred_x0: torch.Tensor, batch) -> torch.Tensor:
-        from torsion_geometry import build_backbone_from_torsions_torch
-
+    def _bridge_closure_metrics(self, pred_x0: torch.Tensor, batch) -> dict:
+        """World-window backbone + phosphate bridges; closure vs GT torsions (neighbor residues GT)."""
         b, ws = self._b_ws(batch)
         ti = batch.target_nt_idx.long()
         bi = torch.arange(b, device=pred_x0.device)
 
         pred_theta, pred_tau_m = self.decode_torsions(pred_x0)
 
-        restype_idx = batch.base_types.view(b, ws, len(base_to_idx))[bi, ti].argmax(-1)
-        o3_prev = batch.o3_prev_local.view(b, ws, 3)[bi, ti]
-        o3_valid = batch.o3_prev_valid.view(b, ws)[bi, ti]
+        tors_m = batch.torsions.view(b, ws, N_TORSIONS).clone()
+        tau_m = batch.tau_m.view(b, ws).clone()
+        tors_m[bi, ti] = pred_theta
+        tau_m[bi, ti] = pred_tau_m.clamp(min=1e-3)
 
-        if not o3_valid.any():
-            return pred_x0.sum() * 0.0
+        restype = batch.base_types.view(b, ws, len(base_to_idx)).argmax(-1)
+        mask = batch.torsion_mask.view(b, ws, N_TORSIONS)
+        origins = batch.nt_origins_world.view(b, ws, 3)
+        frames = batch.nt_frames_world.view(b, ws, 3, 3)
 
         _fitdbg(
-            f'_closure_loss: build_backbone_from_torsions_torch start B={pred_theta.shape[0]} '
-            f'n_o3_valid={int(o3_valid.sum().item())}',
+            f'_bridge_closure_metrics: build_batch_window_backbone B={b} W={ws}',
         )
-        t0 = time.perf_counter()
-        bb = build_backbone_from_torsions_torch(
-            pred_theta.float(),
-            pred_tau_m.clamp(min=1e-3).float(),
-            restype_idx,
-            o3_prev_local=o3_prev,
+        t_bb = time.perf_counter()
+        bb = build_batch_window_backbone_from_torsions_torch(
+            tors_m.float(),
+            tau_m.float(),
+            restype.long(),
+            origins.float(),
+            frames.float(),
+            mask,
         )
         _fitdbg(
-            f'_closure_loss: build_backbone done in {time.perf_counter() - t0:.3f}s',
+            f'_bridge_closure_metrics: backbone done in {time.perf_counter() - t_bb:.3f}s',
         )
-        o5 = bb["O5'"]
 
-        d = (o5[o3_valid] - o3_prev[o3_valid]).norm(dim=-1)
-        return torch.relu(d - 3.2).pow(2).mean()
+        n_bb = len(backbone_atoms)
+        bb_gt = batch.bb_xyz_world.view(b, ws, n_bb, 3)
+        j_c4 = backbone_atoms.index("C4'")
+        j_c3 = backbone_atoms.index("C3'")
+        j_o3 = backbone_atoms.index("O3'")
+        j_p = backbone_atoms.index('P')
+        j_o5 = backbone_atoms.index("O5'")
+        j_c5 = backbone_atoms.index("C5'")
+        fin_prev = (
+            torch.isfinite(bb_gt[..., j_c4]).all(dim=-1)
+            & torch.isfinite(bb_gt[..., j_c3]).all(dim=-1)
+            & torch.isfinite(bb_gt[..., j_o3]).all(dim=-1)
+        )
+        fin_next = (
+            torch.isfinite(bb_gt[..., j_p]).all(dim=-1)
+            & torch.isfinite(bb_gt[..., j_o5]).all(dim=-1)
+            & torch.isfinite(bb_gt[..., j_c5]).all(dim=-1)
+            & torch.isfinite(bb_gt[..., j_c4]).all(dim=-1)
+        )
+        is_edge = batch.is_chain_edge_nt.view(b, ws)
+        valid_nt_mask = (~is_edge) & fin_prev & fin_next
+
+        same_chain_mask = None
+
+        weights = {
+            'bond': float(self.hparams.get('closure_bond_weight', 1.0)),
+            'angle': float(self.hparams.get('closure_angle_weight', 1.0)),
+            'torsion': float(self.hparams.get('closure_torsion_weight', 1.0)),
+        }
+
+        return compute_bridge_closure_loss(
+            bb,
+            batch.torsions.view(b, ws, N_TORSIONS),
+            mask,
+            valid_nt_mask,
+            restype.long(),
+            same_chain_mask,
+            weights=weights,
+            grad_prop_tensor=pred_theta,
+        )
+
+    def _closure_loss(self, pred_x0: torch.Tensor, batch) -> torch.Tensor:
+        return self._bridge_closure_metrics(pred_x0, batch)['closure_loss']
 
     def _build_x(self, batch, x_t_latent, t_per_graph, sc):
         b, ws = self._b_ws(batch)
@@ -368,9 +438,10 @@ class PytorchLightningModule(pl.LightningModule):
         ).sum() / mask_latent.float().sum().clamp(min=1.0)
         pred_x0_cl = self._decode_epsilon_to_x0(x_t, pred, t)
         _fitdbg(f'train_step batch_idx={batch_idx}: MSE ok, start closure_loss')
-        cl = self._closure_loss(pred_x0_cl, batch)
+        clo_metrics = self._bridge_closure_metrics(pred_x0_cl, batch)
+        cl = clo_metrics['closure_loss']
+        loss = mse + float(self.hparams.get('closure_loss_weight', 0.0)) * cl
         _fitdbg(f'train_step batch_idx={batch_idx}: closure_loss OK')
-        loss = mse + self.hparams['closure_loss_weight'] * cl
         self.log(
             'train_loss', mse,
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
@@ -379,6 +450,21 @@ class PytorchLightningModule(pl.LightningModule):
             'train_closure', cl,
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
         )
+        for key in (
+            'closure_loss',
+            'closure_bond_loss',
+            'closure_angle_loss',
+            'closure_torsion_loss',
+            'closure_valid_bridge_fraction',
+            'closure_fail_rate',
+            'bridge_bond_mae',
+            'bridge_angle_mae_deg',
+            'bridge_torsion_mae_deg',
+        ):
+            self.log(
+                key, clo_metrics[key],
+                on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
+            )
         _fitdbg(
             f'train_step batch_idx={batch_idx}: logged metrics; return loss={float(loss.detach())}',
         )
@@ -391,7 +477,19 @@ class PytorchLightningModule(pl.LightningModule):
         )
 
     def on_train_epoch_end(self):
-        self._write_epoch_scalars(['train_loss', 'train_closure'])
+        self._write_epoch_scalars([
+            'train_loss',
+            'train_closure',
+            'closure_loss',
+            'closure_bond_loss',
+            'closure_angle_loss',
+            'closure_torsion_loss',
+            'closure_valid_bridge_fraction',
+            'closure_fail_rate',
+            'bridge_bond_mae',
+            'bridge_angle_mae_deg',
+            'bridge_torsion_mae_deg',
+        ])
 
     def _is_edge_target(self, batch):
         """Bool mask [b]: True if the target nucleotide is a chain edge."""
@@ -453,12 +551,13 @@ class PytorchLightningModule(pl.LightningModule):
         pred_torsions: torch.Tensor,
         pred_tau_m: torch.Tensor,
         batch,
-    ) -> np.ndarray:
+    ) -> torch.Tensor:
         from torsion_geometry import build_backbone_from_torsions_torch
 
         b, ws = self._b_ws(batch)
         ti = batch.target_nt_idx.long()
         bi = torch.arange(b, device=ti.device)
+        dev = pred_torsions.device
 
         n_bb = len(backbone_atoms)
         bb_world_all = batch.bb_xyz_world.view(b, ws, n_bb, 3)
@@ -487,36 +586,47 @@ class PytorchLightningModule(pl.LightningModule):
 
         j1 = backbone_atoms.index('OP1')
         j2 = backbone_atoms.index('OP2')
-        per_graph_rmsd = np.full((b,), np.nan, dtype=np.float64)
+        contrib = torch.zeros(b, device=dev, dtype=torch.float64)
+        count = torch.zeros(b, device=dev, dtype=torch.float64)
 
-        for i in range(b):
-            sq = []
-            for j, nm in enumerate(backbone_atoms):
-                if nm in ('OP1', 'OP2'):
-                    continue
-                if nm not in pred_bb:
-                    continue
-                pred_xyz = pred_bb[nm][i].cpu().numpy()
-                gt_xyz = gt_local[i, j].cpu().numpy()
-                if np.isnan(pred_xyz).any() or np.isnan(gt_xyz).any():
-                    continue
-                sq.append(float(np.sum((pred_xyz - gt_xyz) ** 2)))
+        for j, nm in enumerate(backbone_atoms):
+            if nm in ('OP1', 'OP2'):
+                continue
+            if nm not in pred_bb:
+                continue
+            pred_xyz = pred_bb[nm].to(dtype=torch.float64)
+            gt_xyz = gt_local[:, j, :].to(dtype=torch.float64)
+            valid = torch.isfinite(pred_xyz).all(dim=-1) & torch.isfinite(gt_xyz).all(
+                dim=-1,
+            )
+            diff = pred_xyz - gt_xyz
+            sq = torch.einsum('bi,bi->b', diff, diff)
+            contrib = contrib + sq * valid.to(dtype=torch.float64)
+            count = count + valid.to(dtype=torch.float64)
 
-            if 'OP1' in pred_bb and 'OP2' in pred_bb:
-                p1 = pred_bb['OP1'][i].cpu().numpy()
-                p2 = pred_bb['OP2'][i].cpu().numpy()
-                g1 = gt_local[i, j1].cpu().numpy()
-                g2 = gt_local[i, j2].cpu().numpy()
-                if not (np.isnan(p1).any() or np.isnan(p2).any()
-                        or np.isnan(g1).any() or np.isnan(g2).any()):
-                    d_str = np.sum((p1 - g1) ** 2) + np.sum((p2 - g2) ** 2)
-                    d_swp = np.sum((p1 - g2) ** 2) + np.sum((p2 - g1) ** 2)
-                    sq.append(float(min(d_str, d_swp)) / 2)
+        if 'OP1' in pred_bb and 'OP2' in pred_bb:
+            p1 = pred_bb['OP1'].to(dtype=torch.float64)
+            p2 = pred_bb['OP2'].to(dtype=torch.float64)
+            g1 = gt_local[:, j1, :].to(dtype=torch.float64)
+            g2 = gt_local[:, j2, :].to(dtype=torch.float64)
+            v_op = (
+                torch.isfinite(p1).all(dim=-1)
+                & torch.isfinite(p2).all(dim=-1)
+                & torch.isfinite(g1).all(dim=-1)
+                & torch.isfinite(g2).all(dim=-1)
+            )
+            d1s, d2s = p1 - g1, p2 - g2
+            d1w, d2w = p1 - g2, p2 - g1
+            d_str = torch.einsum('bi,bi->b', d1s, d1s) + torch.einsum('bi,bi->b', d2s, d2s)
+            d_swp = torch.einsum('bi,bi->b', d1w, d1w) + torch.einsum('bi,bi->b', d2w, d2w)
+            op_sq = torch.minimum(d_str, d_swp) * 0.5
+            contrib = contrib + op_sq * v_op.to(dtype=torch.float64)
+            count = count + v_op.to(dtype=torch.float64)
 
-            if sq:
-                per_graph_rmsd[i] = float(np.sqrt(np.mean(sq)))
-
-        return per_graph_rmsd
+        out = torch.full((b,), float('nan'), device=dev, dtype=torch.float64)
+        ok = count > 0
+        out = torch.where(ok, torch.sqrt(contrib / count), out)
+        return out.to(pred_torsions.dtype)
 
     def _log_rmsd(
         self, prefix: str, pred_theta: torch.Tensor, pred_tau_m: torch.Tensor, batch,
@@ -524,13 +634,10 @@ class PytorchLightningModule(pl.LightningModule):
         """Accumulate per-step RMSD (all / central / edge) for later TensorBoard write."""
         _fitdbg(f'_log_rmsd `{prefix}`: start CPU geometry over B={pred_theta.shape[0]}')
         t0 = time.perf_counter()
-        per_graph_rmsd_np = self._compute_rmsd_per_graph_local(
+        per_graph_rmsd = self._compute_rmsd_per_graph_local(
             pred_theta, pred_tau_m, batch,
         )
         _fitdbg(f'_log_rmsd `{prefix}`: RMSD compute {time.perf_counter() - t0:.3f}s')
-        per_graph_rmsd = torch.from_numpy(per_graph_rmsd_np).to(
-            device=pred_theta.device, dtype=torch.float32
-        )
         is_edge = self._is_edge_target(batch)
         finite = torch.isfinite(per_graph_rmsd)
 
@@ -576,8 +683,9 @@ class PytorchLightningModule(pl.LightningModule):
         )
         if self.hparams['lr_scheduler'] is None:
             return optimizer
-        if self.hparams['lr_scheduler'] != 'ReduceLROnPlateau':
-            raise NotImplementedError(f'unknown lr scheduler: {self.hparams['lr_scheduler']}')
+        ls = self.hparams['lr_scheduler']
+        if ls != 'ReduceLROnPlateau':
+            raise NotImplementedError(f'unknown lr scheduler: {ls}')
         scheduler = ReduceLROnPlateau(
             optimizer,
             patience=self.hparams['lr_scheduler_patience'],

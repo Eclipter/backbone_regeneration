@@ -167,7 +167,7 @@ def compute_bridge_closure_loss(
     restype_indices
         ``[B, W]`` residue-type indices into A/C/G/T templates.
     valid_nt_mask
-        Unused (kept for call-site compatibility). Prefer ``valid_pair_mask`` / ``valid_bridge_mask``.
+        Unused API parameter. Prefer ``valid_pair_mask`` / ``valid_bridge_mask``.
     same_chain_mask
         Optional ``[B, W-1]`` mask for consecutive pairs. If ``None``, adjacent positions
         are treated as same-chain neighbors (sliding windows are contiguous).

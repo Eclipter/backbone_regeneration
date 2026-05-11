@@ -56,6 +56,44 @@ def device():
     return torch.device('cpu')
 
 
+def test_chi_rotation_preserves_sugar_ring_internal_torsions(device):
+    """Same P, τ_m, restype; different χ: endocyclic ν₀…ν₄ match; ring atom coords change."""
+    ri = torch.tensor([2], device=device, dtype=torch.long)
+    P = torch.tensor([0.17], device=device)
+    tau_m = torch.tensor([0.33], device=device)
+    chi_a = torch.tensor([-0.55], device=device)
+    chi_b = torch.tensor([0.78], device=device)
+    ring_a = build_sugar_ring_grid_closed_torch(chi_a, P, tau_m, ri)
+    ring_b = build_sugar_ring_grid_closed_torch(chi_b, P, tau_m, ri)
+
+    def _ring_nus(ring: dict) -> torch.Tensor:
+        return torch.stack(
+            [
+                dihedral_rad_torch(
+                    ring[a0n].reshape(1, 3),
+                    ring[a1n].reshape(1, 3),
+                    ring[a2n].reshape(1, 3),
+                    ring[a3n].reshape(1, 3),
+                ).reshape(1)
+                for a0n, a1n, a2n, a3n in _RING_TORSION_DEFS
+            ],
+            dim=-1,
+        )
+
+    nu_a = _ring_nus(ring_a)
+    nu_b = _ring_nus(ring_b)
+    max_nu = wrap_dihedral_diff_torch(nu_a, nu_b).abs().max().item()
+    assert max_nu < 1e-3
+
+    for nm in ("O4'", "C2'", "C3'", "C4'"):
+        assert not torch.allclose(
+            ring_a[nm].reshape(3),
+            ring_b[nm].reshape(3),
+            atol=1e-4,
+            rtol=1e-4,
+        )
+
+
 def test_chi_scan_matches_measured_dihedral_preserves_pucker_and_sugar_metric(device):
     """Same P and τ_m; varying χ: measured χ matches input; ν/Puncher from ring atoms unchanged."""
     ri = torch.tensor([2], device=device, dtype=torch.long)

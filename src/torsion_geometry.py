@@ -1,4 +1,4 @@
-"""Torsion definitions, sugar puckering (Altona–Sundaralingam / MDAnalysis-compatible), and angle wrapping."""
+"""Torsion definitions, sugar puckering (Altona–Sundaralingam / MDAnalysis conventions), and angle wrapping."""
 
 import functools
 from typing import Optional
@@ -535,9 +535,9 @@ def build_sugar_ring_grid_closed_torch(
     """Build sugar ring atoms in local base frame; χ orients the ring vs template base atoms.
 
     Uses a deterministic φ grid scan and argmin over ring-closure residuals (one branch DOF).
-    This is **not** a closed-form analytic solver nor gradient-smooth in the discrete branch choice.
+    This is not a closed-form solver nor gradient-smooth across the discrete branch choice.
 
-    TODO: replace grid branch selection with fully analytic closed-form closure if needed for
+    TODO: replace grid branch selection with a smooth closed-form ring closure if needed for
     differentiable geometry loss through the discrete argmin boundary.
 
     Returns O4', C1', C2', C3', C4' with shapes [..., 3].

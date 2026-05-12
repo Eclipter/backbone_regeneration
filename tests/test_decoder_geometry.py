@@ -1,4 +1,4 @@
-"""Tests for sugar grid-closure ring, stereo exocyclic atoms, and multi-torsion phosphate decoder."""
+"""Tests for analytic sugar ring closure, stereo exocyclic atoms, and multi-torsion phosphate decoder."""
 
 from pathlib import Path
 
@@ -16,7 +16,7 @@ from bbregen.torsion_geometry import (
     add_exocyclic_sugar_atoms_torch,
     add_o5_from_gamma_torch,
     build_backbone_from_torsions_torch,
-    build_sugar_ring_grid_closed_torch,
+    build_sugar_ring_closed_torch,
     build_window_backbone_from_torsions_torch,
     close_phosphate_bridge_multi_torch,
     dihedral_rad,
@@ -62,8 +62,8 @@ def test_chi_rotation_preserves_sugar_ring_internal_torsions(device):
     tau_m = torch.tensor([0.33], device=device)
     chi_a = torch.tensor([-0.55], device=device)
     chi_b = torch.tensor([0.78], device=device)
-    ring_a = build_sugar_ring_grid_closed_torch(chi_a, P, tau_m, ri)
-    ring_b = build_sugar_ring_grid_closed_torch(chi_b, P, tau_m, ri)
+    ring_a = build_sugar_ring_closed_torch(chi_a, P, tau_m, ri)
+    ring_b = build_sugar_ring_closed_torch(chi_b, P, tau_m, ri)
 
     def _ring_nus(ring: dict) -> torch.Tensor:
         return torch.stack(
@@ -105,7 +105,7 @@ def test_chi_scan_matches_measured_dihedral_preserves_pucker_and_sugar_metric(de
     c_atom = tc['chi_c'][ri].reshape(1, 3)
     dist_ref = None
     for chi in chis:
-        ring = build_sugar_ring_grid_closed_torch(chi.unsqueeze(0), P, tau_m, ri)
+        ring = build_sugar_ring_closed_torch(chi.unsqueeze(0), P, tau_m, ri)
         atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=ri)
         mchi = dihedral_rad_torch(
             atoms["O4'"].reshape(1, 3),
@@ -141,7 +141,7 @@ def test_pseudorotation_torsions_consistent(device):
     P = torch.linspace(-1.0, 1.0, 4, device=device)
     tau = torch.full((4,), 0.35, device=device)
     chi = torch.zeros(4, device=device)
-    ring = build_sugar_ring_grid_closed_torch(chi, P, tau, restype_idx)
+    ring = build_sugar_ring_closed_torch(chi, P, tau, restype_idx)
     tgt = nus_rad_from_P_tau_torch(P, tau)
     for i, (a0, a1, a2, a3) in enumerate(
         [
@@ -166,7 +166,7 @@ def test_sugar_ring_is_closed(device):
         P = (torch.rand(16, device=device) * 2.0 - 1.0) * torch.pi
         tau = torch.rand(16, device=device) * 0.2 + 0.28
         chi = (torch.rand(16, device=device) - 0.5) * torch.pi
-        ring = build_sugar_ring_grid_closed_torch(chi, P, tau, restype_idx)
+        ring = build_sugar_ring_closed_torch(chi, P, tau, restype_idx)
         tc = _template_tc(device)
         bl_o4 = tc['bl_o4_c4'][restype_idx.long()]
         dst = (ring["C4'"] - ring["O4'"]).norm(dim=-1)
@@ -186,7 +186,7 @@ def test_exocyclic_stereochemistry(device):
     P = torch.tensor([0.2], device=device)
     tau = torch.tensor([0.34], device=device)
     chi = torch.zeros(1, device=device)
-    ring = build_sugar_ring_grid_closed_torch(chi, P, tau, ri)
+    ring = build_sugar_ring_closed_torch(chi, P, tau, ri)
     atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=ri)
     tc = _template_tc(device)
     l_o3 = tc['bl_o3_c3'][ri]
@@ -207,7 +207,7 @@ def test_gamma_places_o5(device):
     P = torch.tensor([-0.1], device=device)
     tau = torch.tensor([0.32], device=device)
     chi = torch.zeros(1, device=device)
-    ring = build_sugar_ring_grid_closed_torch(chi, P, tau, ri)
+    ring = build_sugar_ring_closed_torch(chi, P, tau, ri)
     atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=ri)
     gam = torch.tensor([0.55], device=device)
     atoms = add_o5_from_gamma_torch(atoms, gam, restype_indices=ri)

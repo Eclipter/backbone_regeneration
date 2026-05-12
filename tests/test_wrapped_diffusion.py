@@ -13,7 +13,7 @@ from bbregen.torsion_geometry import (
     N_LATENT,
     N_TORSIONS,
     TORSION_NAMES,
-    build_sugar_ring_grid_closed_torch,
+    build_sugar_ring_closed_torch,
     dihedral_rad_torch,
     wrap_dihedral_diff_torch,
 )
@@ -107,8 +107,8 @@ def test_chi_affects_coordinates():
     tau = torch.tensor([0.33])
     chi_a = torch.tensor([-0.55])
     chi_b = torch.tensor([1.1])
-    r_a = build_sugar_ring_grid_closed_torch(chi_a, P, tau, ri)
-    r_b = build_sugar_ring_grid_closed_torch(chi_b, P, tau, ri)
+    r_a = build_sugar_ring_closed_torch(chi_a, P, tau, ri)
+    r_b = build_sugar_ring_closed_torch(chi_b, P, tau, ri)
     assert not torch.allclose(r_a["O4'"], r_b["O4'"], atol=1e-4)
     from bbregen.torsion_geometry import _get_template_tensors
 
@@ -129,7 +129,7 @@ def test_chi_torch_pyrimidine_matches_measured_dihedral():
     P = torch.tensor([0.12])
     tau = torch.tensor([0.34])
     chi_tgt = torch.tensor([-0.4])
-    r = build_sugar_ring_grid_closed_torch(chi_tgt, P, tau, ri)
+    r = build_sugar_ring_closed_torch(chi_tgt, P, tau, ri)
     from bbregen.torsion_geometry import _get_template_tensors
 
     tc = _get_template_tensors('cpu')

@@ -12,10 +12,13 @@ def test_val_rmsd_impl_calls_window_backbone_builder_only():
     assert 'build_backbone_from_torsions_torch' not in src
 
 
-def test_val_rmsd_logger_uses_oracle_context_metric_names():
+def test_val_rmsd_metric_name():
     src = inspect.getsource(PytorchLightningModule._log_rmsd)
-    assert "f'{prefix}/rmsd_oracle_context'" in src
-    assert 'rmsd_window_builder' not in src
+    assert "f'{prefix}_rmsd'" in src
+    ck = Path(__file__).resolve().parents[1] / 'scripts' / 'train.py'
+    assert "monitor='val_rmsd'" in ck.read_text()
+    sched = inspect.getsource(PytorchLightningModule.configure_optimizers)
+    assert "'monitor': 'val_rmsd'" in sched
 
 
 def test_predict_merges_target_residue_only_from_cached_window():

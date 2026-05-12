@@ -459,11 +459,19 @@ class PytorchLightningModule(pl.LightningModule):
                 self.logger.experiment.add_scalar(key, metrics[key], self.current_epoch)
 
     def _write_rmsd_scalars(self, prefix):
-        self._write_epoch_scalars([
-            f'{prefix}/rmsd_oracle_context',
-            f'{prefix}/rmsd_oracle_context_central',
-            f'{prefix}/rmsd_oracle_context_edge',
-        ])
+        if prefix == 'val':
+            keys = [
+                'val_rmsd',
+                'val_rmsd_central',
+                'val_rmsd_edge',
+            ]
+        else:
+            keys = [
+                'test_rmsd',
+                'test_rmsd_central',
+                'test_rmsd_edge',
+            ]
+        self._write_epoch_scalars(keys)
 
     def _val_closure_tensorboard_keys(self):
         """TensorBoard extras when validation logs bridge closure diagnostics."""
@@ -651,9 +659,9 @@ class PytorchLightningModule(pl.LightningModule):
         finite = torch.isfinite(per_graph_rmsd)
 
         for name, mask in [
-            (f'{prefix}/rmsd_oracle_context', finite),
-            (f'{prefix}/rmsd_oracle_context_central', (~is_edge) & finite),
-            (f'{prefix}/rmsd_oracle_context_edge', is_edge & finite),
+            (f'{prefix}_rmsd', finite),
+            (f'{prefix}_rmsd_central', (~is_edge) & finite),
+            (f'{prefix}_rmsd_edge', is_edge & finite),
         ]:
             if mask.any():
                 self.log(
@@ -707,5 +715,5 @@ class PytorchLightningModule(pl.LightningModule):
         )
         return {
             'optimizer': optimizer,
-            'lr_scheduler': {'scheduler': scheduler, 'monitor': 'val/rmsd_oracle_context'},
+            'lr_scheduler': {'scheduler': scheduler, 'monitor': 'val_rmsd'},
         }

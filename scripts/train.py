@@ -105,7 +105,7 @@ def train_one(cfg):
     # Initialize callbacks
     checkpoint_callback = ModelCheckpoint(
         filename='{epoch}',
-        monitor='val/rmsd_oracle_context',
+        monitor='val_rmsd',
         every_n_epochs=2,
         save_top_k=10,
         save_last=True,

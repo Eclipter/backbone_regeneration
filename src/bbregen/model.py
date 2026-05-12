@@ -8,24 +8,16 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from .bridge_closure import compute_bridge_closure_loss
-from .torsion_constants import LOG_TAU_M_MAX, LOG_TAU_M_MIN, TAU_M_MAX, TAU_M_MIN
-from .torsion_geometry import (
-    N_LATENT,
-    N_TORSIONS,
-    build_batch_window_backbone_from_torsions_torch,
-)
+from .torsion_constants import (LOG_TAU_M_MAX, LOG_TAU_M_MIN, TAU_M_MAX,
+                                TAU_M_MIN)
+from .torsion_geometry import (N_LATENT, N_TORSIONS,
+                               build_batch_window_backbone_from_torsions_torch)
 from .utils import N_CHAIN_END_CLASSES, backbone_atoms, base_to_idx
-from .wrapped_score_diffusion import (
-    decode_torsions,
-    encode_torsions,
-    estimate_theta_tau_from_score_ve,
-    perturb_torsions,
-    reverse_ve_score_step,
-    sigma_schedule,
-    ve_sigma_grid,
-    weighted_score_mse,
-    wrap_angle,
-)
+from .wrapped_score_diffusion import (decode_torsions, encode_torsions,
+                                      estimate_theta_tau_from_score_ve,
+                                      perturb_torsions, reverse_ve_score_step,
+                                      sigma_schedule, ve_sigma_grid,
+                                      weighted_score_mse, wrap_angle)
 
 # Same dimension constant name as in ONNX companion JSON (`N_TORSIONS_LATENT`).
 N_TORSIONS_LATENT = N_LATENT
@@ -81,7 +73,7 @@ class TorsionDenoiser(nn.Module):
 
 
 _N = ('torsions', 'tau_m', 'bb_xyz_world', 'nt_origins_world', 'nt_frames_world', 'base_types',
-       'torsion_mask', 'target_nt_idx')
+      'torsion_mask', 'target_nt_idx')
 
 
 def _require_window_batch_fields(batch) -> None:

@@ -123,7 +123,7 @@ def train_one(cfg):
     trainer = pl.Trainer(
         max_epochs=cfg['NUM_EPOCHS'],
         gradient_clip_val=1,
-        precision='16-mixed',
+        precision='32',
         num_nodes=num_nodes,
         devices=([0, 1] if os.uname().nodename.partition('.')[0] == 'node07' else 'auto'),  # TODO: remove
         logger=logger,

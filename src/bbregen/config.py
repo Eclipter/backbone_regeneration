@@ -40,7 +40,7 @@ EXPERIMENTS = [
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'torsions'
+RUN_NAME = 'torsions/1'
 
 SEED = 42
 

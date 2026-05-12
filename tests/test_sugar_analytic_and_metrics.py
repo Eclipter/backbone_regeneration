@@ -101,8 +101,8 @@ def test_sugar_ring_bonds_reasonable(device='cpu'):
         d = (ring[a] - ring[b]).norm(dim=-1)
         diffs.append((d - tgt_len).abs().reshape(-1))
     ad = torch.cat(diffs)
-    assert float(ad.mean()) < 0.04
-    assert float(ad.max()) < 0.12
+    assert float(ad.mean()) < 0.03, float(ad.mean())
+    assert float(ad.max()) < 0.08, float(ad.max())
 
 
 def test_sugar_ring_no_grid_no_branch_approx():

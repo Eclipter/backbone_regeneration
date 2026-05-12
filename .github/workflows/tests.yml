@@ -34,7 +34,9 @@ jobs:
         with:
           environment-file: pynamod/environment.yml
           environment-name: backbone_regen
-          cache-environment: true
+          cache-environment: false
+          cache-downloads: true
+          cache-downloads-key: conda-${{ hashFiles('environment.yml', 'pynamod/environment.yml', '.github/workflows/tests.yml') }}
           generate-run-shell: false
 
       - name: Update environment with project dependencies

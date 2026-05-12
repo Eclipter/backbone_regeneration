@@ -7,7 +7,7 @@ name = 'backbone-regeneration'
 version = '0.1.0'
 description = 'DNA backbone regeneration from base-only structures'
 readme = 'README.md'
-requires-python = '==3.13'
+requires-python = '==3.13.12'
 urls = {Repository = 'https://github.com/Eclipter/backbone-regeneration'}
 # PyNAMod remains a manual prerequisite; this project expects the local clone documented in README.
 dependencies = [

@@ -17,16 +17,16 @@ jobs:
 
     steps:
       - name: Checkout backbone-regeneration
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Checkout PyNAMod
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: intbio/PyNAMod
           path: pynamod
 
       - name: Create environment with PyNAMod dependencies
-        uses: mamba-org/setup-micromamba@v2
+        uses: mamba-org/setup-micromamba@v3
         with:
           environment-file: pynamod/environment.yml
           environment-name: backbone_regen

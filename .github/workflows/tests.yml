@@ -10,6 +10,7 @@ on:
       - src/**
       - tests/**
       - environment.yml
+      - pynamod/environment.yml
       - pyproject.toml
       - .github/workflows/tests.yml
   pull_request: *test_paths
@@ -45,6 +46,20 @@ jobs:
           micromamba env update \
               -n backbone_regen \
               -f environment.yml
+
+      - name: Cache pip downloads
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: >-
+            pip-${{ runner.os }}-${{ hashFiles(
+              'pyproject.toml',
+              'environment.yml',
+              'pynamod/environment.yml',
+              '.github/workflows/tests.yml'
+            ) }}
+          restore-keys: |
+            pip-${{ runner.os }}-
 
       - name: Install editable packages
         shell: bash -el {0}

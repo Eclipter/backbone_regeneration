@@ -16,26 +16,39 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Checkout
+      - name: Checkout backbone-regeneration
         uses: actions/checkout@v4
 
-      - name: Micromamba (environment.yml)
+      - name: Checkout PyNAMod
+        uses: actions/checkout@v4
+        with:
+          repository: intbio/PyNAMod
+          path: pynamod
+
+      - name: Create environment with PyNAMod dependencies
         uses: mamba-org/setup-micromamba@v2
         with:
-          environment-file: environment.yml
+          environment-file: pynamod/environment.yml
           environment-name: backbone_regen
           cache-environment: true
+          generate-run-shell: false
 
-      - name: Install pytest
+      - name: Update environment with project dependencies
+        shell: bash -el {0}
+        run: |
+          micromamba env update \
+              -n backbone_regen \
+              -f environment.yml
+
+      - name: Install editable packages
         shell: bash -el {0}
         run: |
           micromamba run -n backbone_regen \
               pip install -U pip
           micromamba run -n backbone_regen \
-              pip install -e '.[test]'
+              pip install -e '.[test]' -e ./pynamod
 
       - name: Run pytest
         shell: bash -el {0}
         run: |
-          micromamba run -n backbone_regen \
-              pytest tests
+          micromamba run -n backbone_regen pytest tests

@@ -8,16 +8,14 @@ from typing import Any, cast
 import torch
 
 from bbregen.model import PytorchLightningModule, TorsionDenoiser
-from bbregen.torsion_constants import assert_torsion_layout
+from bbregen.torsion_constants import assert_torsion_layout, N_LATENT, N_TORSIONS, TORSION_NAMES
 from bbregen.torsion_geometry import (
-    N_LATENT,
-    N_TORSIONS,
-    TORSION_NAMES,
-    build_sugar_ring_closed_torch,
+    build_sugar_ring_closed_form_torch,
     dihedral_rad_torch,
     wrap_dihedral_diff_torch,
 )
-from bbregen.wrapped_score_diffusion import encode_torsions, decode_torsions, perturb_torsions, wrap_angle
+from bbregen.wrapped_score_diffusion import (decode_torsions, encode_torsions,
+                                             perturb_torsions, wrap_angle)
 
 
 def test_wrap_angle_range():
@@ -107,8 +105,8 @@ def test_chi_affects_coordinates():
     tau = torch.tensor([0.33])
     chi_a = torch.tensor([-0.55])
     chi_b = torch.tensor([1.1])
-    r_a = build_sugar_ring_closed_torch(chi_a, P, tau, ri)
-    r_b = build_sugar_ring_closed_torch(chi_b, P, tau, ri)
+    r_a = build_sugar_ring_closed_form_torch(chi_a, P, tau, ri)
+    r_b = build_sugar_ring_closed_form_torch(chi_b, P, tau, ri)
     assert not torch.allclose(r_a["O4'"], r_b["O4'"], atol=1e-4)
     from bbregen.torsion_geometry import _get_template_tensors
 
@@ -121,7 +119,7 @@ def test_chi_affects_coordinates():
         n_atom,
         c_atom,
     )
-    assert abs(float(meas.item()) - float(chi_a.item())) < 0.06
+    assert abs(float(meas.item()) - float(chi_a.item())) < 0.02
 
 
 def test_chi_torch_pyrimidine_matches_measured_dihedral():
@@ -129,7 +127,7 @@ def test_chi_torch_pyrimidine_matches_measured_dihedral():
     P = torch.tensor([0.12])
     tau = torch.tensor([0.34])
     chi_tgt = torch.tensor([-0.4])
-    r = build_sugar_ring_closed_torch(chi_tgt, P, tau, ri)
+    r = build_sugar_ring_closed_form_torch(chi_tgt, P, tau, ri)
     from bbregen.torsion_geometry import _get_template_tensors
 
     tc = _get_template_tensors('cpu')
@@ -141,7 +139,7 @@ def test_chi_torch_pyrimidine_matches_measured_dihedral():
         n_atom,
         c_atom,
     )
-    assert wrap_dihedral_diff_torch(meas, chi_tgt).abs().item() < 0.07
+    assert wrap_dihedral_diff_torch(meas, chi_tgt).abs().item() < 0.02
 
 
 def test_world_local_roundtrip():

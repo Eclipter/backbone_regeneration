@@ -1,4 +1,4 @@
-"""Analytic sugar ring closure (no φ grid), builder invariants, and wrapped score layout checks."""
+"""Closed-form sugar ring (planar PCA + pseudorotation), builder invariants, wrapped score layout."""
 
 import inspect
 import re
@@ -8,11 +8,15 @@ from typing import Any, cast
 import torch
 
 from bbregen.model import PytorchLightningModule, TorsionDenoiser
-from bbregen.torsion_constants import N_LATENT, N_TORSIONS
+from bbregen.torsion_constants import N_LATENT, N_TORSIONS, TORSION_NAMES
 from bbregen.torsion_geometry import (
     _get_template_tensors,
-    build_sugar_ring_closed_torch,
+    build_backbone_from_torsions_torch,
+    build_sugar_ring_closed_form_torch,
+    dihedral_rad_torch,
     pseudorotation_to_nus_torch,
+    signed_tetra_volume,
+    sugar_ring_from_xy_z_torch,
     sugar_ring_torsions_torch,
     wrap_dihedral_diff_torch,
 )
@@ -24,63 +28,107 @@ from bbregen.wrapped_score_diffusion import (
 )
 
 
-def test_no_sugar_grid_solver():
+def test_sugar_ring_closed_form_no_grid():
     import bbregen.torsion_geometry as tg
 
-    src = Path(tg.__file__).read_text()
-    assert '_PHI_SUGAR_GRID' not in src
-    assert 'build_sugar_ring_grid' not in src
-    body = inspect.getsource(tg.build_sugar_ring_closed_torch)
-    assert 'linspace' not in body
+    bb_src = inspect.getsource(tg.build_backbone_from_torsions_torch)
+    assert 'build_sugar_ring_closed_form_torch' in bb_src
+    assert 'build_sugar_ring_grid' not in bb_src
+    assert 'build_sugar_ring_closed_torch' not in bb_src
+    r = build_sugar_ring_closed_form_torch
+    assert r is not None and callable(r)
 
 
-def test_sugar_ring_analytic_lengths_angles(device='cpu'):
+def test_sugar_pseudorotation_torsions_match(device='cpu'):
+    dev = torch.device(device)
+    P = torch.tensor(
+        [
+            -torch.pi,
+            -2 * torch.pi / 3,
+            -torch.pi / 3,
+            0.0,
+            torch.pi / 3,
+            2 * torch.pi / 3,
+            torch.pi,
+        ],
+        device=dev,
+    )
+    tau_vals = torch.tensor([0.3, 0.5, 0.7], device=dev)
+    errs = []
+    for tv in tau_vals:
+        tau_m = tv.expand_as(P)
+        chi = torch.zeros_like(P)
+        ri = torch.arange(P.shape[0], device=dev, dtype=torch.long) % 4
+        ring = build_sugar_ring_closed_form_torch(chi, P, tau_m, ri)
+        nu_act = sugar_ring_torsions_torch(ring)
+        nu_tgt = pseudorotation_to_nus_torch(P, tau_m)
+        d = wrap_dihedral_diff_torch(nu_act, nu_tgt).abs()
+        errs.append(d.reshape(-1))
+    all_e = torch.cat(errs)
+    mean_all = float(all_e.mean())
+    max_all = float(all_e.max())
+    assert mean_all < 0.05, mean_all
+    assert max_all < 0.12, max_all
+
+
+def test_sugar_ring_bonds_reasonable(device='cpu'):
     dev = torch.device(device)
     tc = _get_template_tensors(str(dev))
-    for ri_ in (0, 1, 2, 3):
-        ri = torch.tensor([ri_], device=dev)
-        P = torch.tensor([0.12 - 0.04 * ri_], device=dev)
-        tau_m = torch.tensor([0.28 + 0.02 * ri_], device=dev)
-        chi = torch.zeros(1, device=dev)
-        ring = build_sugar_ring_closed_torch(chi, P, tau_m, ri)
-        assert torch.isfinite(ring["O4'"]).all() and torch.isfinite(ring["C4'"]).all()
-
-        bl_o4_c4 = tc['bl_o4_c4'][ri]
-        assert ((ring["C4'"] - ring["O4'"]).norm(dim=-1) - bl_o4_c4).abs().item() < 0.5
-
-        def _ang(a, b, c):
-            ba = a - b
-            bc = c - b
-            x = (ba * bc).sum(dim=-1) / (ba.norm(dim=-1) * bc.norm(dim=-1)).clamp(min=1e-8)
-            return torch.acos(x.clamp(-1.0, 1.0))
-
-        tgt_o4 = _ang(ring["C2'"], ring["C1'"], ring["O4'"])
-        cur = tc['ba_o4_c1_c2'][ri]
-        assert wrap_dihedral_diff_torch(tgt_o4, cur).abs().item() < 0.35
-
-
-def test_sugar_ring_analytic_torsions_match_pseudorotation(device='cpu'):
-    dev = torch.device(device)
-    restype_idx = torch.tensor([0, 1, 2, 3], device=dev)
-    P = torch.linspace(-0.9, 0.9, 4, device=dev)
-    tau = torch.full((4,), 0.34, device=dev)
-    chi = torch.zeros(4, device=dev)
-    ring = build_sugar_ring_closed_torch(chi, P, tau, restype_idx)
-    nu_tgt = pseudorotation_to_nus_torch(P, tau)
-    nu_act = sugar_ring_torsions_torch(ring)
-    err = wrap_dihedral_diff_torch(nu_act, nu_tgt).abs().max().item()
-    assert err < 0.55
+    P = torch.tensor(
+        [
+            -torch.pi,
+            -torch.pi / 2,
+            0.0,
+            torch.pi / 2,
+            torch.pi,
+        ],
+        device=dev,
+    )
+    tau_m = torch.full_like(P, 0.45)
+    chi = torch.zeros_like(P)
+    ri = torch.tensor([0, 1, 2, 3, 0], device=dev, dtype=torch.long)
+    ring = build_sugar_ring_closed_form_torch(chi, P, tau_m, ri)
+    bl_o4_c1 = (tc['c1'][ri] - tc['o4'][ri]).norm(dim=-1)
+    bls = [
+        ("O4'", "C1'", bl_o4_c1),
+        ("C1'", "C2'", tc['bl_c2_c1'][ri]),
+        ("C2'", "C3'", tc['bl_c3_c2'][ri]),
+        ("C3'", "C4'", tc['bl_c4_c3'][ri]),
+        ("C4'", "O4'", tc['bl_o4_c4'][ri]),
+    ]
+    diffs = []
+    for a, b, tgt_len in bls:
+        d = (ring[a] - ring[b]).norm(dim=-1)
+        diffs.append((d - tgt_len).abs().reshape(-1))
+    ad = torch.cat(diffs)
+    assert float(ad.mean()) < 0.04
+    assert float(ad.max()) < 0.12
 
 
-def test_chi_affects_coordinates_without_changing_pucker(device='cpu'):
+def test_sugar_ring_no_grid_no_branch_approx():
+    body = inspect.getsource(build_sugar_ring_closed_form_torch)
+    banned_substrings = (
+        'torch.linspace',
+        'linspace',
+        'two_phi_p3',
+        'two_phi_p0',
+        'c3_two_cone_sphere',
+        'intersect_circles_3d_torch',
+        'argmin',
+    )
+    for s in banned_substrings:
+        assert s not in body, s
+
+
+def test_chi_changes_orientation_not_pucker(device='cpu'):
     dev = torch.device(device)
     ri = torch.tensor([1], device=dev, dtype=torch.long)
     P = torch.tensor([0.16], device=dev)
     tau_m = torch.tensor([0.32], device=dev)
     chi_a = torch.tensor([-0.6], device=dev)
     chi_b = torch.tensor([0.9], device=dev)
-    ring_a = build_sugar_ring_closed_torch(chi_a, P, tau_m, ri)
-    ring_b = build_sugar_ring_closed_torch(chi_b, P, tau_m, ri)
+    ring_a = build_sugar_ring_closed_form_torch(chi_a, P, tau_m, ri)
+    ring_b = build_sugar_ring_closed_form_torch(chi_b, P, tau_m, ri)
     nu_a = sugar_ring_torsions_torch(ring_a)
     nu_b = sugar_ring_torsions_torch(ring_b)
     assert wrap_dihedral_diff_torch(nu_a, nu_b).abs().max().item() < 1e-2
@@ -89,26 +137,71 @@ def test_chi_affects_coordinates_without_changing_pucker(device='cpu'):
     tc = _get_template_tensors(str(dev))
     n_atom = tc['chi_n'][ri]
     c_atom = tc['chi_c'][ri]
-    from bbregen.torsion_geometry import dihedral_rad_torch
-
     mchi = dihedral_rad_torch(
         ring_b["O4'"].reshape(1, 3),
         ring_b["C1'"].reshape(1, 3),
         n_atom.reshape(1, 3),
         c_atom.reshape(1, 3),
     )
-    assert wrap_dihedral_diff_torch(mchi, chi_b).abs().item() < 0.09
+    assert wrap_dihedral_diff_torch(mchi, chi_b).abs().item() < 0.02
 
 
-def test_builder_no_delta():
-    src = inspect.getsource(build_sugar_ring_closed_torch)
-    assert 'delta' not in src.lower()
-    assert 'delta' not in inspect.signature(build_sugar_ring_closed_torch).parameters
+def test_sugar_ring_chirality_matches_template(device='cpu'):
+    dev = torch.device(device)
+    tc = _get_template_tensors(str(dev))
+    for ri_ in (0, 1, 2, 3):
+        ri = torch.tensor([ri_], device=dev)
+        P = torch.tensor([0.1 + 0.05 * ri_], device=dev)
+        tau_m = torch.tensor([0.31], device=dev)
+        chi = torch.zeros(1, device=dev)
+        ring = build_sugar_ring_closed_form_torch(chi, P, tau_m, ri)
+        o4, c2, c3, c4 = ring["O4'"], ring["C2'"], ring["C3'"], ring["C4'"]
+        trip = signed_tetra_volume(
+            o4.reshape(1, 3),
+            c2.reshape(1, 3),
+            c3.reshape(1, 3),
+            c4.reshape(1, 3),
+        )
+        ref = tc['ring_chiral_triple'][ri]
+        assert torch.sign(trip) == torch.sign(ref)
 
 
-def test_wrapped_score_diffusion_still_intact():
+def test_batch_shapes_and_finite(device='cpu'):
+    dev = torch.device(device)
+    B, W = 3, 5
+    chi = torch.randn(B, W, device=dev)
+    P = torch.randn(B, W, device=dev)
+    tau_m = torch.rand(B, W, device=dev) * 0.08 + 0.28
+    ri = torch.randint(0, 4, (B, W), device=dev)
+    ring = build_sugar_ring_closed_form_torch(chi, P, tau_m, ri)
+    for nm in ("O4'", "C1'", "C2'", "C3'", "C4'"):
+        assert ring[nm].shape == (B, W, 3)
+        assert torch.isfinite(ring[nm]).all()
+
+
+def test_sugar_ring_from_xy_z_contract(device='cpu'):
+    from bbregen import torsion_geometry as tg
+
+    dev = torch.device(device)
+    sp = tg._planar_sugar_spec()
+    xy = torch.as_tensor(sp['xy'], device=dev, dtype=torch.float32)
+    z = torch.zeros(2, 5, device=dev)
+    ctr = torch.as_tensor(sp['center'], device=dev)
+    e1 = torch.as_tensor(sp['e1'], device=dev)
+    e2 = torch.as_tensor(sp['e2'], device=dev)
+    en = torch.as_tensor(sp['en'], device=dev)
+    out = sugar_ring_from_xy_z_torch(xy, z, ctr, e1, e2, en)
+    assert out.shape == (2, 5, 3)
+    assert torch.isfinite(out).all()
+
+
+def test_closed_form_no_delta_no_sincos():
     assert N_TORSIONS == 7
     assert N_LATENT == 8
+    assert TORSION_NAMES == ('alpha', 'beta', 'gamma', 'epsilon', 'zeta', 'chi', 'P')
+    src = inspect.getsource(build_sugar_ring_closed_form_torch)
+    assert 'delta' not in inspect.signature(build_sugar_ring_closed_form_torch).parameters
+    assert 'delta' not in src.lower()
     wsd = Path(__file__).resolve().parents[1] / 'src' / 'bbregen' / 'wrapped_score_diffusion.py'
     txt = wsd.read_text()
     assert re.search(r'N_TORSIONS\s*\*\s*2', txt) is None

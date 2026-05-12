@@ -1,25 +1,16 @@
 """Torsion definitions, sugar puckering (Altona–Sundaralingam / MDAnalysis conventions), and angle wrapping."""
 
 import functools
-from typing import Optional
+import math
+from typing import Any, Optional
 
 import numpy as np
 import torch
 
-from .torsion_constants import (
-    N_LATENT,
-    N_TORSIONS,
-    N_TORSIONS_LATENT,
-    TOR_ALPHA,
-    TOR_BETA,
-    TOR_CHI,
-    TOR_EPS,
-    TOR_GAMMA,
-    TOR_PUCKER_P,
-    TOR_ZETA,
-    TORSION_IS_CIRCULAR,
-    TORSION_NAMES,
-)
+from .torsion_constants import (N_LATENT, N_TORSIONS, N_TORSIONS_LATENT,
+                                TOR_ALPHA, TOR_BETA, TOR_CHI, TOR_EPS,
+                                TOR_GAMMA, TOR_PUCKER_P, TOR_ZETA,
+                                TORSION_IS_CIRCULAR, TORSION_NAMES)
 
 
 def world_to_local_points(
@@ -343,7 +334,7 @@ def _get_template_tensors(device_str: str) -> dict:
     def _dr(tpl, a, b, c, d):
         return float(dihedral_rad(tpl[a], tpl[b], tpl[c], tpl[d]))
 
-    keys_3d = ['c1', 'o4', 'c4_ref', 'chi_n', 'chi_c']
+    keys_3d = ['c1', 'o4', 'c2_ref', 'c4_ref', 'chi_n', 'chi_c']
     keys_1d = [
         'bl_c2_c1', 'ba_o4_c1_c2',
         'bl_c3_c2', 'ba_c1_c2_c3',
@@ -358,7 +349,8 @@ def _get_template_tensors(device_str: str) -> dict:
         'bl_op1', 'bl_op2',
         'ang_op1', 'ang_op2',
         'psi_op1', 'psi_op2',
-        'psi_o3', 'bl_o4_c4', 'ring_chiral_triple',
+        'psi_o3', 'bl_o4_c4', 'ba_c1_o4_c4', 'ba_o4_c4_c3',
+        'ring_chiral_triple',
     ]
 
     rows_3d = {k: [] for k in keys_3d}
@@ -368,6 +360,7 @@ def _get_template_tensors(device_str: str) -> dict:
         tpl = _get_template(rt)
         rows_3d['c1'].append(tpl["C1'"])
         rows_3d['o4'].append(tpl["O4'"])
+        rows_3d['c2_ref'].append(tpl["C2'"])
         rows_3d['c4_ref'].append(tpl["C4'"])
         if rt in ('A', 'G'):
             rows_3d['chi_n'].append(tpl['N9'])
@@ -403,6 +396,8 @@ def _get_template_tensors(device_str: str) -> dict:
         rows_1d['psi_op2'].append(_dr(tpl, "O3'", "O5'", 'P', 'OP2'))
         rows_1d['psi_o3'].append(_dr(tpl, "C5'", "C4'", "C3'", "O3'"))
         rows_1d['bl_o4_c4'].append(_bl(tpl, "O4'", "C4'"))
+        rows_1d['ba_c1_o4_c4'].append(_ba(tpl, "C1'", "O4'", "C4'"))
+        rows_1d['ba_o4_c4_c3'].append(_ba(tpl, "O4'", "C4'", "C3'"))
         _v2 = tpl["C2'"] - tpl["O4'"]
         _v3 = tpl["C3'"] - tpl["O4'"]
         _v4 = tpl["C4'"] - tpl["O4'"]
@@ -418,7 +413,7 @@ def _get_template_tensors(device_str: str) -> dict:
     return out
 
 
-# --- Torch geometry decoder (sugar ring: closed-form φ from quartic + template NERF chain; phosphate still uses φ grid) ---
+# --- Torch geometry decoder (sugar ring: planar canonical + pseudorotation; phosphate uses φ grid) ---
 
 _GEO_EPS = 1e-8
 _PHI_PHOS_GRID = 128
@@ -553,80 +548,6 @@ def _circle_line_or_circle_angle_intersection(
     raise ValueError('Specify line_point/line_dir or cone parameters.')
 
 
-def _fit_cos_sin_batch(
-    phi_s: torch.Tensor,
-    ys: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Solve y = a + b cos(phi) + c sin(phi); phi_s [S], ys [B, S] -> a,b,c [B]."""
-    vand = torch.stack(
-        [
-            torch.ones_like(phi_s),
-            torch.cos(phi_s),
-            torch.sin(phi_s),
-        ],
-        dim=-1,
-    )
-    sol = torch.linalg.lstsq(
-        vand.expand(ys.shape[0], -1, -1),
-        ys.unsqueeze(-1),
-        driver='gels' if ys.device.type == 'cuda' else None,
-    ).solution.squeeze(-1).to(dtype=ys.dtype)
-    return sol[:, 0], sol[:, 1], sol[:, 2]
-
-
-def _scalar_fourier_coeffs_from_Mh(
-    M: torch.Tensor,
-    h: torch.Tensor,
-    c0: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """f = A + B cos + C sin + Fm cos2 + Em sin2 for ||p + G [c,s]^T||^2 on the unit circle."""
-    m11 = M[:, 0, 0]
-    m12 = M[:, 0, 1]
-    m22 = M[:, 1, 1]
-    Fm = 0.5 * (m11 - m22)
-    Em = m12
-    Bcoef = 2.0 * h[:, 0]
-    Ccoef = 2.0 * h[:, 1]
-    A0 = c0 + 0.5 * (m11 + m22)
-    return A0, Bcoef, Ccoef, Fm, Em
-
-
-def _quartic_phi_stationary(
-    Bcoef: torch.Tensor,
-    Ccoef: torch.Tensor,
-    Fm: torch.Tensor,
-    Em: torch.Tensor,
-) -> torch.Tensor:
-    """Stationary phi for A+Bcos+Csin+Fm cos2+Em sin2 via quartic in t=tan(phi/2); returns [B,4]."""
-    dev = Bcoef.device
-    a4 = -Ccoef + 2.0 * Em
-    a3 = -2.0 * Bcoef + 8.0 * Fm
-    a2 = -12.0 * Em
-    a1 = -2.0 * Bcoef - 8.0 * Fm
-    a0 = Ccoef + 2.0 * Em
-    lin = a4.abs() < 1e-12
-    a4_m = torch.where(lin, a4.sign() * 1e-12 + 1e-14, a4)
-    ma3 = a3 / a4_m
-    ma2 = a2 / a4_m
-    ma1 = a1 / a4_m
-    ma0 = a0 / a4_m
-    Bsz = Bcoef.shape[0]
-    comp = torch.zeros(Bsz, 4, 4, device=dev, dtype=torch.cdouble)
-    comp[:, 0, 1] = 1
-    comp[:, 1, 2] = 1
-    comp[:, 2, 3] = 1
-    comp[:, 3, 0] = -ma0.to(torch.cdouble)
-    comp[:, 3, 1] = -ma1.to(torch.cdouble)
-    comp[:, 3, 2] = -ma2.to(torch.cdouble)
-    comp[:, 3, 3] = -ma3.to(torch.cdouble)
-    roots_t = torch.linalg.eigvals(comp)
-    t_real = roots_t.real
-    mask_im = roots_t.imag.abs() < 1e-3
-    phi = 2.0 * torch.atan(t_real)
-    phi = torch.where(mask_im, phi, torch.full_like(phi, float('nan')))
-    return phi.to(dtype=Bcoef.dtype)
-
-
 def dihedral_rad_torch(
     p0: torch.Tensor,
     p1: torch.Tensor,
@@ -695,6 +616,394 @@ def sugar_ring_torsions_torch(atoms: dict[str, torch.Tensor]) -> torch.Tensor:
     return _ring_dihedrals_from_coords_torch(atoms)
 
 
+def _circle_basis_from_bond_angle_torch(
+    anchor: torch.Tensor,
+    neighbor: torch.Tensor,
+    bond_length: torch.Tensor,
+    bond_angle: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Circle of X with |X−anchor| = bond_length and ∠(neighbor, anchor, X) = bond_angle (interior).
+
+    Returns ``center, e1, e2, r_ring`` with
+    ``X(φ) = center + r_ring * (cos φ * e1 + sin φ * e2)``.
+    """
+    u, e1, e2 = _orthonormal_basis_from_axis(neighbor - anchor)
+    L = bond_length.reshape(-1, 1).to(dtype=u.dtype)
+    ba = bond_angle.reshape(-1, 1).to(dtype=u.dtype)
+    cos_b = torch.cos(ba)
+    sin_b = torch.sin(ba)
+    center = anchor + L * cos_b * u
+    r_ring = (L * sin_b).reshape(-1)
+    return center, e1, e2, r_ring
+
+
+def _point_on_circle_torch(
+    center: torch.Tensor,
+    e1: torch.Tensor,
+    e2: torch.Tensor,
+    r_ring: torch.Tensor,
+    phi: torch.Tensor,
+) -> torch.Tensor:
+    """``phi`` shape [...]; ``r_ring`` broadcastable to [...]."""
+    center = center.reshape(-1, 3)
+    e1 = e1.reshape(-1, 3)
+    e2 = e2.reshape(-1, 3)
+    r_ring = r_ring.reshape(-1)
+    phi = phi.reshape(-1)
+    rr = r_ring.unsqueeze(-1)
+    cp = torch.cos(phi).unsqueeze(-1)
+    sp = torch.sin(phi).unsqueeze(-1)
+    return center + rr * (cp * e1 + sp * e2)
+
+
+def _angle_at_center_torch(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """Interior angle ∠(a, b, c) at ``b``; batch [...,3]."""
+    ba = a - b
+    bc = c - b
+    denom = (ba.norm(dim=-1) * bc.norm(dim=-1)).clamp(min=_GEO_EPS)
+    x = (ba * bc).sum(dim=-1) / denom
+    return torch.acos(x.clamp(-1.0, 1.0))
+
+
+def signed_tetra_volume(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    d: torch.Tensor,
+) -> torch.Tensor:
+    """Signed volume ∝ (b−a)·((c−a)×(d−a)); shape matches broadcast of inputs."""
+    return (torch.linalg.cross(b - a, c - a, dim=-1) * (d - a)).sum(dim=-1)
+
+
+def intersect_circles_3d_torch(
+    center1: torch.Tensor,
+    normal1: torch.Tensor,
+    radius1: torch.Tensor,
+    center2: torch.Tensor,
+    normal2: torch.Tensor,
+    radius2: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Two closed-form intersection points of coplanar circles in different planes [... , 2, 3]."""
+    n1 = _safe_normalize(normal1, eps=eps)
+    n2 = _safe_normalize(normal2, eps=eps)
+    d1 = (n1 * center1).sum(dim=-1)
+    d2 = (n2 * center2).sum(dim=-1)
+    w = torch.linalg.cross(n1, n2, dim=-1)
+    w_norm_sq = (w * w).sum(dim=-1)
+    cross_n2_w = torch.linalg.cross(n2, w, dim=-1)
+    cross_w_n1 = torch.linalg.cross(w, n1, dim=-1)
+    degen = w_norm_sq < eps * eps
+    w_norm_sq_safe = torch.where(degen, torch.ones_like(w_norm_sq), w_norm_sq).clamp(min=eps * eps)
+    p0 = (
+        d1.unsqueeze(-1) * cross_n2_w + d2.unsqueeze(-1) * cross_w_n1
+    ) / w_norm_sq_safe.unsqueeze(-1)
+    d_hat = _safe_normalize(
+        torch.where(
+            degen.unsqueeze(-1),
+            _safe_normalize(center2 - center1, eps=eps),
+            w,
+        ),
+        eps=eps,
+    )
+    v = p0 - center1
+    vd = (v * d_hat).sum(dim=-1)
+    vv = (v * v).sum(dim=-1)
+    r1 = radius1
+    while r1.ndim < vd.ndim:
+        r1 = r1.unsqueeze(-1)
+    r1 = r1.expand_as(vd)
+    disc = (vd * vd - vv + r1 * r1).clamp(min=0.0)
+    t_rt = torch.sqrt(disc)
+    t1 = -vd + t_rt
+    t2 = -vd - t_rt
+    q1 = p0 + t1.unsqueeze(-1) * d_hat
+    q2 = p0 + t2.unsqueeze(-1) * d_hat
+    fb = (center1 + center2) * 0.5
+    bad = degen | (~torch.isfinite(q1).all(dim=-1)) | (~torch.isfinite(q2).all(dim=-1))
+    bad2 = bad.unsqueeze(-1)
+    q1 = torch.where(bad2, fb, q1)
+    q2 = torch.where(bad2, fb + eps * d_hat, q2)
+    return torch.stack([q1, q2], dim=-2)
+
+
+def _c3_two_cone_sphere(
+    c2: torch.Tensor,
+    c4: torch.Tensor,
+    c1: torch.Tensor,
+    bl23: torch.Tensor,
+    bl34: torch.Tensor,
+    ba123: torch.Tensor,
+) -> torch.Tensor:
+    """Two C3′ candidates per row: sphere–sphere circle ∩ bond-angle cone at C2′; ``[..., 2, 3]``."""
+    cc, rc, nc = _sphere_sphere_circle(c2, bl23, c4, bl34)
+    ax = c1 - c2
+    cos_pr = torch.cos(ba123).reshape(-1, 1)
+    cos_alt = torch.cos(torch.pi - ba123).reshape(-1, 1)
+    hits = _circle_line_or_circle_angle_intersection(
+        cc,
+        rc,
+        nc,
+        cone_apex=c2,
+        cone_axis=ax,
+        cone_cos_angle=cos_pr,
+    )
+    hits_alt = _circle_line_or_circle_angle_intersection(
+        cc,
+        rc,
+        nc,
+        cone_apex=c2,
+        cone_axis=ax,
+        cone_cos_angle=cos_alt,
+    )
+    bad = (~torch.isfinite(hits)).any(dim=(-2, -1))
+    bad = bad.unsqueeze(-1).unsqueeze(-1).expand_as(hits)
+    hits = torch.where(bad, hits_alt, hits)
+    bad2 = (~torch.isfinite(hits)).any(dim=(-2, -1))
+    fb = (c2 + c4) * 0.5
+    hits = torch.where(
+        bad2.unsqueeze(-1).unsqueeze(-1).expand_as(hits),
+        fb.unsqueeze(-2).expand(-1, 2, -1),
+        hits,
+    )
+    return hits
+
+
+def _dihedral_linear_xy_torch(
+    p0: torch.Tensor,
+    p1: torch.Tensor,
+    p2: torch.Tensor,
+    p3: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Unnormalized ``(x, y)`` with ``dihedral = atan2(y, x)`` (matches ``dihedral_rad_torch``)."""
+    b1 = p1 - p0
+    b2 = p2 - p1
+    b3 = p3 - p2
+    n1 = torch.linalg.cross(b1, b2, dim=-1)
+    n2 = torch.linalg.cross(b2, b3, dim=-1)
+    b2n = b2.norm(dim=-1).clamp(min=_GEO_EPS)
+    x = (n1 * n2).sum(dim=-1)
+    y = -(b2 * torch.linalg.cross(n1, n2, dim=-1)).sum(dim=-1) / b2n
+    return x, y
+
+
+def _expand_b_times3(t: torch.Tensor) -> torch.Tensor:
+    """[B+, ...] -> [B*3, ...] with leading dim B = t.shape[0]."""
+    b = int(t.shape[0])
+    return t.unsqueeze(1).expand(-1, 3, *t.shape[1:]).reshape(b * 3, *t.shape[1:])
+
+
+def _solve_trig_linear_tan_half(
+    Acoef: torch.Tensor,
+    Bcoef: torch.Tensor,
+    Dcoef: torch.Tensor,
+    phi_ref: torch.Tensor,
+    *,
+    dev: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Solve ``A cos φ + B sin φ + D = 0``; return [B, 2] via ``t = tan(φ/2)``."""
+    qa = Dcoef - Acoef
+    qb = 2.0 * Bcoef
+    qc = Acoef + Dcoef
+    disc = (qb * qb - 4.0 * qa * qc).clamp(min=0.0)
+    sq = torch.sqrt(disc)
+    small_qa = qa.abs() < 1e-10
+    qa_safe = torch.where(small_qa, qa.sign() * 1e-10 + 1e-14, qa)
+    t1 = (-qb + sq) / (2.0 * qa_safe)
+    t2 = (-qb - sq) / (2.0 * qa_safe)
+    lin = small_qa & (qb.abs() >= 1e-10)
+    t_lin = -qc / qb.clamp(min=_GEO_EPS)
+    t1 = torch.where(lin, t_lin, t1)
+    t2 = torch.where(lin, t_lin, t2)
+    phi1 = 2.0 * torch.atan(t1)
+    phi2 = 2.0 * torch.atan(t2)
+    out = torch.stack([phi1, phi2], dim=-1)
+    bad = ~torch.isfinite(out)
+    pr = phi_ref.unsqueeze(-1).expand_as(out)
+    out = torch.where(bad, pr, out)
+    bad_disc = disc < 1e-16
+    out = torch.where(bad_disc.unsqueeze(-1).expand_as(out), pr, out)
+    return out.to(dtype=dtype)
+
+
+def _pick_two_best_phi_p3(
+    p0: torch.Tensor,
+    p1: torch.Tensor,
+    p2: torch.Tensor,
+    center: torch.Tensor,
+    e1: torch.Tensor,
+    e2: torch.Tensor,
+    r_ring: torch.Tensor,
+    tgt: torch.Tensor,
+    phi_ref: torch.Tensor,
+    phi_q: torch.Tensor,
+) -> torch.Tensor:
+    """Pick two φ from quadratic roots, ``φ_ref``, ``φ_ref+π`` by smallest dihedral residual."""
+    Bsz = int(p0.shape[0])
+    dev, dtype = p0.device, p0.dtype
+    pi_ = torch.tensor(np.pi, device=dev, dtype=dtype)
+    cand = torch.stack(
+        [phi_q[:, 0], phi_q[:, 1], phi_ref, phi_ref + pi_],
+        dim=-1,
+    )
+    m = 4
+    p0e = p0.unsqueeze(1).expand(-1, m, -1).reshape(Bsz * m, 3)
+    p1e = p1.unsqueeze(1).expand(-1, m, -1).reshape(Bsz * m, 3)
+    p2e = p2.unsqueeze(1).expand(-1, m, -1).reshape(Bsz * m, 3)
+    ce = center.unsqueeze(1).expand(-1, m, -1).reshape(Bsz * m, 3)
+    e1e = e1.unsqueeze(1).expand(-1, m, -1).reshape(Bsz * m, 3)
+    e2e = e2.unsqueeze(1).expand(-1, m, -1).reshape(Bsz * m, 3)
+    re = r_ring.reshape(-1, 1).expand(-1, m).reshape(Bsz * m)
+    ph = cand.reshape(Bsz * m)
+    p3 = _point_on_circle_torch(ce, e1e, e2e, re, ph)
+    dih = dihedral_rad_torch(p0e, p1e, p2e, p3).reshape(Bsz, m)
+    err = wrap_dihedral_diff_torch(dih, tgt.unsqueeze(-1)).abs()
+    idx = err.argsort(dim=-1)
+    i0 = idx[:, 0]
+    i1 = idx[:, 1]
+    phi0 = cand.gather(1, i0.unsqueeze(1)).squeeze(1)
+    phi1 = cand.gather(1, i1.unsqueeze(1)).squeeze(1)
+    close = (phi0 - phi1).abs() < 0.05
+    i1 = torch.where(close, idx[:, 2], i1)
+    phi1 = cand.gather(1, i1.unsqueeze(1)).squeeze(1)
+    return torch.stack([phi0, phi1], dim=-1)
+
+
+def _pick_two_best_phi_p0(
+    p1: torch.Tensor,
+    p2: torch.Tensor,
+    p3: torch.Tensor,
+    center: torch.Tensor,
+    e1: torch.Tensor,
+    e2: torch.Tensor,
+    r_ring: torch.Tensor,
+    tgt: torch.Tensor,
+    phi_ref: torch.Tensor,
+    phi_q: torch.Tensor,
+) -> torch.Tensor:
+    Bsz = int(p1.shape[0])
+    dev, dtype = p1.device, p1.dtype
+    pi_ = torch.tensor(np.pi, device=dev, dtype=dtype)
+    cand = torch.stack(
+        [phi_q[:, 0], phi_q[:, 1], phi_ref, phi_ref + pi_],
+        dim=-1,
+    )
+    m = 4
+    p1e = p1.unsqueeze(1).expand(-1, m, -1).reshape(Bsz * m, 3)
+    p2e = p2.unsqueeze(1).expand(-1, m, -1).reshape(Bsz * m, 3)
+    p3e = p3.unsqueeze(1).expand(-1, m, -1).reshape(Bsz * m, 3)
+    ce = center.unsqueeze(1).expand(-1, m, -1).reshape(Bsz * m, 3)
+    e1e = e1.unsqueeze(1).expand(-1, m, -1).reshape(Bsz * m, 3)
+    e2e = e2.unsqueeze(1).expand(-1, m, -1).reshape(Bsz * m, 3)
+    re = r_ring.reshape(-1, 1).expand(-1, m).reshape(Bsz * m)
+    ph = cand.reshape(Bsz * m)
+    p0 = _point_on_circle_torch(ce, e1e, e2e, re, ph)
+    dih = dihedral_rad_torch(p0, p1e, p2e, p3e).reshape(Bsz, m)
+    err = wrap_dihedral_diff_torch(dih, tgt.unsqueeze(-1)).abs()
+    idx = err.argsort(dim=-1)
+    i0 = idx[:, 0]
+    i1 = idx[:, 1]
+    phi0 = cand.gather(1, i0.unsqueeze(1)).squeeze(1)
+    phi1 = cand.gather(1, i1.unsqueeze(1)).squeeze(1)
+    close = (phi0 - phi1).abs() < 0.05
+    i1 = torch.where(close, idx[:, 2], i1)
+    phi1 = cand.gather(1, i1.unsqueeze(1)).squeeze(1)
+    return torch.stack([phi0, phi1], dim=-1)
+
+
+def _two_phi_p3_on_circle(
+    p0: torch.Tensor,
+    p1: torch.Tensor,
+    p2: torch.Tensor,
+    center: torch.Tensor,
+    e1: torch.Tensor,
+    e2: torch.Tensor,
+    r_ring: torch.Tensor,
+    tgt: torch.Tensor,
+    phi_ref: torch.Tensor,
+) -> torch.Tensor:
+    """``p3(φ)`` on circle; match ``dihedral(p0,p1,p2,p3(φ)) = tgt``; [B,2]."""
+    Bsz = int(p0.shape[0])
+    dev, dtype = p0.device, p0.dtype
+    phis = torch.tensor([0.0, 0.5 * np.pi, np.pi], device=dev, dtype=dtype)
+    p0e = _expand_b_times3(p0)
+    p1e = _expand_b_times3(p1)
+    p2e = _expand_b_times3(p2)
+    ce = _expand_b_times3(center)
+    e1e = _expand_b_times3(e1)
+    e2e = _expand_b_times3(e2)
+    re = r_ring.reshape(-1, 1).expand(-1, 3).reshape(-1)
+    ph = phis.view(1, 3).expand(Bsz, -1).reshape(-1)
+    p3 = ce + re.unsqueeze(-1) * (
+        torch.cos(ph).unsqueeze(-1) * e1e + torch.sin(ph).unsqueeze(-1) * e2e
+    )
+    x, y = _dihedral_linear_xy_torch(p0e, p1e, p2e, p3)
+    xv = x.reshape(Bsz, 3)
+    yv = y.reshape(Bsz, 3)
+    xc = (xv[:, 0] - xv[:, 2]) * 0.5
+    x0m = (xv[:, 0] + xv[:, 2]) * 0.5
+    xs = xv[:, 1] - x0m
+    yc = (yv[:, 0] - yv[:, 2]) * 0.5
+    y0m = (yv[:, 0] + yv[:, 2]) * 0.5
+    ys = yv[:, 1] - y0m
+    st = torch.sin(tgt)
+    ct = torch.cos(tgt)
+    Acoef = st * xc - ct * yc
+    Bcoef = st * xs - ct * ys
+    Dcoef = st * x0m - ct * y0m
+    phi_q = _solve_trig_linear_tan_half(Acoef, Bcoef, Dcoef, phi_ref, dev=dev, dtype=dtype)
+    return _pick_two_best_phi_p3(
+        p0, p1, p2, center, e1, e2, r_ring, tgt, phi_ref, phi_q,
+    )
+
+
+def _two_phi_p0_on_circle(
+    p1: torch.Tensor,
+    p2: torch.Tensor,
+    p3: torch.Tensor,
+    center: torch.Tensor,
+    e1: torch.Tensor,
+    e2: torch.Tensor,
+    r_ring: torch.Tensor,
+    tgt: torch.Tensor,
+    phi_ref: torch.Tensor,
+) -> torch.Tensor:
+    """``p0(φ)`` on circle; match ``dihedral(p0(φ),p1,p2,p3) = tgt``; [B,2]."""
+    Bsz = int(p1.shape[0])
+    dev, dtype = p1.device, p1.dtype
+    phis = torch.tensor([0.0, 0.5 * np.pi, np.pi], device=dev, dtype=dtype)
+    p1e = _expand_b_times3(p1)
+    p2e = _expand_b_times3(p2)
+    p3e = _expand_b_times3(p3)
+    ce = _expand_b_times3(center)
+    e1e = _expand_b_times3(e1)
+    e2e = _expand_b_times3(e2)
+    re = r_ring.reshape(-1, 1).expand(-1, 3).reshape(-1)
+    ph = phis.view(1, 3).expand(Bsz, -1).reshape(-1)
+    p0 = ce + re.unsqueeze(-1) * (
+        torch.cos(ph).unsqueeze(-1) * e1e + torch.sin(ph).unsqueeze(-1) * e2e
+    )
+    x, y = _dihedral_linear_xy_torch(p0, p1e, p2e, p3e)
+    xv = x.reshape(Bsz, 3)
+    yv = y.reshape(Bsz, 3)
+    xc = (xv[:, 0] - xv[:, 2]) * 0.5
+    x0m = (xv[:, 0] + xv[:, 2]) * 0.5
+    xs = xv[:, 1] - x0m
+    yc = (yv[:, 0] - yv[:, 2]) * 0.5
+    y0m = (yv[:, 0] + yv[:, 2]) * 0.5
+    ys = yv[:, 1] - y0m
+    st = torch.sin(tgt)
+    ct = torch.cos(tgt)
+    Acoef = st * xc - ct * yc
+    Bcoef = st * xs - ct * ys
+    Dcoef = st * x0m - ct * y0m
+    phi_q = _solve_trig_linear_tan_half(Acoef, Bcoef, Dcoef, phi_ref, dev=dev, dtype=dtype)
+    return _pick_two_best_phi_p0(
+        p1, p2, p3, center, e1, e2, r_ring, tgt, phi_ref, phi_q,
+    )
+
+
 def _rodrigues_rotate_point_torch(
     v: torch.Tensor,
     k: torch.Tensor,
@@ -733,189 +1042,403 @@ def _apply_chi_rotation_to_sugar_ring_torch(
     return out
 
 
-def build_sugar_ring_closed_torch(
+# Indices 0..4 correspond to this atom order (canonical planar + z puckering).
+_SUGAR_RING_BUILD_ATOM_ORDER: tuple[str, ...] = (
+    "C4'", "O4'", "C1'", "C2'", "C3'",
+)
+
+_PLANAR_SUGAR_SPEC: Optional[dict[str, Any]] = None
+
+
+def _fallback_mean_ring_xyz_acgt_order() -> np.ndarray:
+    """Approximate mean sugar ring (Å) in ``_SUGAR_RING_BUILD_ATOM_ORDER`` when pynamod is unavailable.
+
+    Puckered 5-ring (not flat) so PCA normal and chirality are defined; used only if template import fails.
+    """
+    ang = np.linspace(0.0, 2.0 * math.pi, 6, dtype=np.float64)[:-1] + 0.25
+    r0 = 1.28
+    r_var = np.array([0.03, -0.02, 0.01, -0.01, 0.02], dtype=np.float64)
+    x = (r0 + r_var) * np.cos(ang)
+    y = (r0 + r_var) * np.sin(ang)
+    z = 0.045 * np.sin(2.0 * ang)
+    verts_ring = np.stack([x, y, z], axis=1)
+    # ring visit order O4', C1', C2', C3', C4' == angular indices 0..4
+    ring_to_build = np.array([4, 0, 1, 2, 3], dtype=np.int64)
+    return verts_ring[ring_to_build]
+
+
+def _mean_sugar_ring_xyz_from_templates() -> np.ndarray:
+    ATOM_ORDER = _SUGAR_RING_BUILD_ATOM_ORDER
+    restypes = ['A', 'C', 'G', 'T']
+    acc: list[np.ndarray] = []
+    for rt in restypes:
+        tpl = _get_template(rt)
+        acc.append(np.stack([tpl[n] for n in ATOM_ORDER], axis=0))
+    return np.mean(np.stack(acc, axis=0), axis=0)
+
+
+def _calibrate_planar_sugar_from_pts(pts_mean: np.ndarray) -> dict[str, Any]:
+    """One-time fit: cyclic phase/coset + z-scale vs ``nus`` Altona–Sundaralingam formula (numpy)."""
+    ATOM_ORDER = _SUGAR_RING_BUILD_ATOM_ORDER
+    pts = np.asarray(pts_mean, dtype=np.float64)
+    ctr = pts.mean(axis=0)
+    X = pts - ctr
+    _, _, Vt = np.linalg.svd(X, full_matrices=False)
+    e1 = Vt[0].astype(np.float64)
+    e2 = Vt[1].astype(np.float64)
+    en = Vt[2].astype(np.float64)
+    xy = np.stack([(X @ e1), (X @ e2)], axis=1)
+    pairs = [(0, 1), (1, 2), (2, 3), (3, 4), (4, 0)]
+    tpl_e = np.array([np.linalg.norm(pts[i] - pts[j]) for i, j in pairs], dtype=np.float64)
+    can_e = np.array([np.linalg.norm(xy[i] - xy[j]) for i, j in pairs], dtype=np.float64).clip(min=1e-9)
+    xy *= float(np.mean(tpl_e / can_e))
+    base_phases = np.array([0.0, 4.0, 8.0, 2.0, 6.0], dtype=np.float64) * (np.pi / 5.0)
+    P_grid = np.linspace(-math.pi, math.pi, 9, dtype=np.float64)
+    tau_grid = np.array([0.28, 0.4, 0.55, 0.7], dtype=np.float64)
+
+    def _ring_dict_from_xyz(pos: np.ndarray) -> dict[str, np.ndarray]:
+        return {ATOM_ORDER[j]: pos[j] for j in range(5)}
+
+    def _nus_np(d: dict[str, np.ndarray]) -> np.ndarray:
+        return np.array(
+            [
+                dihedral_rad(d[a0], d[a1], d[a2], d[a3])
+                for a0, a1, a2, a3 in _RING_TORSION_DEFS
+            ],
+            dtype=np.float64,
+        )
+
+    rch = float(
+        np.dot(
+            np.cross(pts[3] - pts[1], pts[4] - pts[1]),
+            pts[0] - pts[1],
+        ),
+    )
+
+    def _mean_nu_err_for(
+        z_scale_: float,
+        shift_: int,
+        sp_: float,
+        sz_: float,
+        phase0_: float,
+    ) -> float:
+        rolled = np.roll(base_phases, shift_)
+        phases_np = rolled * sz_ + phase0_
+        errs: list[float] = []
+        for Pv in P_grid:
+            for tv in tau_grid:
+                z = z_scale_ * tv * np.cos(sp_ * Pv + phases_np)
+                pos = np.stack(
+                    [
+                        ctr + xy[j, 0] * e1 + xy[j, 1] * e2 + z[j] * en
+                        for j in range(5)
+                    ],
+                    axis=0,
+                )
+                nu_act = _nus_np(_ring_dict_from_xyz(pos))
+                nu_tgt = tv * np.cos(Pv + base_phases)
+                dnu = np.arctan2(
+                    np.sin(nu_act - nu_tgt),
+                    np.cos(nu_act - nu_tgt),
+                )
+                errs.append(float(np.mean(np.abs(dnu))))
+        return float(np.mean(errs))
+
+    best: Optional[tuple[float, float, int, float, float, float, float]] = None
+    phase0_grid = np.linspace(0.0, 2.0 * math.pi / 5.0, 5, endpoint=False)
+    for shift in range(5):
+        for sp in (1.0, -1.0):
+            for sz in (1.0, -1.0):
+                for phase0 in phase0_grid:
+                    for z_scale in np.geomspace(0.06, 4.0, 24):
+                        m_err = _mean_nu_err_for(z_scale, shift, sp, sz, float(phase0))
+                        if best is None or m_err < best[0]:
+                            best = (
+                                m_err,
+                                m_err,
+                                shift,
+                                sp,
+                                sz,
+                                float(phase0),
+                                float(z_scale),
+                            )
+    if best is None:
+        raise RuntimeError('planar sugar calibration failed (grid).')
+    _, _, shift, sp, sz, phase0_sel, z_coarse = best
+    z_lo = z_coarse * 0.75
+    z_hi = z_coarse * 1.35
+    z_fine = np.linspace(z_lo, z_hi, 24, dtype=np.float64)
+    best_m = best[0]
+    z_scale = z_coarse
+    for z_try in z_fine:
+        m_err = _mean_nu_err_for(float(z_try), shift, sp, sz, phase0_sel)
+        if m_err < best_m:
+            best_m = m_err
+            z_scale = float(z_try)
+    phases_out = np.roll(base_phases, shift) * sz + phase0_sel
+    en_u = en.copy()
+    z_test = z_scale * 0.5 * np.cos(sp * 0.0 + phases_out)
+    pos_t = np.stack(
+        [
+            ctr + xy[j, 0] * e1 + xy[j, 1] * e2 + z_test[j] * en_u
+            for j in range(5)
+        ],
+        axis=0,
+    )
+    tr = float(
+        np.dot(
+            np.cross(pos_t[3] - pos_t[1], pos_t[4] - pos_t[1]),
+            pos_t[0] - pos_t[1],
+        ),
+    )
+    if np.sign(tr) != np.sign(rch):
+        en_u = -en_u
+    return {
+        'xy': xy.astype(np.float32),
+        'center': ctr.astype(np.float32),
+        'e1': e1.astype(np.float32),
+        'e2': e2.astype(np.float32),
+        'en': en_u.astype(np.float32),
+        'phase_rad': phases_out.astype(np.float32),
+        'z_scale': z_scale,
+        'sign_P': float(sp),
+    }
+
+
+def _calibrate_planar_sugar_spec() -> dict[str, Any]:
+    try:
+        pts = _mean_sugar_ring_xyz_from_templates()
+    except (ImportError, ModuleNotFoundError, OSError):
+        pts = _fallback_mean_ring_xyz_acgt_order()
+    return _calibrate_planar_sugar_from_pts(pts)
+
+
+def _planar_sugar_spec() -> dict[str, Any]:
+    global _PLANAR_SUGAR_SPEC
+    if _PLANAR_SUGAR_SPEC is None:
+        _PLANAR_SUGAR_SPEC = _calibrate_planar_sugar_spec()
+    return _PLANAR_SUGAR_SPEC
+
+
+def sugar_ring_from_xy_z_torch(
+    xy: torch.Tensor,
+    z: torch.Tensor,
+    center: torch.Tensor,
+    e1: torch.Tensor,
+    e2: torch.Tensor,
+    en: torch.Tensor,
+) -> torch.Tensor:
+    """Build 3D ring atoms from in-plane ``xy`` and out-of-plane ``z``.
+
+    Args:
+        xy: ``[5, 2]`` for ``_SUGAR_RING_BUILD_ATOM_ORDER``.
+        z: ``[..., 5]`` out-of-plane displacement per atom.
+        center, e1, e2, en: ``[3]`` PCA frame in Å.
+
+    Returns:
+        ``[..., 5, 3]`` coordinates in the same order as ``_SUGAR_RING_BUILD_ATOM_ORDER``.
+    """
+    if xy.shape != (5, 2):
+        raise ValueError(f'xy must be [5,2], got {tuple(xy.shape)}')
+    base = (
+        center
+        + xy[:, 0].unsqueeze(-1) * e1
+        + xy[:, 1].unsqueeze(-1) * e2
+    )
+    nd = z.ndim - 1
+    base_exp = base.view((1,) * nd + (5, 3)).expand(z.shape[:-1] + (5, 3))
+    z3 = z.unsqueeze(-1) * en
+    return base_exp + z3
+
+
+def _rotmat_unit_a_to_b(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    """Rotation ``[...,3,3]`` with ``R @ a == b`` for unit ``a``, ``b`` ``[...,3]``."""
+    v = torch.linalg.cross(a, b, dim=-1)
+    s = v.norm(dim=-1).clamp(min=_GEO_EPS)
+    c = (a * b).sum(dim=-1)
+    axis = v / s.unsqueeze(-1)
+    ang = torch.atan2(s, c)
+    return _rodrigues_rotmat_from_axis_angle(axis, ang)
+
+
+def _rigid_align_c1_o4_c2_torch(
+    ring: dict[str, torch.Tensor],
+    tpl_c1: torch.Tensor,
+    tpl_o4: torch.Tensor,
+    tpl_c2: torch.Tensor,
+) -> dict[str, torch.Tensor]:
+    """Map canonical ring to base-local template: exact ``C1'``, ``O4'``, twist from ``C2'`` hint."""
+    c1 = ring["C1'"]
+    o4 = ring["O4'"]
+    c2 = ring["C2'"]
+    lead_shape = c1.shape[:-1]
+    flat = int(np.prod(lead_shape)) if lead_shape else 1
+    c1f = c1.reshape(flat, 3)
+    o4f = o4.reshape(flat, 3)
+    c2f = c2.reshape(flat, 3)
+    tc1 = tpl_c1.reshape(flat, 3)
+    to4 = tpl_o4.reshape(flat, 3)
+    tc2 = tpl_c2.reshape(flat, 3)
+
+    delta = tc1 - c1f
+    o4t = o4f + delta
+    c2t = c2f + delta
+    v_int = _safe_normalize(o4t - tc1)
+    v_tgt = _safe_normalize(to4 - tc1)
+    R0 = _rotmat_unit_a_to_b(v_int, v_tgt)
+
+    axis2 = v_tgt
+    u0 = c2t - tc1 - ((c2t - tc1) * axis2).sum(dim=-1, keepdim=True) * axis2
+    u1 = tc2 - tc1 - ((tc2 - tc1) * axis2).sum(dim=-1, keepdim=True) * axis2
+    u0 = _safe_normalize(u0)
+    u1 = _safe_normalize(u1)
+    w = torch.linalg.cross(u0, u1, dim=-1)
+    sin_t = (w * axis2).sum(dim=-1)
+    cos_t = (u0 * u1).sum(dim=-1)
+    theta = torch.atan2(sin_t, cos_t)
+    R1 = _rodrigues_rotmat_from_axis_angle(axis2, theta)
+    R = R1 @ R0
+
+    out: dict[str, torch.Tensor] = {}
+    for nm, xf in ring.items():
+        xf_ = xf.reshape(flat, 3)
+        out[nm] = (R @ (xf_ - c1f).unsqueeze(-1)).squeeze(-1) + tc1
+        out[nm] = out[nm].reshape(*lead_shape, 3)
+    return out
+
+
+def _rodrigues_rotmat_from_axis_angle(
+    axis: torch.Tensor,
+    angle: torch.Tensor,
+) -> torch.Tensor:
+    """``axis`` unit ``[...,3]``, ``angle`` radians ``[...]`` -> ``[...,3,3]``."""
+    x, y, z = axis.unbind(-1)
+    ca = torch.cos(angle)
+    sa = torch.sin(angle)
+    omc = 1.0 - ca
+    K = torch.zeros(*axis.shape[:-1], 3, 3, dtype=axis.dtype, device=axis.device)
+    K[..., 0, 1] = -z
+    K[..., 0, 2] = y
+    K[..., 1, 0] = z
+    K[..., 1, 2] = -x
+    K[..., 2, 0] = -y
+    K[..., 2, 1] = x
+    I = torch.eye(3, dtype=axis.dtype, device=axis.device).expand(*K.shape)
+    return I + sa.unsqueeze(-1).unsqueeze(-1) * K + omc.unsqueeze(-1).unsqueeze(-1) * (axis.unsqueeze(-1) @ axis.unsqueeze(-2))
+
+
+def _mean_ring_bond_length_torch(
+    stacked: torch.Tensor,
+    pairs: tuple[tuple[int, int], ...],
+) -> torch.Tensor:
+    """Mean edge length per batch row; ``stacked`` is ``[..., 5, 3]``."""
+    ds = []
+    for i, j in pairs:
+        ds.append((stacked[..., i, :] - stacked[..., j, :]).norm(dim=-1))
+    return torch.stack(ds, dim=-1).mean(dim=-1)
+
+
+def _scale_ring_isotropic_about_centroid_torch(
+    stacked: torch.Tensor,
+    target_mean_bond: torch.Tensor,
+) -> torch.Tensor:
+    """Scale ``[...,5,3]`` about its centroid to match mean bond length (preserves dihedrals)."""
+    cent = stacked.mean(dim=-2, keepdim=True)
+    d = stacked - cent
+    cur = _mean_ring_bond_length_torch(
+        stacked,
+        ((0, 1), (1, 2), (2, 3), (3, 4), (4, 0)),
+    ).clamp(min=1e-4)
+    s = (target_mean_bond / cur).clamp(0.82, 1.18)
+    while s.ndim < stacked.ndim:
+        s = s.unsqueeze(-1)
+    return cent + d * s
+
+
+def build_sugar_ring_closed_form_torch(
     chi: torch.Tensor,
     P: torch.Tensor,
     tau_m: torch.Tensor,
     restype_indices: torch.Tensor,
     *,
+    geometry: Optional[dict] = None,
     bond_lengths: Optional[dict] = None,
     bond_angles: Optional[dict] = None,
 ) -> dict[str, torch.Tensor]:
-    """Build sugar ring in the template base frame (O4′, C1′, …); analytic φ + legacy NERF chain, then χ."""
-    _ = bond_lengths, bond_angles
+    """Closed-form furanose ring: template PCA plane + ``τ_m cos(P+φ)`` puckering, rigid anchor, χ.
+
+    No grid scan, no discrete branch minimization, no cone–sphere sugar solver. Returns
+    ``O4'``, ``C1'``, ``C2'``, ``C3'``, ``C4'``.
+    """
+    _ = geometry, bond_lengths, bond_angles
     if P.shape != tau_m.shape or P.shape != restype_indices.shape:
         raise ValueError('P, tau_m, restype_indices must share the same leading shape.')
     if P.ndim == 0:
+        chi = chi.unsqueeze(0)
         P = P.unsqueeze(0)
         tau_m = tau_m.unsqueeze(0)
         restype_indices = restype_indices.unsqueeze(0)
-    B = int(P.shape[0])
+        squeeze_batch = True
+    else:
+        squeeze_batch = False
+    orig = P.shape
+    N = int(P.numel())
     dev = P.device
     dtype = P.dtype
-    ri = restype_indices.long()
+    chi_f = chi.reshape(N)
+    P_f = P.reshape(N)
+    tm_f = tau_m.reshape(N)
+    ri = restype_indices.reshape(N).long()
     tc = _get_template_tensors(str(dev))
 
-    c1 = tc['c1'][ri].reshape(B, 3)
-    o4 = tc['o4'][ri].reshape(B, 3)
-    c4_ref = tc['c4_ref'][ri].reshape(B, 3)
-    axis_u = _safe_normalize(c1 - o4)
-
-    _HP = torch.tensor(np.pi / 2.0, device=dev, dtype=dtype)
-    tau_c = tau_m.clamp(min=1e-4)
-    nu_tgt = nus_rad_from_P_tau_torch(P, tau_c)
-    nu3 = nu_tgt[:, 1]
-    nu4 = nu_tgt[:, 2]
-    nu0 = nu_tgt[:, 3]
-
-    def bl(key: str) -> torch.Tensor:
+    def _g1(key: str) -> torch.Tensor:
         return tc[key][ri]
 
-    def ba(key: str) -> torch.Tensor:
-        return tc[key][ri]
+    spec = _planar_sugar_spec()
+    xy = torch.as_tensor(spec['xy'], device=dev, dtype=dtype)
+    ctr = torch.as_tensor(spec['center'], device=dev, dtype=dtype)
+    e1v = torch.as_tensor(spec['e1'], device=dev, dtype=dtype)
+    e2v = torch.as_tensor(spec['e2'], device=dev, dtype=dtype)
+    env = torch.as_tensor(spec['en'], device=dev, dtype=dtype)
+    phases = torch.as_tensor(spec['phase_rad'], device=dev, dtype=dtype)
+    z_sc = float(spec['z_scale'])
+    sgn_p = float(spec['sign_P'])
 
-    bl_o4c4 = tc['bl_o4_c4'][ri]
-
-    k = axis_u
-    v = c4_ref - o4
-    v_par = (v * k).sum(dim=-1, keepdim=True) * k
-    v_perp = v - v_par
-    w = torch.linalg.cross(k, v_perp, dim=-1)
-    u0 = o4 + v_par
-
-    # Trigonometric surrogate for the NERF chain's terminal C4'(φ): fit a + b cosφ + c sinφ per axis
-    # from three samples; stationary φ of ||p + G [cosφ, sinφ]^T||² on S¹ solve a quartic. The final
-    # branch minimizes true ν / closure loss (same weights as before), not grid search on φ.
-
-    phi_s = torch.tensor(
-        [0.0, 2.0 * np.pi / 3.0, 4.0 * np.pi / 3.0],
-        device=dev,
-        dtype=dtype,
+    tau_c = tm_f.clamp(min=1e-4)
+    z = (
+        z_sc
+        * tau_c.unsqueeze(-1)
+        * torch.cos(sgn_p * P_f.unsqueeze(-1) + phases.unsqueeze(0))
     )
-    S = int(phi_s.shape[0])
-    cph = torch.cos(phi_s).view(1, S, 1)
-    sph = torch.sin(phi_s).view(1, S, 1)
-    c4_piv = u0.unsqueeze(1) + cph * v_perp.unsqueeze(1) + sph * w.unsqueeze(1)
-    bs = B * S
-    o4e = o4.unsqueeze(1).expand(-1, S, -1).reshape(bs, 3)
-    c1e = c1.unsqueeze(1).expand(-1, S, -1).reshape(bs, 3)
-    c4e = c4_piv.reshape(bs, 3)
-    nu3e = nu3.unsqueeze(1).expand(-1, S).reshape(-1)
-    nu4e = nu4.unsqueeze(1).expand(-1, S).reshape(-1)
-    nu0e = nu0.unsqueeze(1).expand(-1, S).reshape(-1)
-
-    c2s = nerf_place_torch(
-        c4e, o4e, c1e,
-        bl('bl_c2_c1').unsqueeze(1).expand(-1, S).reshape(-1),
-        ba('ba_o4_c1_c2').unsqueeze(1).expand(-1, S).reshape(-1),
-        nu3e - _HP,
-    )
-    c3s = nerf_place_torch(
-        o4e, c1e, c2s,
-        bl('bl_c3_c2').unsqueeze(1).expand(-1, S).reshape(-1),
-        ba('ba_c1_c2_c3').unsqueeze(1).expand(-1, S).reshape(-1),
-        nu4e - _HP,
-    )
-    c4s = nerf_place_torch(
-        c1e, c2s, c3s,
-        bl('bl_c4_c3').unsqueeze(1).expand(-1, S).reshape(-1),
-        ba('ba_c2_c3_c4').unsqueeze(1).expand(-1, S).reshape(-1),
-        nu0e - _HP,
-    )
-    c4_stack = c4s.reshape(B, S, 3)
-    aa = torch.zeros((B, 3), device=dev, dtype=dtype)
-    bb = torch.zeros((B, 3), device=dev, dtype=dtype)
-    cc = torch.zeros((B, 3), device=dev, dtype=dtype)
-    for dim in range(3):
-        a_d, b_d, c_d = _fit_cos_sin_batch(phi_s, c4_stack[:, :, dim])
-        aa[:, dim], bb[:, dim], cc[:, dim] = a_d, b_d, c_d
-
-    p = aa - u0
-    G = torch.stack([bb - v_perp, cc - w], dim=-1)
-    M = torch.matmul(G.transpose(-2, -1), G)
-    h = torch.einsum('bki,bk->bi', G, p)
-    c0 = (p * p).sum(dim=-1)
-    _, Bcoef, Ccoef, Fm, Em = _scalar_fourier_coeffs_from_Mh(M, h, c0)
-
-    phi_stat = _quartic_phi_stationary(Bcoef, Ccoef, Fm, Em)
-    phi_ck = torch.cat([phi_stat, torch.zeros((B, 1), device=dev, dtype=dtype)], dim=-1)
-    K = int(phi_ck.shape[1])
-
-    o4k = o4.unsqueeze(1).expand(-1, K, -1).reshape(B * K, 3)
-    c1k = c1.unsqueeze(1).expand(-1, K, -1).reshape(B * K, 3)
-    phif = phi_ck.reshape(B * K)
-    v_park = v_par.unsqueeze(1).expand(-1, K, -1).reshape(B * K, 3)
-    v_perpk = v_perp.unsqueeze(1).expand(-1, K, -1).reshape(B * K, 3)
-    wk = w.unsqueeze(1).expand(-1, K, -1).reshape(B * K, 3)
-    u0k = o4k + v_park
-    c4_pk = u0k + torch.cos(phif).unsqueeze(-1) * v_perpk + torch.sin(phif).unsqueeze(-1) * wk
-
-    nu3k = nu3.unsqueeze(1).expand(-1, K).reshape(-1)
-    nu4k = nu4.unsqueeze(1).expand(-1, K).reshape(-1)
-    nu0k = nu0.unsqueeze(1).expand(-1, K).reshape(-1)
-
-    c2k = nerf_place_torch(
-        c4_pk, o4k, c1k,
-        bl('bl_c2_c1').unsqueeze(1).expand(-1, K).reshape(-1),
-        ba('ba_o4_c1_c2').unsqueeze(1).expand(-1, K).reshape(-1),
-        nu3k - _HP,
-    )
-    c3k = nerf_place_torch(
-        o4k, c1k, c2k,
-        bl('bl_c3_c2').unsqueeze(1).expand(-1, K).reshape(-1),
-        ba('ba_c1_c2_c3').unsqueeze(1).expand(-1, K).reshape(-1),
-        nu4k - _HP,
-    )
-    c4k = nerf_place_torch(
-        c1k, c2k, c3k,
-        bl('bl_c4_c3').unsqueeze(1).expand(-1, K).reshape(-1),
-        ba('ba_c2_c3_c4').unsqueeze(1).expand(-1, K).reshape(-1),
-        nu0k - _HP,
-    )
-
-    c2g = c2k.reshape(B, K, 3)
-    c3g = c3k.reshape(B, K, 3)
-    c4g = c4k.reshape(B, K, 3)
-    o4g = o4.unsqueeze(1).expand(-1, K, -1)
-    c1g = c1.unsqueeze(1).expand(-1, K, -1)
-
-    triple = (
-        torch.linalg.cross(c2g - o4g, c3g - o4g, dim=-1) * (c4g - o4g)
-    ).sum(dim=-1)
-    chir_ref = tc['ring_chiral_triple'][ri].reshape(B, 1).expand(-1, K)
-    chir_miss = (torch.sign(triple) - torch.sign(chir_ref)).abs()
-
-    ra = {"C1'": c1g, "C2'": c2g, "C3'": c3g, "C4'": c4g, "O4'": o4g}
-    nu_blocks = []
-    for a0n, a1n, a2n, a3n in _RING_TORSION_DEFS:
-        nu_blocks.append(
-            dihedral_rad_torch(
-                ra[a0n].reshape(B * K, 3),
-                ra[a1n].reshape(B * K, 3),
-                ra[a2n].reshape(B * K, 3),
-                ra[a3n].reshape(B * K, 3),
-            ).reshape(B, K, 1),
-        )
-    nu_meas_t = torch.cat(nu_blocks, dim=-1)
-    nu_tgt_g = nu_tgt.unsqueeze(1).expand(-1, K, -1)
-    err_nu = (wrap_dihedral_diff_torch(nu_meas_t, nu_tgt_g) ** 2).sum(dim=-1)
-    err_close = ((c4g - o4g).norm(dim=-1) - bl_o4c4.unsqueeze(-1)) ** 2
-    loss = 2.5 * err_nu + 0.2 * err_close + 1e-3 * chir_miss
-    loss = torch.where(torch.isfinite(phi_ck), loss, torch.full_like(loss, float('inf')))
-    best = loss.argmin(dim=-1)
-    idx = torch.arange(B, device=dev, dtype=torch.long)
-    out = {
-        "C1'": c1,
-        "C2'": c2g[idx, best],
-        "C3'": c3g[idx, best],
-        "C4'": c4g[idx, best],
-        "O4'": o4,
+    stacked = sugar_ring_from_xy_z_torch(xy, z, ctr, e1v, e2v, env)
+    order = _SUGAR_RING_BUILD_ATOM_ORDER
+    # Match mean ring bond length to template (isotropic about centroid; preserves ν).
+    tgt_bl = (
+        _g1('bl_o4_c4')
+        + (tc['c1'][ri] - tc['o4'][ri]).norm(dim=-1)
+        + _g1('bl_c2_c1')
+        + _g1('bl_c3_c2')
+        + _g1('bl_c4_c3')
+    ) / 5.0
+    stacked = _scale_ring_isotropic_about_centroid_torch(stacked, tgt_bl)
+    ring_pre: dict[str, torch.Tensor] = {
+        order[j]: stacked[:, j] for j in range(5)
     }
-    n_atom = tc['chi_n'][ri].reshape(B, 3)
-    c_atom = tc['chi_c'][ri].reshape(B, 3)
-    out = _apply_chi_rotation_to_sugar_ring_torch(
-        out, chi.reshape(B), n_atom, c_atom,
+
+    ring_pre = _rigid_align_c1_o4_c2_torch(
+        ring_pre,
+        _g1('c1'),
+        _g1('o4'),
+        _g1('c2_ref'),
     )
+
+    n_atom = tc['chi_n'][ri].reshape(N, 3)
+    c_atom = tc['chi_c'][ri].reshape(N, 3)
+    out = _apply_chi_rotation_to_sugar_ring_torch(ring_pre, chi_f, n_atom, c_atom)
+    for nm in ("C1'", "C2'", "C3'", "C4'", "O4'"):
+        out[nm] = out[nm].reshape(*orig, 3)
+    if squeeze_batch:
+        out = {k: v.squeeze(0) for k, v in out.items()}
     return out
 
 
@@ -1407,7 +1930,7 @@ def build_backbone_from_torsions_torch(
     beta = torsions[:, TOR_BETA]
     eps_lat = torsions[:, TOR_EPS]
     zet_lat = torsions[:, TOR_ZETA]
-    ring = build_sugar_ring_closed_torch(chi, P, tau_m, ri)
+    ring = build_sugar_ring_closed_form_torch(chi, P, tau_m, ri)
     atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=ri)
     atoms = add_o5_from_gamma_torch(atoms, gamma, restype_indices=ri)
 
@@ -1486,7 +2009,7 @@ def build_batch_window_backbone_from_torsions_torch(
     flat_ri = restype_indices.reshape(BW).long()
     chi = flat_t[:, TOR_CHI]
     P_rad = flat_t[:, TOR_PUCKER_P]
-    ring = build_sugar_ring_closed_torch(chi, P_rad, flat_tm, flat_ri)
+    ring = build_sugar_ring_closed_form_torch(chi, P_rad, flat_tm, flat_ri)
     atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=flat_ri)
     atoms = add_o5_from_gamma_torch(
         atoms, flat_t[:, TOR_GAMMA], restype_indices=flat_ri,

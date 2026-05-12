@@ -9,22 +9,13 @@ import torch
 from bbregen import utils
 from bbregen.bridge_closure import canonical_two_residue_bridge_positions_numpy
 from bbregen.torsion_geometry import (
-    N_TORSIONS,
-    _get_template,
-    _get_template_tensors,
-    _RING_TORSION_DEFS,
-    add_exocyclic_sugar_atoms_torch,
-    add_o5_from_gamma_torch,
-    build_backbone_from_torsions_torch,
-    build_sugar_ring_closed_torch,
+    _RING_TORSION_DEFS, N_TORSIONS, _get_template, _get_template_tensors,
+    add_exocyclic_sugar_atoms_torch, add_o5_from_gamma_torch,
+    build_backbone_from_torsions_torch, build_sugar_ring_closed_form_torch,
     build_window_backbone_from_torsions_torch,
-    close_phosphate_bridge_multi_torch,
-    dihedral_rad,
-    dihedral_rad_torch,
-    nucleotide_torsions_numpy,
-    nus_rad_from_P_tau_torch,
-    wrap_dihedral_diff_torch,
-)
+    close_phosphate_bridge_multi_torch, dihedral_rad, dihedral_rad_torch,
+    nucleotide_torsions_numpy, nus_rad_from_P_tau_torch,
+    wrap_dihedral_diff_torch)
 
 
 def _assert_window_bb_finiteness_design(bb: torch.Tensor) -> None:
@@ -62,8 +53,8 @@ def test_chi_rotation_preserves_sugar_ring_internal_torsions(device):
     tau_m = torch.tensor([0.33], device=device)
     chi_a = torch.tensor([-0.55], device=device)
     chi_b = torch.tensor([0.78], device=device)
-    ring_a = build_sugar_ring_closed_torch(chi_a, P, tau_m, ri)
-    ring_b = build_sugar_ring_closed_torch(chi_b, P, tau_m, ri)
+    ring_a = build_sugar_ring_closed_form_torch(chi_a, P, tau_m, ri)
+    ring_b = build_sugar_ring_closed_form_torch(chi_b, P, tau_m, ri)
 
     def _ring_nus(ring: dict) -> torch.Tensor:
         return torch.stack(
@@ -105,7 +96,7 @@ def test_chi_scan_matches_measured_dihedral_preserves_pucker_and_sugar_metric(de
     c_atom = tc['chi_c'][ri].reshape(1, 3)
     dist_ref = None
     for chi in chis:
-        ring = build_sugar_ring_closed_torch(chi.unsqueeze(0), P, tau_m, ri)
+        ring = build_sugar_ring_closed_form_torch(chi.unsqueeze(0), P, tau_m, ri)
         atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=ri)
         mchi = dihedral_rad_torch(
             atoms["O4'"].reshape(1, 3),
@@ -113,7 +104,7 @@ def test_chi_scan_matches_measured_dihedral_preserves_pucker_and_sugar_metric(de
             n_atom,
             c_atom,
         )
-        assert wrap_dihedral_diff_torch(mchi, chi.unsqueeze(0)).abs().item() < 0.09
+        assert wrap_dihedral_diff_torch(mchi, chi.unsqueeze(0)).abs().item() < 0.02
         nu_meas = []
         for a0n, a1n, a2n, a3n in _RING_TORSION_DEFS:
             nu_meas.append(
@@ -126,7 +117,7 @@ def test_chi_scan_matches_measured_dihedral_preserves_pucker_and_sugar_metric(de
             )
         nu_st = torch.cat(nu_meas, dim=-1)
         err_nu = wrap_dihedral_diff_torch(nu_st, tgt_nu).abs().max().item()
-        assert err_nu < 0.55
+        assert err_nu < 0.12
         sugar_names = ["O4'", "C2'", "C3'", "C4'", "C5'", "O3'"]
         pts = torch.stack([atoms[nm].reshape(3) for nm in sugar_names], dim=0)
         dmat = torch.cdist(pts.unsqueeze(0), pts.unsqueeze(0)).squeeze(0)
@@ -141,7 +132,7 @@ def test_pseudorotation_torsions_consistent(device):
     P = torch.linspace(-1.0, 1.0, 4, device=device)
     tau = torch.full((4,), 0.35, device=device)
     chi = torch.zeros(4, device=device)
-    ring = build_sugar_ring_closed_torch(chi, P, tau, restype_idx)
+    ring = build_sugar_ring_closed_form_torch(chi, P, tau, restype_idx)
     tgt = nus_rad_from_P_tau_torch(P, tau)
     for i, (a0, a1, a2, a3) in enumerate(
         [
@@ -156,7 +147,7 @@ def test_pseudorotation_torsions_consistent(device):
             ring[a0], ring[a1], ring[a2], ring[a3],
         )
         err = wrap_dihedral_diff_torch(m, tgt[:, i]).abs().max().item()
-        assert err < 0.55, i
+        assert err < 0.12, i
 
 
 def test_sugar_ring_is_closed(device):
@@ -166,19 +157,22 @@ def test_sugar_ring_is_closed(device):
         P = (torch.rand(16, device=device) * 2.0 - 1.0) * torch.pi
         tau = torch.rand(16, device=device) * 0.2 + 0.28
         chi = (torch.rand(16, device=device) - 0.5) * torch.pi
-        ring = build_sugar_ring_closed_torch(chi, P, tau, restype_idx)
+        ring = build_sugar_ring_closed_form_torch(chi, P, tau, restype_idx)
         tc = _template_tc(device)
         bl_o4 = tc['bl_o4_c4'][restype_idx.long()]
         dst = (ring["C4'"] - ring["O4'"]).norm(dim=-1)
         dlen = (dst - bl_o4).abs().mean().item()
-        assert dlen < 0.5
+        # C4′–O4′ length vs template: see planar sugar builder (ν-first).
+        assert dlen < 0.25
         assert torch.isfinite(ring["C1'"]).all()
+        ri_l = restype_idx.long()
+        bl_o4_c1 = (tc['c1'][ri_l] - tc['o4'][ri_l]).norm(dim=-1)
         v = ring["C1'"] - ring["O4'"]
-        err = (v.norm(dim=-1) - tc['bl_c2_c1'][restype_idx.long()]).abs().mean().item()
-        assert err < 0.12
+        err = (v.norm(dim=-1) - bl_o4_c1).abs().mean().item()
+        assert err < 0.04
 
         d44 = (ring["C4'"] - ring["O4'"]).norm(dim=-1) - bl_o4
-        assert (d44.abs() < 0.5).all()
+        assert (d44.abs() < 0.12).all()
 
 
 def test_exocyclic_stereochemistry(device):
@@ -186,7 +180,7 @@ def test_exocyclic_stereochemistry(device):
     P = torch.tensor([0.2], device=device)
     tau = torch.tensor([0.34], device=device)
     chi = torch.zeros(1, device=device)
-    ring = build_sugar_ring_closed_torch(chi, P, tau, ri)
+    ring = build_sugar_ring_closed_form_torch(chi, P, tau, ri)
     atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=ri)
     tc = _template_tc(device)
     l_o3 = tc['bl_o3_c3'][ri]
@@ -207,7 +201,7 @@ def test_gamma_places_o5(device):
     P = torch.tensor([-0.1], device=device)
     tau = torch.tensor([0.32], device=device)
     chi = torch.zeros(1, device=device)
-    ring = build_sugar_ring_closed_torch(chi, P, tau, ri)
+    ring = build_sugar_ring_closed_form_torch(chi, P, tau, ri)
     atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=ri)
     gam = torch.tensor([0.55], device=device)
     atoms = add_o5_from_gamma_torch(atoms, gam, restype_indices=ri)
@@ -340,7 +334,8 @@ def test_ground_truth_torsions_rmsd_loose(device):
 
 
 def test_window_builder_batch_size_gt_one_finite(device):
-    from bbregen.torsion_geometry import build_batch_window_backbone_from_torsions_torch
+    from bbregen.torsion_geometry import \
+        build_batch_window_backbone_from_torsions_torch
 
     B, W = 3, 4
     theta = torch.randn(B, W, N_TORSIONS, device=device, dtype=torch.float32) * 0.1

@@ -17,8 +17,8 @@ from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
-import utils
-from config import SEED
+from . import utils
+from .config import SEED
 
 EDGE_CACHE_NAME = 'edge_windows.txt'
 
@@ -29,7 +29,7 @@ class PyGDataset(Dataset):
 
         self.pdb_ids = utils.get_pdb_ids()
 
-        root_path = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'data')
+        root_path = osp.join(osp.dirname(osp.abspath(__file__)), '..', '..', 'data')
         super().__init__(root_path)
 
         self.data_list = []

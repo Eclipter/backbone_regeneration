@@ -19,17 +19,16 @@ import py3Dmol
 import requests
 import seaborn as sns
 import torch
+from bbregen import utils
+from bbregen.dataset import DNADataModule, PyGDataset
+from bbregen.model import PytorchLightningModule
+from bbregen.predict import MODEL_DIR, predict_backbone, write_structure
+from bbregen.torsion_constants import N_LATENT
+from bbregen.torsion_geometry import build_backbone_from_torsions
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
-from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 from sklearn.neighbors import NearestNeighbors
 from torch_geometric.data import Batch, Data
 from tqdm import tqdm
-
-import utils
-from dataset import DNADataModule, PyGDataset
-from model import PytorchLightningModule
-from predict import predict_backbone, write_structure
-from torsion_geometry import build_backbone_from_torsions
 
 # Angle channel order in tensors: α, β, γ, ε, ζ, χ, P (no backbone δ; τ_m is separate / log τ in latent).
 TOR_NAMES = ['α', 'β', 'γ', 'ε', 'ζ', 'χ', 'P']
@@ -155,7 +154,7 @@ def _add_local_axes(
 
 
 def _load_dataset_backbone_segments(bb_local, valid_mask):
-    from pynamod.atomic_analysis.nucleotides_parser import nucleotide_graphs
+    from pynamod.atomic_analysis.nucleotides_parser import nucleotide_graphs  # pyright: ignore[reportMissingImports]
 
     rename_bb = {'O1P': 'OP1', 'O2P': 'OP2', 'O1A': 'OP1', 'O2A': 'OP2'}
     bb_set = set(utils.backbone_atoms)
@@ -795,7 +794,7 @@ _bb_set = set(utils.backbone_atoms)
 
 
 def _get_backbone_bonds():
-    from pynamod.atomic_analysis.nucleotides_parser import nucleotide_graphs
+    from pynamod.atomic_analysis.nucleotides_parser import nucleotide_graphs  # pyright: ignore[reportMissingImports]
     G = nucleotide_graphs['A']
     bonds = []
     seen = set()
@@ -860,7 +859,7 @@ def _coords_local_per_nt(window, origin_world, frame_world):
 
 def _bond_segments_from_nt_graph(coords_by_name: dict, restype_letter: str):
     """Intra-nucleotide bonds using the pynamod template graph (incl. base atoms)."""
-    from pynamod.atomic_analysis.nucleotides_parser import nucleotide_graphs
+    from pynamod.atomic_analysis.nucleotides_parser import nucleotide_graphs  # pyright: ignore[reportMissingImports]
 
     if restype_letter not in nucleotide_graphs:
         return []
@@ -1253,7 +1252,7 @@ print(f'Generating backbone for {inference_pdb_id}...')
 generated_pdb_path = osp.join(run_dir, f'generated_backbone_{inference_pdb_id}.pdb')
 predictions, inference_chain_records = predict_backbone(
     raw_inference_path,
-    ckpt_path,
+    MODEL_DIR,
     device=device,
     show_progress=True,
 )

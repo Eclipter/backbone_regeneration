@@ -4,8 +4,14 @@ import math
 
 import torch
 
-from torsion_constants import (LOG_TAU_M_MAX, LOG_TAU_M_MIN, N_LATENT,
-                               N_TORSIONS, TAU_M_MAX, TAU_M_MIN)
+from .torsion_constants import (
+    LOG_TAU_M_MAX,
+    LOG_TAU_M_MIN,
+    N_LATENT,
+    N_TORSIONS,
+    TAU_M_MAX,
+    TAU_M_MIN,
+)
 
 
 def wrap_angle(x: torch.Tensor) -> torch.Tensor:
@@ -119,7 +125,6 @@ def perturb_torsions(
     theta_t = wrap_angle(theta_0 + sigma_theta * eps_theta)
 
     eps_tau = torch.randn_like(log_tau_0)
-    # No clamp before Gaussian score target (clamp only on decode/output paths).
     log_tau_t = log_tau_0 + sigma_tau * eps_tau
 
     angular_score_target = wrapped_normal_score(

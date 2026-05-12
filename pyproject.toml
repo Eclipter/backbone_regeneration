@@ -1,0 +1,51 @@
+[build-system]
+requires = ['setuptools<80', 'wheel']
+build-backend = 'setuptools.build_meta'
+
+[project]
+name = 'backbone-regeneration'
+version = '0.1.0'
+description = 'DNA backbone regeneration from base-only structures'
+readme = 'README.md'
+requires-python = '==3.13'
+urls = {Repository = 'https://github.com/Eclipter/backbone-regeneration'}
+# PyNAMod remains a manual prerequisite; this project expects the local clone documented in README.
+dependencies = [
+  'biopython>=1.86',
+  'gemmi',
+  'lightning',
+  'matplotlib',
+  'MDAnalysis>=2.10.0',
+  'numpy>=2.4.3',
+  'onnx',
+  'onnxruntime',
+  'pandas>=3.0.1',
+  'plotly',
+  'py3Dmol',
+  'requests',
+  'scikit-learn',
+  'seaborn>=0.13.2',
+  'tensorboard',
+  'torch',
+  'torch-geometric',
+  'tqdm',
+]
+
+[project.optional-dependencies]
+test = [
+  'pytest>=9.0.2',
+]
+
+[project.scripts]
+bbregen = 'bbregen.predict:main'
+
+[tool.setuptools]
+package-dir = {'' = 'src'}
+
+[tool.setuptools.packages.find]
+where = ['src']
+
+[tool.pytest.ini_options]
+addopts = '-v --tb=short'
+testpaths = ['tests']
+pythonpath = ['pynamod', 'src']

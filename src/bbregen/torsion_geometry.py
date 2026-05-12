@@ -6,7 +6,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from torsion_constants import (
+from .torsion_constants import (
     N_LATENT,
     N_TORSIONS,
     N_TORSIONS_LATENT,

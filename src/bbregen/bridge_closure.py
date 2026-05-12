@@ -6,7 +6,7 @@ from typing import Optional
 import numpy as np
 import torch
 
-from torsion_geometry import (
+from .torsion_geometry import (
     TOR_ALPHA,
     TOR_BETA,
     TOR_EPS,
@@ -17,7 +17,7 @@ from torsion_geometry import (
     dihedral_rad_torch,
     wrap_dihedral_diff_torch,
 )
-from utils import backbone_atoms
+from .utils import backbone_atoms
 
 _BASE_LETTERS = ('A', 'C', 'G', 'T')
 

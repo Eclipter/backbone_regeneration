@@ -11,23 +11,33 @@ cd backbone-regeneration
 
 2. Install Conda. See [Conda Installation](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
 
-3. Install PyNAMod:
+3. Download PyNAMod:
 
 ```bash
-git clone https://github.com/intbio/PyNAMod.git
-cd PyNAMod
+git clone https://github.com/intbio/PyNAMod.git pynamod
+cd pynamod
 ```
 
-4. Create a new environment with pynamod dependencies:
+4. Create a new environment with PyNAMod dependencies:
 
 ```bash
-conda env create --name backbone_regen --file PyNAMod/environment.yml
+/opt/miniconda/bin/conda env create \
+  --name backbone_regen \
+  --file pynamod/environment.yml
 ```
 
 5. Install the project dependencies:
 
 ```bash
-conda env update --name backbone_regen --file environment.yml
+/opt/miniconda/bin/conda env update \
+  --name backbone_regen \
+  --file environment.yml
+/opt/miniconda/bin/conda run \
+  -n backbone_regen \
+  pip install \
+    -e ./pynamod \
+    -e .[test] \
+    --no-deps
 ```
 
 ## Training
@@ -37,19 +47,19 @@ conda env update --name backbone_regen --file environment.yml
 2. Train and test the model:
 
 ```bash
-python src/train.py
+python scripts/train.py
 ```
 
-3. Visualize the results if necessary
+3. Analyze the results if necessary
 
 ```bash
-python src/visualize.py
+python scripts/analyze.py
 ```
 
 4. Export the best model to ONNX:
 
 ```bash
-python src/export.py --run-dir logs/fixed_swa/baseline
+python scripts/export.py --run-dir fixed_swa/baseline
 ```
 
 ## Usage
@@ -59,8 +69,7 @@ python src/export.py --run-dir logs/fixed_swa/baseline
 2. Predict the backbone. Input and output may be PDB or mmCIF independently (e.g. PDB in, mmCIF out). By default **5'-terminal phosphate atoms** (`P`, `OP1`, `OP2`) are **not** predicted. Pass `--generate-5-prime-phosphate` to include them.
 
 ```bash
-python src/predict.py \
-    --run-dir models \
+bbregen \
     --input input.pdb \
     --output output.pdb
 ```

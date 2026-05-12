@@ -6,10 +6,10 @@ from typing import Any, cast
 import pytest
 import torch
 
-import utils
-from model import PytorchLightningModule
-from torsion_constants import LOG_TAU_M_MAX, N_LATENT, N_TORSIONS, TORSION_NAMES
-from wrapped_score_diffusion import (
+from bbregen import utils
+from bbregen.model import PytorchLightningModule
+from bbregen.torsion_constants import LOG_TAU_M_MAX, N_LATENT, N_TORSIONS, TORSION_NAMES
+from bbregen.wrapped_score_diffusion import (
     decode_torsions,
     gaussian_score,
     perturb_torsions,
@@ -127,7 +127,7 @@ def test_delta_absent():
 
 
 def test_decode_clamps_extreme_log_tau():
-    from torsion_constants import TAU_M_MAX, TAU_M_MIN
+    from bbregen.torsion_constants import TAU_M_MAX, TAU_M_MIN
 
     x = torch.zeros(2, N_LATENT)
     x[:, N_TORSIONS] = 10.0
@@ -214,8 +214,8 @@ def test_perturb_raises_on_wrong_torsion_width():
 
 
 def test_synthetic_perturb_decode_window_builder_closure_finite():
-    from bridge_closure import compute_bridge_closure_loss
-    from torsion_geometry import build_batch_window_backbone_from_torsions_torch
+    from bbregen.bridge_closure import compute_bridge_closure_loss
+    from bbregen.torsion_geometry import build_batch_window_backbone_from_torsions_torch
 
     torch.manual_seed(0)
     B, W = 2, 4
@@ -241,7 +241,7 @@ def test_synthetic_perturb_decode_window_builder_closure_finite():
 
 def test_perturb_log_tau_forward_no_clamp_before_gaussian_score(monkeypatch):
     """Forward noising path must remain Gaussian matching ``tau_score_target``."""
-    import wrapped_score_diffusion as m
+    import bbregen.wrapped_score_diffusion as m
 
     def _flat_sigma(t, *_a, **_k):
         return torch.full_like(t, 120.0, dtype=torch.float32)

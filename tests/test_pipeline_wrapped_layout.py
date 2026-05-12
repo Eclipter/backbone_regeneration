@@ -3,7 +3,7 @@
 import inspect
 from pathlib import Path
 
-from model import PytorchLightningModule
+from bbregen.model import PytorchLightningModule
 
 
 def test_val_rmsd_impl_calls_window_backbone_builder_only():
@@ -19,7 +19,7 @@ def test_val_rmsd_logger_uses_oracle_context_metric_names():
 
 
 def test_predict_merges_target_residue_only_from_cached_window():
-    import predict as pred_mod
+    import bbregen.predict as pred_mod
 
     text = Path(pred_mod.__file__).read_text()
     assert '_merge_window_pred_for_residue' in text
@@ -27,27 +27,27 @@ def test_predict_merges_target_residue_only_from_cached_window():
 
 
 def test_predict_has_full_window_inference_for_default_path():
-    import predict as pred_mod
+    import bbregen.predict as pred_mod
 
     text = Path(pred_mod.__file__).read_text()
     assert '_predict_full_window_predictions_dict' in text
 
 
 def test_predict_module_full_window_builder():
-    import predict as pred_mod
+    import bbregen.predict as pred_mod
 
     src = inspect.getsource(pred_mod._predict_full_window_predictions_dict)
     assert 'build_batch_window_backbone_from_torsions_torch' in src
 
 
 def test_training_module_has_no_ddpm_alpha_bar_in_source():
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[1] / 'src' / 'bbregen'
     model_txt = (root / 'model.py').read_text()
     assert 'alpha_bar' not in model_txt
     assert 'alphas_cumulative_prod' not in model_txt
 
 
 def test_wrapped_score_module_has_no_sincos_latent_width():
-    wsd = Path(__file__).resolve().parents[1] / 'wrapped_score_diffusion.py'
+    wsd = Path(__file__).resolve().parents[1] / 'src' / 'bbregen' / 'wrapped_score_diffusion.py'
     text = wsd.read_text()
     assert 'N_TORSIONS * 2' not in text

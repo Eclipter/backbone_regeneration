@@ -7,11 +7,11 @@ import numpy as np
 import pytest
 import torch
 
-from bridge_closure import (
+from bbregen.bridge_closure import (
     canonical_two_residue_bridge_bb_tensor,
     compute_bridge_closure_loss,
 )
-from torsion_geometry import (
+from bbregen.torsion_geometry import (
     N_TORSIONS,
     TOR_ALPHA,
     TOR_BETA,
@@ -20,7 +20,7 @@ from torsion_geometry import (
     dihedral_rad_torch,
     wrap_dihedral_diff_torch,
 )
-from utils import backbone_atoms
+from bbregen.utils import backbone_atoms
 
 
 def _ideal_bridge_bb_and_targets(dtype=torch.float64, device='cpu'):
@@ -114,7 +114,7 @@ def test_bridge_closure_loss_ignores_invalid_bridges():
 
 
 def test_delta_absent_from_closure_loss():
-    text = Path(__file__).resolve().parents[1] / 'bridge_closure.py'
+    text = Path(__file__).resolve().parents[1] / 'src' / 'bbregen' / 'bridge_closure.py'
     low = text.read_text().lower()
     assert 'delta' not in low
 
@@ -147,7 +147,7 @@ def test_processed_pt_smoke_if_present():
 
 
 def test_bridge_o3p_bond_target_is_not_intraresidue_o3_p_separation():
-    from torsion_geometry import _get_template_tensors
+    from bbregen.torsion_geometry import _get_template_tensors
 
     tc = _get_template_tensors('cpu')
     for idx in range(4):

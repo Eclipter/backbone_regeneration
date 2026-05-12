@@ -7,18 +7,18 @@ from pathlib import Path
 import pytest
 import torch
 
-from torsion_constants import (
+from bbregen.torsion_constants import (
     N_LATENT,
     N_TORSIONS,
     N_TORSIONS_LATENT,
 )
-from torsion_geometry import (
+from bbregen.torsion_geometry import (
     build_backbone_from_torsions,
     build_backbone_from_torsions_torch,
 )
 
 
-_SRC = Path(__file__).resolve().parents[1]
+_SRC = Path(__file__).resolve().parents[1] / 'src' / 'bbregen'
 _MODEL_PY = _SRC / 'model.py'
 
 

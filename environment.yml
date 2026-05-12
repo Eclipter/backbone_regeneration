@@ -17,4 +17,3 @@ dependencies:
       - torch==2.8.*
       - lightning
       - torch_geometric
-      - -e PyNAMod

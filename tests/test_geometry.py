@@ -4,7 +4,7 @@ import numpy as np
 import torch
 from torch_geometric.data import Data
 
-from torsion_geometry import (
+from bbregen.torsion_geometry import (
     N_TORSIONS,
     TOR_ALPHA,
     TOR_BETA,
@@ -19,9 +19,7 @@ from torsion_geometry import (
     nerf_place,
     _get_template,
 )
-
-
-from wrapped_score_diffusion import decode_torsions, encode_torsions, wrap_angle
+from bbregen.wrapped_score_diffusion import decode_torsions, encode_torsions, wrap_angle
 
 
 def _encode(theta: torch.Tensor, tau_m: torch.Tensor) -> torch.Tensor:
@@ -92,7 +90,7 @@ def test_alpha_roundtrip_from_template():
 
 
 def test_tau_m_encode_decode_roundtrip():
-    from torsion_constants import TAU_M_MAX, TAU_M_MIN
+    from bbregen.torsion_constants import TAU_M_MAX, TAU_M_MIN
 
     rng = torch.Generator().manual_seed(0)
     n = N_TORSIONS
@@ -200,7 +198,7 @@ def test_beta_gamma_paths_close_on_canonical_template():
 
 
 def test_world_local_roundtrip():
-    from torsion_geometry import local_to_world_points, world_to_local_points
+    from bbregen.torsion_geometry import local_to_world_points, world_to_local_points
 
     torch.manual_seed(0)
     origin = torch.randn(2, 3)
@@ -218,7 +216,7 @@ def test_window_builder_uses_same_frame_convention_as_utils():
     ok = torch.randn(5, 3)
     frame = torch.randn(5, 3, 3)
     frame, _ = torch.linalg.qr(frame)
-    from torsion_geometry import world_to_local_torch
+    from bbregen.torsion_geometry import world_to_local_torch
 
     u = torch.einsum('bi,bij->bj', o3w - ok, frame)
     v = world_to_local_torch(o3w, ok, frame)
@@ -268,7 +266,7 @@ def test_measured_chi_pyrimidine_matches_input():
 
 def test_world_local_matches_project_helpers():
     """Same row-vector convention as builder/inference: local = (world - origin) @ R."""
-    from torsion_geometry import local_to_world_points, world_to_local_points
+    from bbregen.torsion_geometry import local_to_world_points, world_to_local_points
 
     torch.manual_seed(2)
     b = 5

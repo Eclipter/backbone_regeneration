@@ -1,0 +1,41 @@
+name: Tests
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Micromamba (environment.yml)
+        uses: mamba-org/setup-micromamba@v2
+        with:
+          environment-file: environment.yml
+          environment-name: backbone_regen
+          cache-environment: true
+
+      - name: Install pytest
+        shell: bash -el {0}
+        run: |
+          micromamba run -n backbone_regen \
+              pip install -U pip
+          micromamba run -n backbone_regen \
+              pip install -e '.[test]'
+
+      - name: Run pytest
+        shell: bash -el {0}
+        run: |
+          micromamba run -n backbone_regen \
+              pytest tests

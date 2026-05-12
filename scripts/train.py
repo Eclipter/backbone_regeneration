@@ -7,14 +7,13 @@ from datetime import datetime
 
 import lightning.pytorch as pl
 import torch
+from bbregen.config import BASE, EXPERIMENTS, RUN_NAME, SEED
+from bbregen.dataset import DNADataModule
+from bbregen.model import PytorchLightningModule
 from lightning.pytorch.callbacks import (LearningRateMonitor, ModelCheckpoint,
                                          StochasticWeightAveraging)
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning_utilities.core.rank_zero import rank_zero_info
-
-from config import BASE, EXPERIMENTS, RUN_NAME, SEED
-from dataset import DNADataModule
-from model import PytorchLightningModule
 
 # Suppress PyTorch FutureWarning about functools.partial in DDP comm hooks (Python 3.13 compatibility)
 warnings.filterwarnings('ignore', category=FutureWarning, module='torch.distributed.algorithms.ddp_comm_hooks')

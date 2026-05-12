@@ -14,18 +14,17 @@ import torch.nn.functional as F
 from MDAnalysis.exceptions import SelectionError
 from torch_geometric.data import Data
 
-from pynamod import CG_Structure
-from pynamod.atomic_analysis.nucleotides_parser import get_base_u
-from torsion_geometry import (N_TORSIONS, nucleotide_torsions_numpy,
-                              wrap_angle_rad)
+from pynamod import CG_Structure  # pyright: ignore[reportAttributeAccessIssue]
+from pynamod.atomic_analysis.nucleotides_parser import get_base_u  # pyright: ignore[reportMissingImports]
 
-backbone_atoms = ["C1'", "C2'", "C3'", "C4'", "C5'", "OP1", "OP2", "P", "O3'", "O4'", "O5'"]
+from .torsion_geometry import nucleotide_torsions_numpy, wrap_angle_rad
+
+backbone_atoms = ["C1'", "C2'", "C3'", "C4'", "C5'", 'OP1', 'OP2', 'P', "O3'", "O4'", "O5'"]
 nucleic_acid_atoms = ['N1', 'N2', 'N3', 'N4', 'N6', 'N7', 'N9', 'C2', 'C4', 'C5', 'C6', 'C7', 'C8', 'O2', 'O4', 'O6']
 nucleotide_atoms = nucleic_acid_atoms + backbone_atoms
 atom_to_idx = {atom: i for i, atom in enumerate(nucleotide_atoms)}
 base_to_idx = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
 
-# 3-class one-hot for where a nucleotide sits in its chain
 CHAIN_END_CLASS_INTERNAL = 0
 CHAIN_END_CLASS_5_PRIME = 1
 CHAIN_END_CLASS_3_PRIME = 2
@@ -35,7 +34,7 @@ PBAR_COLOR = '#B366FF'
 
 
 def _load_mda_universe_from_pdb_file(pdb_path):
-    """Open a PDB file with MDAnalysis; silence unknown X/D element PDB noise; guess empty elements."""
+    """Open a PDB file with MDAnalysis and silence noisy element warnings."""
     with warnings.catch_warnings():
         warnings.filterwarnings(
             'ignore',
@@ -55,7 +54,6 @@ def mmcif_to_mda_universe(path):
     tmp_pdb = tmp.name
     tmp.close()
     try:
-        # Avoid placeholder 1 Å³ CRYST1 from gemmi; MDAnalysis warns and drops the box anyway.
         pdb_opts = gemmi.PdbWriteOptions()
         pdb_opts.cryst1_record = False
         st.write_pdb(tmp_pdb, pdb_opts)
@@ -92,7 +90,7 @@ def find_best_checkpoint(run_dir):
 
 
 def get_pdb_ids():
-    """Get PDB IDs from the RCSB PDB API with resolution less than 3 Å and DNA (longer than 3 residues)."""
+    """Get PDB IDs from the RCSB PDB API with resolution ≤3 Å and DNA (≥3 residues)."""
     query = {
         'query': {
             'type': 'group',
@@ -105,8 +103,8 @@ def get_pdb_ids():
                         'attribute': 'rcsb_entry_info.resolution_combined',
                         'operator': 'less_or_equal',
                         'negation': False,
-                        'value': 3
-                    }
+                        'value': 3,
+                    },
                 },
                 {
                     'type': 'terminal',
@@ -115,8 +113,8 @@ def get_pdb_ids():
                         'attribute': 'entity_poly.rcsb_entity_polymer_type',
                         'operator': 'exact_match',
                         'negation': False,
-                        'value': 'DNA'
-                    }
+                        'value': 'DNA',
+                    },
                 },
                 {
                     'type': 'terminal',
@@ -125,8 +123,8 @@ def get_pdb_ids():
                         'attribute': 'entity_poly.rcsb_sample_sequence_length',
                         'operator': 'greater_or_equal',
                         'negation': False,
-                        'value': 3
-                    }
+                        'value': 3,
+                    },
                 },
                 {
                     'type': 'group',
@@ -138,8 +136,8 @@ def get_pdb_ids():
                                 'attribute': 'exptl.method',
                                 'operator': 'exact_match',
                                 'negation': False,
-                                'value': 'X-RAY DIFFRACTION'
-                            }
+                                'value': 'X-RAY DIFFRACTION',
+                            },
                         },
                         {
                             'type': 'terminal',
@@ -148,51 +146,39 @@ def get_pdb_ids():
                                 'attribute': 'exptl.method',
                                 'operator': 'exact_match',
                                 'negation': False,
-                                'value': 'ELECTRON MICROSCOPY'
-                            }
-                        }
+                                'value': 'ELECTRON MICROSCOPY',
+                            },
+                        },
                     ],
-                    'logical_operator': 'or'
-                }
+                    'logical_operator': 'or',
+                },
             ],
-            'label': 'text'
+            'label': 'text',
         },
         'return_type': 'entry',
         'request_options': {
-            'paginate': {
-                'start': 0,
-                'rows': 10000
-            },
-            'results_content_type': [
-                'experimental'
-            ],
-            'sort': [
-                {
-                    'sort_by': 'score',
-                    'direction': 'desc'
-                }
-            ],
-            'scoring_strategy': 'combined'
-        }
+            'paginate': {'start': 0, 'rows': 10000},
+            'results_content_type': ['experimental'],
+            'sort': [{'sort_by': 'score', 'direction': 'desc'}],
+            'scoring_strategy': 'combined',
+        },
     }
 
     response = requests.post(
         'https://search.rcsb.org/rcsbsearch/v2/query',
         json=query,
-        headers={'Content-Type': 'application/json'}
+        headers={'Content-Type': 'application/json'},
     )
     response.raise_for_status()
     data = response.json()
-    pdb_ids = [item['identifier'] for item in data.get('result_set', [])]
-
-    return pdb_ids
+    return [item['identifier'] for item in data.get('result_set', [])]
 
 
 def resolve_run_dir(run):
     """Map a user-facing experiment id (e.g. 'fixed_swa/baseline') to its log directory."""
     if osp.isabs(run):
         return run
-    log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', 'logs')
+    log_dir = osp.join(osp.dirname(osp.abspath(__file__)), '..', '..', 'logs')
     run_norm = osp.normpath(run)
     if run_norm.split(os.sep, 1)[0] == 'logs':
         run_norm = run_norm.split(os.sep, 1)[1] if os.sep in run_norm else ''
@@ -203,8 +189,7 @@ def has_pair(structure, nucleotide):
     """Check if a nucleotide has a pair."""
     lead_idxs = structure.dna.pairs_list.lead_nucl_inds  # type: ignore
     lag_idxs = structure.dna.pairs_list.lag_nucl_inds  # type: ignore
-
-    return nucleotide.ind in lead_idxs+lag_idxs
+    return nucleotide.ind in lead_idxs + lag_idxs
 
 
 _ATOM_RENAMES = {'O1P': 'OP1', 'O2P': 'OP2', 'O1A': 'OP1', 'O2A': 'OP2'}
@@ -214,21 +199,16 @@ def rename_atom(name):
     return _ATOM_RENAMES.get(name, name.rstrip('AB'))
 
 
-# Heavy atom = not hydrogen by name and not hydrogen/deuterium by element
 def _is_heavy_atom(atom):
     return 'H' not in atom.name and getattr(atom, 'element', None) not in {'H', 'D'}
 
 
-# (atom_name, position) pairs for heavy atoms in the experimental residue, in input order
 def default_atoms_provider(nucleotide):
     return [(rename_atom(a.name), a.position) for a in nucleotide.e_residue if _is_heavy_atom(a)]
 
 
 def inference_atoms_provider(nucleotide):
-    """Canonical heavy atoms of the nucleotide; fill positions from the experimental residue
-    when present, zeros otherwise. Backbone atoms are always zero-initialised at inference
-    time and get replaced by Gaussian noise in the reverse diffusion loop.
-    """
+    """Canonical heavy atoms for a nucleotide with zero-filled missing positions."""
     exp_positions = dict(default_atoms_provider(nucleotide))
     atoms = []
     for atom in get_base_u(nucleotide.restype):  # type: ignore
@@ -248,24 +228,24 @@ def _heavy_xyz_dict(nucleotide):
 
 
 def _neighbor_xyz_for_torsions(window, i):
-    """Heavy-atom name→xyz for current, previous, next nucleotides (chain neighbors outside window)."""
+    """Heavy-atom xyz for current, previous, and next nucleotides."""
     cur = window[i]
     xyz_cur = _heavy_xyz_dict(cur)
     if i > 0:
         xyz_prev = _heavy_xyz_dict(window[i - 1])
     else:
-        p = cur.previous_nucleotide
-        xyz_prev = _heavy_xyz_dict(p) if p is not None else {}
+        prev_nt = cur.previous_nucleotide
+        xyz_prev = _heavy_xyz_dict(prev_nt) if prev_nt is not None else {}
     if i < len(window) - 1:
         xyz_next = _heavy_xyz_dict(window[i + 1])
     else:
-        n = cur.next_nucleotide
-        xyz_next = _heavy_xyz_dict(n) if n is not None else {}
+        next_nt = cur.next_nucleotide
+        xyz_next = _heavy_xyz_dict(next_nt) if next_nt is not None else {}
     return xyz_cur, xyz_prev, xyz_next
 
 
 def _build_window_data(window, window_idx, chain_len, chain_direction, structure, window_size):
-    """Build per-nucleotide torsion features and chain metadata for one sliding window."""
+    """Build the PyG window payload used by inference and training."""
     ref_frames_all = getattr(structure.dna.nucleotides, 'ref_frames')
     origins_all = getattr(structure.dna.nucleotides, 'origins')
 
@@ -281,20 +261,19 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
 
     tau_m_list: list[float] = []
     tau_m_mask_list: list[bool] = []
-    pair_origins: list = []
-    pair_frames: list = []
+    pair_origins: list[torch.Tensor] = []
+    pair_frames: list[torch.Tensor] = []
 
-    # Build bidirectional map: nucleotide.ind -> paired nucleotide.ind
-    _pairs = structure.dna.pairs_list
+    pairs = structure.dna.pairs_list
     pair_map: dict[int, int] = {
-        **{lead: lag for lead, lag in zip(_pairs.lead_nucl_inds, _pairs.lag_nucl_inds)},
-        **{lag: lead for lead, lag in zip(_pairs.lead_nucl_inds, _pairs.lag_nucl_inds)},
+        **{lead: lag for lead, lag in zip(pairs.lead_nucl_inds, pairs.lag_nucl_inds)},
+        **{lag: lead for lead, lag in zip(pairs.lead_nucl_inds, pairs.lag_nucl_inds)},
     }
 
     for nucleotide_idx, nucleotide in enumerate(window):
         base_letter = nucleotide.restype
         base_type_idx.append(base_to_idx[base_letter])
-        nt_has_pair = has_pair(structure, nucleotide)
+        nt_has_pair = nucleotide.ind in pair_map
         position_in_chain = window_idx + nucleotide_idx
         if position_in_chain == 0:
             chain_end_class = CHAIN_END_CLASS_5_PRIME if chain_direction >= 0 else CHAIN_END_CLASS_3_PRIME
@@ -350,11 +329,11 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
     bb_world = torch.full((window_size, n_bb, 3), float('nan'), dtype=torch.float32)
     for i, nucleotide in enumerate(window):
         exp = dict(default_atoms_provider(nucleotide))
-        for j, nm in enumerate(backbone_atoms):
-            if nm in exp:
-                bb_world[i, j] = torch.tensor(np.asarray(exp[nm], dtype=np.float32))
+        for j, atom_name in enumerate(backbone_atoms):
+            if atom_name in exp:
+                bb_world[i, j] = torch.tensor(np.asarray(exp[atom_name], dtype=np.float32))
 
-    j_O3 = backbone_atoms.index("O3'")
+    j_o3 = backbone_atoms.index("O3'")
     o3_prev_local_rows = []
     o3_prev_valid_rows = []
     for k in range(window_size):
@@ -362,14 +341,14 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
             o3_prev_local_rows.append(torch.zeros(3, dtype=torch.float32))
             o3_prev_valid_rows.append(False)
         else:
-            o3w = bb_world[k - 1, j_O3]
+            o3w = bb_world[k - 1, j_o3]
             if torch.isnan(o3w).any():
                 o3_prev_local_rows.append(torch.zeros(3, dtype=torch.float32))
                 o3_prev_valid_rows.append(False)
             else:
                 ok = nt_origins[k]
-                Rk = nt_frames[k]
-                o3_local = (o3w - ok) @ Rk
+                rk = nt_frames[k]
+                o3_local = (o3w - ok) @ rk
                 o3_prev_local_rows.append(o3_local.float())
                 o3_prev_valid_rows.append(True)
 
@@ -399,16 +378,7 @@ def _build_window_data(window, window_idx, chain_len, chain_direction, structure
 
 
 def parse_dna(path, use_full_nucleotide, window_size=3):
-    """Read a PDB/mmCIF file, run pynamod DNA analysis, group nucleotides by chain,
-    slide sliding windows, and build PyG Data objects for every contiguous window.
-
-    Returns:
-        structure: the `CG_Structure` with `analyze_dna` applied.
-        chain_records: list of (chain_key, chain, windows) where `chain` is the list of
-            pynamod nucleotides grouped by chainID (fallback to segid), and `windows` is
-            a list of (window, window_idx, data) for every window of `window_size`
-            consecutive residues (gapped windows are skipped).
-    """
+    """Parse a DNA structure and build sliding-window records."""
     ext = os.path.splitext(path)[1].lower()
     if ext == '.pdb':
         universe = _load_mda_universe_from_pdb_file(path)
@@ -424,11 +394,10 @@ def parse_dna(path, use_full_nucleotide, window_size=3):
     dna_segids = list(np.unique(nucleic_atoms.segids))
     structure.analyze_dna(leading_strands=dna_segids, use_full_nucleotide=use_full_nucleotide)
 
-    # Group nucleotides by chains
     nucleotides_by_chain = defaultdict(list)
     for segid, nucleotide in zip(
         structure.dna.nucleotides.segids,  # type: ignore
-        structure.dna.nucleotides
+        structure.dna.nucleotides,
     ):
         atom_group = getattr(nucleotide, 'e_residue').atoms
         atom0 = atom_group[0] if len(atom_group) > 0 else None
@@ -441,32 +410,28 @@ def parse_dna(path, use_full_nucleotide, window_size=3):
             continue
         nucleotides_by_chain[chain_key].append(nucleotide)
 
-    # Build per-chain windows (skipping short chains and non-contiguous windows).
-    # KeyError/SelectionError inside a chain abort the rest of that chain, matching
-    # the original training-time behaviour.
     chain_records = []
     for chain_key, chain in nucleotides_by_chain.items():
         windows: list = []
         if len(chain) >= window_size:
-            # Infer chain direction (5'->3' vs 3'->5') from endpoint resids.
-            # Standard PDB/mmCIF numbering increases along 5'->3', so a lagging
-            # strand whose list order is reversed shows up as direction == -1.
             first_resid = chain[0].e_residue.resids[0]
             last_resid = chain[-1].e_residue.resids[0]
             chain_direction = 1 if last_resid >= first_resid else -1
             try:
                 for window_idx in range(len(chain) - window_size + 1):
                     window = chain[window_idx: window_idx + window_size]
-
-                    # Check for continuity of residues to avoid gaps in the chain
                     resids = [n.e_residue.resids[0] for n in window]
-                    steps = [resids[i+1] - resids[i] for i in range(len(resids)-1)]
+                    steps = [resids[i + 1] - resids[i] for i in range(len(resids) - 1)]
                     if not (all(s == 1 for s in steps) or all(s == -1 for s in steps)):
                         continue
 
                     data = _build_window_data(
-                        window, window_idx, len(chain), chain_direction,
-                        structure, window_size,
+                        window,
+                        window_idx,
+                        len(chain),
+                        chain_direction,
+                        structure,
+                        window_size,
                     )
                     windows.append((window, window_idx, data))
             except (KeyError, SelectionError):
@@ -474,10 +439,3 @@ def parse_dna(path, use_full_nucleotide, window_size=3):
         chain_records.append((chain_key, chain, windows))
 
     return structure, chain_records
-
-
-if __name__ == '__main__':
-    pdb_ids = get_pdb_ids()
-
-    print(f'API request resulted in {len(pdb_ids)} PDB IDs.', end='\n')
-    print(pdb_ids)

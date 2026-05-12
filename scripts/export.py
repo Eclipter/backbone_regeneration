@@ -1,3 +1,5 @@
+"""Export the diffusion denoiser from a Lightning checkpoint to ONNX."""
+
 import json
 import os
 import os.path as osp
@@ -5,10 +7,10 @@ from argparse import ArgumentParser
 
 import torch
 
-from model import N_TORSIONS_LATENT, PytorchLightningModule
-from utils import base_to_idx, find_best_checkpoint, resolve_run_dir
+from bbregen.model import N_TORSIONS_LATENT, PytorchLightningModule
+from bbregen.utils import base_to_idx, find_best_checkpoint, resolve_run_dir
 
-# Keys describing denoiser I/O and σ endpoints at inference time (VE score sampler rebuilds grids).
+# Keys describing denoiser I/O and sigma endpoints at inference time.
 HPARAM_KEYS = (
     'hidden_dim',
     'num_heads',
@@ -20,25 +22,21 @@ HPARAM_KEYS = (
     'tau_sigma_max',
     'tau_loss_weight',
     'score_loss_weighting',
+    'log_tau_init_noise_scale',
 )
 
-# Inference window (nucleotides). ``torch.onnx.export`` fixes this axis in the graph; only
-# batch ``B`` is dynamic — do not declare ``L`` in ``dynamic_axes`` or consumers may assume any length.
+# The exported graph keeps the nucleotide window length fixed.
 ONNX_EXPORT_SEQ_LEN = 3
+
+MODEL_DIR = osp.normpath(osp.join(osp.dirname(osp.abspath(__file__)), '..', 'model'))
 
 
 def export_to_onnx(ckpt_path, out_dir=None, opset=17):
-    """Export the torsion Transformer denoiser from a Lightning checkpoint to ONNX.
-
-    Writes ``model.onnx`` (single forward: node features → predicted score) and ``model.json``.
-    Tensors are ``[B, ONNX_EXPORT_SEQ_LEN, node_dim]`` and ``[B, ONNX_EXPORT_SEQ_LEN, N_TORSIONS_LATENT]``;
-    only the batch axis ``B`` is dynamic in the ONNX graph.
-    """
+    """Export the torsion Transformer denoiser from a Lightning checkpoint to ONNX."""
     if out_dir is None:
         out_dir = osp.dirname(osp.abspath(ckpt_path))
     os.makedirs(out_dir, exist_ok=True)
 
-    # Force fp32/CPU for a portable graph; training may have used 16-mixed.
     pl_module = (
         PytorchLightningModule
         .load_from_checkpoint(ckpt_path, map_location='cpu')
@@ -64,12 +62,20 @@ def export_to_onnx(ckpt_path, out_dir=None, opset=17):
         do_constant_folding=True,
     )
 
-    # Everything the ONNX graph deliberately leaves out goes into model.json.
     hp = pl_module.hparams
+
+    def _hparam(key):
+        if hasattr(hp, key):
+            return getattr(hp, key)
+        return hp.get(key)
+
     meta = {
-        'hyperparameters': {k: getattr(hp, k) for k in HPARAM_KEYS},
+        'hyperparameters': {k: _hparam(k) for k in HPARAM_KEYS},
         'N_TORSIONS_LATENT': N_TORSIONS_LATENT,
         'base_to_idx': base_to_idx,
+        'node_dim': d_in,
+        'time_emb_dim': pl_module.time_emb_dim,
+        'window_size': ONNX_EXPORT_SEQ_LEN,
         'opset_version': opset,
         'source_checkpoint': osp.basename(ckpt_path),
     }
@@ -80,21 +86,23 @@ def export_to_onnx(ckpt_path, out_dir=None, opset=17):
     return onnx_path, json_path
 
 
-MODEL_DIR = osp.normpath(osp.join(osp.dirname(osp.abspath(__file__)), '..', 'model'))
-
-
 def _parse_args():
-    p = ArgumentParser(description='Export the diffusion denoiser GNN from Lightning runs to ONNX.')
-    p.add_argument(
+    parser = ArgumentParser(description='Export the diffusion denoiser GNN from Lightning runs to ONNX.')
+    parser.add_argument(
         '--run-dir',
         required=True,
         help='Experiment id relative to logs/ (e.g. "fixed_swa/baseline").',
     )
-    p.add_argument('--opset', type=int, default=17, help='ONNX opset version (>=16 required for ScatterND).')
-    return p.parse_args()
+    parser.add_argument(
+        '--opset',
+        type=int,
+        default=17,
+        help='ONNX opset version (>=16 required for ScatterND).',
+    )
+    return parser.parse_args()
 
 
-if __name__ == '__main__':
+def main():
     args = _parse_args()
 
     run_dir = resolve_run_dir(args.run_dir)
@@ -103,3 +111,7 @@ if __name__ == '__main__':
     onnx_path, json_path = export_to_onnx(ckpt_path, MODEL_DIR, args.opset)
     print(f'Exported ONNX graph:     {onnx_path}')
     print(f'Exported companion JSON: {json_path}')
+
+
+if __name__ == '__main__':
+    main()

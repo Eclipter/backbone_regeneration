@@ -8,31 +8,30 @@ from typing import Any, Tuple
 import MDAnalysis as mda
 import numpy as np
 import torch
-from tqdm import tqdm
 from Bio.PDB.mmcifio import MMCIFIO
 from Bio.PDB.PDBParser import PDBParser
 from torch_geometric.data import Batch
+from .onnx_runtime import OnnxSampler
+from .torsion_constants import TAU_M_MAX, TAU_M_MIN
+from .torsion_geometry import (
+    N_TORSIONS,
+    TOR_ALPHA,
+    TOR_EPS,
+    TOR_ZETA,
+    build_batch_window_backbone_from_torsions_torch,
+)
+from tqdm import tqdm
 
-import utils
-from model import PytorchLightningModule
-from torsion_constants import TAU_M_MAX, TAU_M_MIN
-from torsion_geometry import (N_TORSIONS, TOR_ALPHA, TOR_EPS, TOR_ZETA,
-                              build_batch_window_backbone_from_torsions_torch)
-from utils import (CHAIN_END_CLASS_3_PRIME, CHAIN_END_CLASS_5_PRIME,
-                   resolve_run_dir)
+from . import utils
+from .utils import CHAIN_END_CLASS_3_PRIME, CHAIN_END_CLASS_5_PRIME
 
 WINDOW_SIZE = 3
+MODEL_DIR = osp.normpath(osp.join(osp.dirname(osp.abspath(__file__)), '..', '..', 'model'))
 _FIVE_PRIME_PHOSPHATE_ATOMS = frozenset({'P', 'OP1', 'OP2'})
 
 
-def _load_model(ckpt_path, device):
-    return (
-        PytorchLightningModule
-        .load_from_checkpoint(ckpt_path, map_location=device)
-        .float()
-        .to(device)
-        .eval()
-    )
+def _load_model(model_path, device):
+    return OnnxSampler(model_path, device=device)
 
 
 def _chain_list_direction(chain):
@@ -144,7 +143,7 @@ def _window_tidx_for_chain_index(chain_len: int, j: int):
 
 def predict_backbone(
     input_path,
-    ckpt_path,
+    model_path=MODEL_DIR,
     device='cuda',
     show_progress: bool = False,
 ) -> Tuple[dict, Any]:
@@ -153,7 +152,7 @@ def predict_backbone(
         use_full_nucleotide=False,
         window_size=WINDOW_SIZE,
     )
-    model = _load_model(ckpt_path, device)
+    model = _load_model(model_path, device)
     predictions: dict = {}
 
     for _chain_key, chain, windows in chain_records:
@@ -309,7 +308,6 @@ def _parse_args():
     p = ArgumentParser(description='Regenerate DNA backbone atoms from a base-only PDB/mmCIF.')
     p.add_argument('--input', required=True, help='Path to input .pdb/.cif/.mmcif (DNA without backbone).')
     p.add_argument('--output', required=True, help='Output path; format from extension (.pdb or .cif/.mmcif).')
-    p.add_argument('--run-dir', required=True, help='Experiment id under logs/ (e.g. "fixed_swa/baseline").')
     p.add_argument(
         '--generate-5-prime-phosphate',
         action='store_true',
@@ -318,14 +316,11 @@ def _parse_args():
     return p.parse_args()
 
 
-if __name__ == '__main__':
+def main():
     args = _parse_args()
-    ckpt_path = utils.find_best_checkpoint(resolve_run_dir(args.run_dir))
-    print(f'checkpoint: {ckpt_path}')
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     predictions, chain_records = predict_backbone(
         args.input,
-        ckpt_path,
         device=device,
     )
     write_structure(
@@ -335,3 +330,7 @@ if __name__ == '__main__':
         generate_5prime_phosphate=args.generate_5_prime_phosphate,
     )
     print(f'Wrote {args.output} ({len(predictions)} predicted backbone atoms).')
+
+
+if __name__ == '__main__':
+    main()

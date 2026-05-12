@@ -5,11 +5,11 @@ from typing import Any, cast
 import torch
 from torch_geometric.data import Batch, Data
 
-import utils
-from model import PytorchLightningModule
-from torsion_constants import N_LATENT, N_TORSIONS
-from torsion_geometry import N_LATENT as TG_NLAT
-from wrapped_score_diffusion import encode_torsions
+from bbregen import utils
+from bbregen.model import PytorchLightningModule
+from bbregen.torsion_constants import N_LATENT, N_TORSIONS
+from bbregen.torsion_geometry import N_LATENT as TG_NLAT
+from bbregen.wrapped_score_diffusion import encode_torsions
 
 
 def _minimal_train_batch(ws: int = 3, *, device=torch.device('cpu')) -> Batch:

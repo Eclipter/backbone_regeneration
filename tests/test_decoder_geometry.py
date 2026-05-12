@@ -6,10 +6,9 @@ import numpy as np
 import pytest
 import torch
 
-from bridge_closure import canonical_two_residue_bridge_positions_numpy
-
-import utils
-from torsion_geometry import (
+from bbregen import utils
+from bbregen.bridge_closure import canonical_two_residue_bridge_positions_numpy
+from bbregen.torsion_geometry import (
     N_TORSIONS,
     _get_template,
     _get_template_tensors,
@@ -341,7 +340,7 @@ def test_ground_truth_torsions_rmsd_loose(device):
 
 
 def test_window_builder_batch_size_gt_one_finite(device):
-    from torsion_geometry import build_batch_window_backbone_from_torsions_torch
+    from bbregen.torsion_geometry import build_batch_window_backbone_from_torsions_torch
 
     B, W = 3, 4
     theta = torch.randn(B, W, N_TORSIONS, device=device, dtype=torch.float32) * 0.1

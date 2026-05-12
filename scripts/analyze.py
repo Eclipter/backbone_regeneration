@@ -19,16 +19,19 @@ import py3Dmol
 import requests
 import seaborn as sns
 import torch
+from Bio.PDB.PDBExceptions import PDBConstructionWarning
+from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
+from sklearn.neighbors import NearestNeighbors
+from torch_geometric.data import Batch, Data
+from tqdm import tqdm
+
 from bbregen import utils
 from bbregen.dataset import DNADataModule, PyGDataset
 from bbregen.model import PytorchLightningModule
 from bbregen.predict import MODEL_DIR, predict_backbone, write_structure
 from bbregen.torsion_constants import N_LATENT
 from bbregen.torsion_geometry import build_backbone_from_torsions
-from Bio.PDB.PDBExceptions import PDBConstructionWarning
-from sklearn.neighbors import NearestNeighbors
-from torch_geometric.data import Batch, Data
-from tqdm import tqdm
+from pynamod.atomic_analysis.nucleotides_parser import nucleotide_graphs
 
 # Angle channel order in tensors: α, β, γ, ε, ζ, χ, P (no backbone δ; τ_m is separate / log τ in latent).
 TOR_NAMES = ['α', 'β', 'γ', 'ε', 'ζ', 'χ', 'P']
@@ -154,8 +157,6 @@ def _add_local_axes(
 
 
 def _load_dataset_backbone_segments(bb_local, valid_mask):
-    from pynamod.atomic_analysis.nucleotides_parser import nucleotide_graphs  # pyright: ignore[reportMissingImports]
-
     rename_bb = {'O1P': 'OP1', 'O2P': 'OP2', 'O1A': 'OP1', 'O2A': 'OP2'}
     bb_set = set(utils.backbone_atoms)
     graph = nucleotide_graphs['A']
@@ -794,7 +795,6 @@ _bb_set = set(utils.backbone_atoms)
 
 
 def _get_backbone_bonds():
-    from pynamod.atomic_analysis.nucleotides_parser import nucleotide_graphs  # pyright: ignore[reportMissingImports]
     G = nucleotide_graphs['A']
     bonds = []
     seen = set()
@@ -859,8 +859,6 @@ def _coords_local_per_nt(window, origin_world, frame_world):
 
 def _bond_segments_from_nt_graph(coords_by_name: dict, restype_letter: str):
     """Intra-nucleotide bonds using the pynamod template graph (incl. base atoms)."""
-    from pynamod.atomic_analysis.nucleotides_parser import nucleotide_graphs  # pyright: ignore[reportMissingImports]
-
     if restype_letter not in nucleotide_graphs:
         return []
     graph = nucleotide_graphs[restype_letter]

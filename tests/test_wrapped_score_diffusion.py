@@ -286,8 +286,6 @@ def test_torsion_score_network_out_features_is_packed_latent():
         closure_bond_weight=1.0,
         closure_angle_weight=1.0,
         closure_torsion_weight=1.0,
-        log_closure_metrics_train=False,
-        log_closure_metrics_val=True,
     )
     pl_mod = BackboneLightningModule(**cast(Any, hp)).float()
     assert pl_mod.score_network.out.out_features == N_LATENT == 8

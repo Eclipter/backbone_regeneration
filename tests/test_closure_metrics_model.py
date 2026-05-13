@@ -78,8 +78,6 @@ def test_bridge_closure_metrics_returns_finite_dict():
         closure_bond_weight=1.0,
         closure_angle_weight=1.0,
         closure_torsion_weight=1.0,
-        log_closure_metrics_train=False,
-        log_closure_metrics_val=True,
     )
     mod = BackboneLightningModule(**cast(Any, hp)).eval()
     batch = _minimal_train_batch()
@@ -99,9 +97,9 @@ def test_bridge_closure_metrics_returns_finite_dict():
         assert torch.isfinite(out[k].reshape(-1)).all()
 
 
-def test_validation_step_source_logs_val_closure_when_flag_true():
+def test_validation_step_source_always_logs_val_closure():
     src = inspect.getsource(BackboneLightningModule.validation_step)
-    assert 'log_closure_metrics_val' in src
+    assert 'log_closure_metrics_val' not in src
     assert '_bridge_closure_metrics' in src
     assert "f'val/{key}'" in src.replace(' ', '')
 
@@ -133,8 +131,6 @@ def test_p_sample_loop_finite_shapes_with_stub_scores(monkeypatch):
         closure_bond_weight=1.0,
         closure_angle_weight=1.0,
         closure_torsion_weight=1.0,
-        log_closure_metrics_train=False,
-        log_closure_metrics_val=True,
     )
     mod = BackboneLightningModule(**cast(Any, hp)).eval()
 

@@ -240,8 +240,6 @@ def test_closed_form_no_delta_no_sincos():
         closure_bond_weight=1.0,
         closure_angle_weight=1.0,
         closure_torsion_weight=1.0,
-        log_closure_metrics_train=False,
-        log_closure_metrics_val=False,
     )
     pl = BackboneLightningModule(**cast(Any, hp)).float()
     den = TorsionScoreNetwork(pl.node_dim, hp['hidden_dim'], hp['num_heads'], hp['num_layers'])

@@ -58,13 +58,13 @@ def test_load_analysis_run_artifacts_collects_run_state(monkeypatch):
     assert got.ckpt_path == '/tmp/logs/torsions/baseline/checkpoints/best.ckpt'
     assert got.test_dataset_path == '/tmp/logs/torsions/baseline/test_dataset.pt'
     assert got.event_files == ['/tmp/logs/torsions/baseline/events.out.tfevents']
-    assert got.target_modes == ('all', 'central', 'edge')
+    assert got.target_modes == ('avg', 'central', 'edge')
     assert got.test_indices_per_mode == {
-        'all': [0, 1, 2, 3, 4],
+        'avg': [0, 1, 2, 3, 4],
         'central': [1, 3],
         'edge': [0, 4],
     }
-    assert len(got.test_datasets['all']) == 5
+    assert len(got.test_datasets['avg']) == 5
     assert len(got.test_datasets['central']) == 2
     assert len(got.test_datasets['edge']) == 2
     assert got.model is fake_model

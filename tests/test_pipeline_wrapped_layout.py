@@ -15,11 +15,11 @@ def test_val_rmsd_impl_calls_window_backbone_builder_only():
 
 def test_val_rmsd_metric_name():
     src = inspect.getsource(BackboneLightningModule._log_rmsd)
-    assert "f'{prefix}_rmsd'" in src
+    assert "f'{prefix}/rmsd/avg'" in src
     ck = Path(__file__).resolve().parents[1] / 'scripts' / 'train.py'
-    assert "monitor='val_rmsd'" in ck.read_text()
+    assert "monitor='val/rmsd/avg'" in ck.read_text()
     sched = inspect.getsource(BackboneLightningModule.configure_optimizers)
-    assert "'monitor': 'val_rmsd'" in sched
+    assert "'monitor': 'val/rmsd/avg'" in sched
 
 
 def test_predict_merges_target_residue_only_from_cached_window():

@@ -41,8 +41,8 @@ def test_model_source_has_no_tor_delta_or_ascii_delta_in_plm():
 
 def test_training_logs_named_loss_not_per_torsion_delta():
     text = _MODEL_PY.read_text()
-    assert "'train_loss'" in text or '"train_loss"' in text
-    assert "'train_closure'" in text or '"train_closure"' in text
+    assert "'train/loss'" in text or '"train/loss"' in text
+    assert "'train/closure_loss'" in text or '"train/closure_loss"' in text
 
 
 def test_coordinate_builders_have_no_delta_parameter():

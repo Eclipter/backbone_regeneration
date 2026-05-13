@@ -24,10 +24,10 @@ class _FakeAccumulator:
 
 def test_scalars_to_dataframe_preserves_step_value_pairs():
     ea = _FakeAccumulator({
-        'val_rmsd': [_Scalar(0, 1.5), _Scalar(1, 1.25)],
+        'val/rmsd/avg': [_Scalar(0, 1.5), _Scalar(1, 1.25)],
     })
 
-    got = scalars_to_dataframe(ea, 'val_rmsd')
+    got = scalars_to_dataframe(ea, 'val/rmsd/avg')
 
     assert got.to_dict('records') == [
         {'epoch': 0, 'value': 1.5},
@@ -38,11 +38,11 @@ def test_scalars_to_dataframe_preserves_step_value_pairs():
 def test_collect_scalar_history_filters_and_labels(monkeypatch):
     accumulators = {
         'events.a': _FakeAccumulator({
-            'train_loss': [_Scalar(0, 4.0)],
+            'train/loss': [_Scalar(0, 4.0)],
             'ignored': [_Scalar(0, 99.0)],
         }),
         'events.b': _FakeAccumulator({
-            'val_rmsd': [_Scalar(0, 2.0), _Scalar(1, 1.0)],
+            'val/rmsd/avg': [_Scalar(0, 2.0), _Scalar(1, 1.0)],
         }),
     }
 
@@ -57,15 +57,15 @@ def test_collect_scalar_history_filters_and_labels(monkeypatch):
     got = collect_scalar_history(
         ['events.a', 'events.b'],
         {
-            'train_loss': ('all', 'train_loss'),
-            'val_rmsd': ('all', 'val_rmsd'),
+            'train/loss': ('avg', 'train/loss'),
+            'val/rmsd/avg': ('avg', 'val/rmsd'),
         },
     )
 
     assert got.to_dict('records') == [
-        {'epoch': 0, 'mode': 'all', 'metric': 'train_loss', 'value': 4.0},
-        {'epoch': 0, 'mode': 'all', 'metric': 'val_rmsd', 'value': 2.0},
-        {'epoch': 1, 'mode': 'all', 'metric': 'val_rmsd', 'value': 1.0},
+        {'epoch': 0, 'mode': 'avg', 'metric': 'train/loss', 'value': 4.0},
+        {'epoch': 0, 'mode': 'avg', 'metric': 'val/rmsd', 'value': 2.0},
+        {'epoch': 1, 'mode': 'avg', 'metric': 'val/rmsd', 'value': 1.0},
     ]
 
 

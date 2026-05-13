@@ -37,9 +37,9 @@ def load_analysis_run_artifacts(run_id: str) -> AnalysisRunArtifacts:
     except FileNotFoundError:
         raise FileNotFoundError(f'`{test_dataset_path}` not found. Ensure training completed.')
 
-    target_modes = ('all', 'central', 'edge')
+    target_modes = ('avg', 'central', 'edge')
     test_indices_per_mode = {
-        'all': list(range(len(test_dataset))),
+        'avg': list(range(len(test_dataset))),
         'central': list(test_dataset.central_virtual),
         'edge': list(test_dataset.edge_virtual),
     }

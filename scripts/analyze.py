@@ -25,27 +25,21 @@ from tqdm import tqdm
 
 from base2backbone.data import BACKBONE_ATOMS, BASE_TO_INDEX, parse_dna
 from base2backbone.dataset import DNADataModule, PyGDataset
-from base2backbone.eval import (
-    backbone_local_in_target_frame,
-    backbone_segments_from_local_coords,
-    bond_segments_from_nt_graph,
-    coords_local_per_nt,
-    find_window_matching_sample,
-    local_backbone_rmsd,
-    ordered_backbone_segments,
-    phosphodiester_segments_local,
-    world_to_local_np,
-)
+from base2backbone.eval import (backbone_local_in_target_frame,
+                                backbone_segments_from_local_coords,
+                                bond_segments_from_nt_graph,
+                                coords_local_per_nt,
+                                find_window_matching_sample,
+                                local_backbone_rmsd, ordered_backbone_segments,
+                                phosphodiester_segments_local,
+                                world_to_local_np)
+from base2backbone.geometry.backbone import build_backbone_local
 from base2backbone.inference import predict_backbone, write_structure
 from base2backbone.io import default_atoms_provider
-from base2backbone.runtime import (
-    MODEL_DIR,
-    PROGRESS_BAR_COLOR,
-    collect_scalar_history,
-    load_analysis_run_artifacts,
-)
+from base2backbone.runtime import (MODEL_DIR, PROGRESS_BAR_COLOR,
+                                   collect_scalar_history,
+                                   load_analysis_run_artifacts)
 from base2backbone.torsion_constants import N_LATENT
-from base2backbone.geometry.backbone import build_backbone_local
 
 # Angle channel order in tensors: α, β, γ, ε, ζ, χ, pseudorotation phase
 # (no backbone δ; τ_m is separate / log τ in latent).
@@ -61,11 +55,11 @@ event_files = run_artifacts.event_files
 test_dataset = run_artifacts.test_dataset
 target_modes = run_artifacts.target_modes
 mode_colors = {
-    'all': 'indigo',
+    'avg': 'indigo',
     'central': PROGRESS_BAR_COLOR,
     'edge': 'violet',
 }
-mode_linestyles = {'all': '-', 'central': '--', 'edge': '--'}
+mode_linestyles = {'avg': '-', 'central': '--', 'edge': '--'}
 model = run_artifacts.model
 device = run_artifacts.device
 print(f'device: {device}')
@@ -141,6 +135,7 @@ def _add_local_axes(
             showlegend=False,
             hoverinfo='skip',
         ))
+
 
 bb_local_per_nt = []
 for i in range(ws):
@@ -564,26 +559,24 @@ plt.rcParams['font.family'] = 'Nunito'
 
 
 metric_tags = {
-    'train_loss':                          ('all',     'train_loss'),
-    'val_rmsd':                            ('all',     'val_rmsd'),
-    'val_rmsd_central':                    ('central', 'val_rmsd'),
-    'val_rmsd_edge':                       ('edge',    'val_rmsd'),
-    'test_rmsd':                           ('all',     'test_rmsd'),
-    'test_rmsd_central':                   ('central', 'test_rmsd'),
-    'test_rmsd_edge':                      ('edge',    'test_rmsd'),
+    'train/loss':                          ('avg',     'train/loss'),
+    'val/rmsd/avg':                        ('avg',     'val/rmsd'),
+    'val/rmsd/central':                    ('central', 'val/rmsd'),
+    'val/rmsd/edge':                       ('edge',    'val/rmsd'),
+    'test/rmsd/avg':                       ('avg',     'test/rmsd'),
+    'test/rmsd/central':                   ('central', 'test/rmsd'),
+    'test/rmsd/edge':                      ('edge',    'test/rmsd'),
 }
 scalars = collect_scalar_history(event_files, metric_tags)
-if scalars.empty:
-    raise ValueError(f'No tracked TensorBoard scalars in `{run_dir}`.')
 wide_per_mode = {
     mode: scalars.loc[scalars['mode'] == mode].pivot_table(
         index='epoch', columns='metric', values='value', aggfunc='last'
     )
     for mode in target_modes
 }
-wide = wide_per_mode['all']
-if 'train_loss' in wide.columns:
-    wide['train_noise_rmse'] = np.sqrt(wide['train_loss'].clip(lower=0))
+wide = wide_per_mode['avg']
+if 'train/loss' in wide.columns:
+    wide['train_noise_rmse'] = np.sqrt(wide['train/loss'].clip(lower=0))
 
 
 def _plot_metric(ax, table, column, color, label, linestyle='-'):
@@ -599,7 +592,7 @@ def _plot_metric(ax, table, column, color, label, linestyle='-'):
 
 
 validation_labels = {
-    'all': 'все нуклеотиды',
+    'avg': 'все нуклеотиды',
     'central': 'центральные нуклеотиды',
     'edge': 'краевые нуклеотиды',
 }
@@ -634,11 +627,11 @@ fig, ax = plt.subplots(figsize=(7, 4))
 ax.tick_params(axis='both', labelsize=15)
 for mode in target_modes:
     w = wide_per_mode[mode]
-    if 'val_rmsd' in w.columns:
+    if 'val/rmsd' in w.columns:
         _plot_metric(
             ax,
             w,
-            'val_rmsd',
+            'val/rmsd',
             mode_colors[mode],
             validation_labels[mode],
             mode_linestyles[mode],
@@ -656,7 +649,7 @@ plt.show()
 fig, ax = plt.subplots(figsize=(6, 3))
 ax.tick_params(axis='both', labelsize=15)
 test_values = [
-    float(wide_per_mode[mode]['test_rmsd'].dropna().iloc[-1])
+    float(wide_per_mode[mode]['test/rmsd'].dropna().iloc[-1])
     for mode in target_modes
 ]
 bars = ax.barh(
@@ -690,6 +683,7 @@ tidx_frame = data.nt_frames_world[tidx].numpy()
 if np.isnan(tidx_origin).any() or np.isnan(tidx_frame).any():
     tidx_origin = np.zeros(3, dtype=np.float64)
     tidx_frame = np.eye(3, dtype=np.float64)
+
 
 def _collect_frame_geometry(origins_world, frames_world, target_origin, target_frame, target_idx):
     labels = []
@@ -1213,7 +1207,7 @@ if rmsd_values:
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.hist(rmsd_values, bins=50, color='skyblue', edgecolor='white')
     for mode, color in mode_colors.items():
-        val = float(wide_per_mode[mode]['val_rmsd'].dropna().iloc[-1])
+        val = float(wide_per_mode[mode]['val/rmsd'].dropna().iloc[-1])
         ax.axvline(
             val,
             color=color,
@@ -1384,7 +1378,7 @@ _knn_is_edge_arr = np.array(_knn_is_edge)
 
 print('kNN backbone RMSD (local frame):')
 for _label, _mask in [
-    ('all',     np.ones(len(_knn_rmsds_arr), dtype=bool)),
+    ('avg',     np.ones(len(_knn_rmsds_arr), dtype=bool)),
     ('central', ~_knn_is_edge_arr),
     ('edge',    _knn_is_edge_arr),
 ]:
@@ -1394,7 +1388,7 @@ for _label, _mask in [
               f'  n={len(_vals)}')
 
 print('\nModel val RMSD (last epoch):')
-for _label, _w in [('all', wide)] + [(m, wide_per_mode[m]) for m in ('central', 'edge')]:
-    if 'val_rmsd' in _w.columns:
-        _v = float(_w['val_rmsd'].dropna().iloc[-1])
+for _label, _w in [('avg', wide)] + [(m, wide_per_mode[m]) for m in ('central', 'edge')]:
+    if 'val/rmsd' in _w.columns:
+        _v = float(_w['val/rmsd'].dropna().iloc[-1])
         print(f'  {_label:>7}: {_v:.3f} Å')

@@ -84,21 +84,6 @@ def _require_window_batch_fields(batch) -> None:
             )
 
 
-def _zero_bridge_closure_metrics(pred_x0: torch.Tensor) -> dict[str, torch.Tensor]:
-    z = pred_x0.sum() * 0.0
-    zf = pred_x0.new_zeros(())
-    return {
-        'closure_loss': z,
-        'closure_bond_loss': z,
-        'closure_angle_loss': z,
-        'closure_torsion_loss': z,
-        'closure_valid_bridge_fraction': zf,
-        'closure_num_valid_bridges': zf,
-        'closure_fail_rate': zf,
-        'bridge_bond_mae': zf,
-        'bridge_angle_mae_deg': zf,
-        'bridge_torsion_mae_deg': zf,
-    }
 
 
 class BackboneLightningModule(pl.LightningModule):
@@ -113,8 +98,6 @@ class BackboneLightningModule(pl.LightningModule):
         closure_bond_weight: float = 1.0,
         closure_angle_weight: float = 1.0,
         closure_torsion_weight: float = 1.0,
-        log_closure_metrics_train: bool = False,
-        log_closure_metrics_val: bool = True,
         log_tau_init_noise_scale: float | None = None,
     ):
         super().__init__()
@@ -282,12 +265,6 @@ class BackboneLightningModule(pl.LightningModule):
         bi = torch.arange(b, device=score_all.device)
         return score_all[bi, batch.target_nt_idx.long()]
 
-    def _should_compute_closure_train(self) -> bool:
-        return (
-            float(self.hparams.get('closure_loss_weight', 0.0)) > 0.0
-            or bool(self.hparams.get('log_closure_metrics_train', False))
-        )
-
     def training_step(self, batch, batch_idx):
         theta0, m, tau0, tau_mk, _ = self._theta_mask_target(batch)
         if theta0.shape[-1] != N_TORSIONS:
@@ -350,14 +327,11 @@ class BackboneLightningModule(pl.LightningModule):
             pert['sigma_theta'],
             pert['sigma_tau'],
         )
-        if self._should_compute_closure_train():
-            clo_metrics = self._bridge_closure_metrics(pred_x0_cl, batch)
-        else:
-            clo_metrics = _zero_bridge_closure_metrics(pred_x0_cl)
+        clo_metrics = self._bridge_closure_metrics(pred_x0_cl, batch)
         cl = clo_metrics['closure_loss']
         loss = mse + float(self.hparams.get('closure_loss_weight', 0.0)) * cl
         self.log(
-            'train_loss', mse,
+            'train/loss', mse,
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
         )
         self.log(
@@ -369,7 +343,7 @@ class BackboneLightningModule(pl.LightningModule):
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
         )
         self.log(
-            'train/score_norm', pred.square().mean(),
+            'diagnostics/train/score_norm', pred.square().mean(),
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
         )
         tgt = torch.cat(
@@ -377,21 +351,17 @@ class BackboneLightningModule(pl.LightningModule):
             dim=-1,
         )
         self.log(
-            'train/target_score_norm', tgt.square().mean(),
+            'diagnostics/train/target_score_norm', tgt.square().mean(),
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
         )
         self.log(
-            'train/sigma_theta_mean',
+            'diagnostics/train/sigma_theta_mean',
             pert['sigma_theta'].mean(),
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
         )
         self.log(
-            'train/sigma_tau_mean',
+            'diagnostics/train/sigma_tau_mean',
             pert['sigma_tau'].mean(),
-            on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
-        )
-        self.log(
-            'train_closure', cl,
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
         )
         for key in (
@@ -407,31 +377,30 @@ class BackboneLightningModule(pl.LightningModule):
             'bridge_torsion_mae_deg',
         ):
             self.log(
-                key, clo_metrics[key],
+                f'train/{key}', clo_metrics[key],
                 on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
             )
         return loss
 
     def on_train_epoch_end(self):
         self._write_epoch_scalars([
-            'train_loss',
+            'train/loss',
             'train/angular_score_loss',
             'train/tau_score_loss',
-            'train/score_norm',
-            'train/target_score_norm',
-            'train/sigma_theta_mean',
-            'train/sigma_tau_mean',
-            'train_closure',
-            'closure_loss',
-            'closure_bond_loss',
-            'closure_angle_loss',
-            'closure_torsion_loss',
-            'closure_valid_bridge_fraction',
-            'closure_num_valid_bridges',
-            'closure_fail_rate',
-            'bridge_bond_mae',
-            'bridge_angle_mae_deg',
-            'bridge_torsion_mae_deg',
+            'diagnostics/train/score_norm',
+            'diagnostics/train/target_score_norm',
+            'diagnostics/train/sigma_theta_mean',
+            'diagnostics/train/sigma_tau_mean',
+            'train/closure_loss',
+            'train/closure_bond_loss',
+            'train/closure_angle_loss',
+            'train/closure_torsion_loss',
+            'train/closure_valid_bridge_fraction',
+            'train/closure_num_valid_bridges',
+            'train/closure_fail_rate',
+            'train/bridge_bond_mae',
+            'train/bridge_angle_mae_deg',
+            'train/bridge_torsion_mae_deg',
         ])
 
     def _is_edge_target(self, batch):
@@ -457,22 +426,20 @@ class BackboneLightningModule(pl.LightningModule):
     def _write_rmsd_scalars(self, prefix):
         if prefix == 'val':
             keys = [
-                'val_rmsd',
-                'val_rmsd_central',
-                'val_rmsd_edge',
+                'val/rmsd/avg',
+                'val/rmsd/central',
+                'val/rmsd/edge',
             ]
         else:
             keys = [
-                'test_rmsd',
-                'test_rmsd_central',
-                'test_rmsd_edge',
+                'test/rmsd/avg',
+                'test/rmsd/central',
+                'test/rmsd/edge',
             ]
         self._write_epoch_scalars(keys)
 
     def _val_closure_tensorboard_keys(self):
-        """TensorBoard extras when validation logs bridge closure diagnostics."""
-        if not bool(self.hparams.get('log_closure_metrics_val', False)):
-            return []
+        """TensorBoard scalars for bridge closure on validation samples."""
         return [
             'val/closure_loss',
             'val/closure_bond_loss',
@@ -655,9 +622,9 @@ class BackboneLightningModule(pl.LightningModule):
         finite = torch.isfinite(per_graph_rmsd)
 
         for name, mask in [
-            (f'{prefix}_rmsd', finite),
-            (f'{prefix}_rmsd_central', (~is_edge) & finite),
-            (f'{prefix}_rmsd_edge', is_edge & finite),
+            (f'{prefix}/rmsd/avg', finite),
+            (f'{prefix}/rmsd/central', (~is_edge) & finite),
+            (f'{prefix}/rmsd/edge', is_edge & finite),
         ]:
             if mask.any():
                 self.log(
@@ -669,19 +636,18 @@ class BackboneLightningModule(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         _, (pred_theta, pred_tau_m) = self.p_sample_loop(batch)
         self._log_rmsd('val', pred_theta, pred_tau_m, batch)
-        if bool(self.hparams.get('log_closure_metrics_val', False)):
-            pred_x0 = encode_torsions(pred_theta, pred_tau_m)
-            clo = self._bridge_closure_metrics(pred_x0, batch)
-            for key, val in clo.items():
-                self.log(
-                    f'val/{key}',
-                    val,
-                    on_epoch=True,
-                    on_step=False,
-                    sync_dist=True,
-                    batch_size=batch.num_graphs,
-                    logger=False,
-                )
+        pred_x0 = encode_torsions(pred_theta, pred_tau_m)
+        clo = self._bridge_closure_metrics(pred_x0, batch)
+        for key, val in clo.items():
+            self.log(
+                f'val/{key}',
+                val,
+                on_epoch=True,
+                on_step=False,
+                sync_dist=True,
+                batch_size=batch.num_graphs,
+                logger=False,
+            )
 
     def test_step(self, batch, _):
         _, (pred_theta, pred_tau_m) = self.p_sample_loop(batch)
@@ -711,5 +677,5 @@ class BackboneLightningModule(pl.LightningModule):
         )
         return {
             'optimizer': optimizer,
-            'lr_scheduler': {'scheduler': scheduler, 'monitor': 'val_rmsd'},
+            'lr_scheduler': {'scheduler': scheduler, 'monitor': 'val/rmsd/avg'},
         }

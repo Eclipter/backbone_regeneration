@@ -15,7 +15,8 @@ from MDAnalysis.exceptions import SelectionError
 from torch_geometric.data import Data
 
 from pynamod import CG_Structure  # pyright: ignore[reportAttributeAccessIssue]
-from pynamod.atomic_analysis.nucleotides_parser import get_base_u  # pyright: ignore[reportMissingImports]
+from pynamod.atomic_analysis.nucleotides_parser import \
+    get_base_u  # pyright: ignore[reportMissingImports]
 
 from .torsion_geometry import nucleotide_torsions_numpy, wrap_angle_rad
 

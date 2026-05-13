@@ -3,9 +3,11 @@ import multiprocessing as mp
 import os
 import os.path as osp
 import shutil
+import sys
 import tempfile
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from pathlib import Path
 from typing import Optional, cast
 
 import lightning.pytorch as pl
@@ -16,6 +18,10 @@ from torch.utils.data import Sampler
 from torch_geometric.data import Dataset
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
+
+if __package__ in (None, ''):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    __package__ = 'bbregen'
 
 from . import utils
 from .config import SEED

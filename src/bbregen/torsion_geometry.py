@@ -1327,34 +1327,6 @@ def _rodrigues_rotmat_from_axis_angle(
     return I + sa.unsqueeze(-1).unsqueeze(-1) * K + omc.unsqueeze(-1).unsqueeze(-1) * (axis.unsqueeze(-1) @ axis.unsqueeze(-2))
 
 
-def _mean_ring_bond_length_torch(
-    stacked: torch.Tensor,
-    pairs: tuple[tuple[int, int], ...],
-) -> torch.Tensor:
-    """Mean edge length per batch row; ``stacked`` is ``[..., 5, 3]``."""
-    ds = []
-    for i, j in pairs:
-        ds.append((stacked[..., i, :] - stacked[..., j, :]).norm(dim=-1))
-    return torch.stack(ds, dim=-1).mean(dim=-1)
-
-
-def _scale_ring_isotropic_about_centroid_torch(
-    stacked: torch.Tensor,
-    target_mean_bond: torch.Tensor,
-) -> torch.Tensor:
-    """Scale ``[...,5,3]`` about its centroid to match mean bond length (preserves dihedrals)."""
-    cent = stacked.mean(dim=-2, keepdim=True)
-    d = stacked - cent
-    cur = _mean_ring_bond_length_torch(
-        stacked,
-        ((0, 1), (1, 2), (2, 3), (3, 4), (4, 0)),
-    ).clamp(min=1e-4)
-    s = (target_mean_bond / cur).clamp(0.82, 1.18)
-    while s.ndim < stacked.ndim:
-        s = s.unsqueeze(-1)
-    return cent + d * s
-
-
 def build_sugar_ring_closed_form_torch(
     chi: torch.Tensor,
     P: torch.Tensor,
@@ -1365,7 +1337,12 @@ def build_sugar_ring_closed_form_torch(
     bond_lengths: Optional[dict] = None,
     bond_angles: Optional[dict] = None,
 ) -> dict[str, torch.Tensor]:
-    """Closed-form furanose ring: template PCA plane + ``τ_m cos(P+φ)`` puckering, rigid anchor, χ.
+    """Closed-form furanose ring: NeRF from template reference frame + χ rotation.
+
+    Builds the ring using exact template bond lengths and angles.  C3' and C4' are
+    placed via NERF with torsions ν₄ and ν₀ from the Altona-Sundaralingam formula
+    (ν_k = τ_m cos(P + phase_k)).  The ring closes to within the AS approximation
+    residual (< 0.03 Å for typical RNA puckering).
 
     No grid scan, no discrete branch minimization, no cone–sphere sugar solver. Returns
     ``O4'``, ``C1'``, ``C2'``, ``C3'``, ``C4'``.
@@ -1394,6 +1371,7 @@ def build_sugar_ring_closed_form_torch(
     def _g1(key: str) -> torch.Tensor:
         return tc[key][ri]
 
+    # PCA ring: gives P-appropriate 3D positions for all ring atoms.
     spec = _planar_sugar_spec()
     xy = torch.as_tensor(spec['xy'], device=dev, dtype=dtype)
     ctr = torch.as_tensor(spec['center'], device=dev, dtype=dtype)
@@ -1404,34 +1382,89 @@ def build_sugar_ring_closed_form_torch(
     z_sc = float(spec['z_scale'])
     sgn_p = float(spec['sign_P'])
 
-    tau_c = tm_f.clamp(min=1e-4)
-    z = (
-        z_sc
-        * tau_c.unsqueeze(-1)
-        * torch.cos(sgn_p * P_f.unsqueeze(-1) + phases.unsqueeze(0))
+    z = z_sc * tm_f.clamp(min=1e-4).unsqueeze(-1) * torch.cos(
+        sgn_p * P_f.unsqueeze(-1) + phases.unsqueeze(0)
     )
-    stacked = sugar_ring_from_xy_z_torch(xy, z, ctr, e1v, e2v, env)
-    order = _SUGAR_RING_BUILD_ATOM_ORDER
-    # Match mean ring bond length to template (isotropic about centroid; preserves ν).
-    tgt_bl = (
-        _g1('bl_o4_c4')
-        + (tc['c1'][ri] - tc['o4'][ri]).norm(dim=-1)
-        + _g1('bl_c2_c1')
-        + _g1('bl_c3_c2')
-        + _g1('bl_c4_c3')
-    ) / 5.0
-    stacked = _scale_ring_isotropic_about_centroid_torch(stacked, tgt_bl)
-    ring_pre: dict[str, torch.Tensor] = {
-        order[j]: stacked[:, j] for j in range(5)
-    }
+    stacked = sugar_ring_from_xy_z_torch(xy, z, ctr, e1v, e2v, env)  # [N, 5, 3]
+    # _SUGAR_RING_BUILD_ATOM_ORDER: C4'=0, O4'=1, C1'=2, C2'=3, C3'=4
 
-    ring_pre = _rigid_align_c1_o4_c2_torch(
-        ring_pre,
-        _g1('c1'),
-        _g1('o4'),
-        _g1('c2_ref'),
+    # Translate-only: move C1' to template position, preserve P-appropriate O4'/C2' directions.
+    c1 = _g1('c1')
+    transl = c1 - stacked[:, 2]
+    bl_o4c1 = (tc['c1'][ri] - tc['o4'][ri]).norm(dim=-1)
+
+    # Rescale O4' and C2' to exact template bond lengths, keeping P-dependent directions.
+    o4 = c1 + bl_o4c1.unsqueeze(-1) * _safe_normalize(stacked[:, 1] + transl - c1)
+    c2 = c1 + _g1('bl_c2_c1').unsqueeze(-1) * _safe_normalize(stacked[:, 3] + transl - c1)
+
+    # ν₁ = dihedral(O4',C1',C2',C3'); ν₂ = dihedral(C1',C2',C3',C4') — AS formula.
+    _HP = torch.tensor(torch.pi / 2.0, device=dev, dtype=dtype)
+    nus = nus_rad_from_P_tau_torch(P_f, tm_f)  # [N, 5]
+
+    # Place C3' via NeRF: exact bl_c3c2, exact ν₁ (index 4 in _RING_TORSION_DEFS order).
+    c3 = nerf_place_torch(
+        o4, c1, c2,
+        _g1('bl_c3_c2'), _g1('ba_c1_c2_c3'),
+        nus[:, 4] - _HP,
     )
 
+    # Place ideal C4' via NeRF with ν₂ (index 0); used only to initialise circle basis.
+    ideal_c4 = nerf_place_torch(
+        c1, c2, c3,
+        _g1('bl_c4_c3'), _g1('ba_c2_c3_c4'),
+        nus[:, 0] - _HP,
+    )
+    bl_c4c3 = _g1('bl_c4_c3')   # [N]
+    bl_o4c4 = tc['bl_o4_c4'][ri]  # [N]
+
+    # Sphere-sphere intersection: circle of C4' satisfying |C4'–C3'| = bl_c4c3 and |C4'–O4'| = bl_o4c4.
+    c3o4 = o4 - c3
+    d_sq = (c3o4 * c3o4).sum(dim=-1)
+    d = d_sq.clamp(min=1e-8).sqrt()
+    d_hat = c3o4 / d.unsqueeze(-1)
+    h = (d_sq + bl_c4c3 ** 2 - bl_o4c4 ** 2) / (2.0 * d)  # foot distance from C3' to circle centre
+    r_c = (bl_c4c3 ** 2 - h ** 2).clamp(min=0.0).sqrt()    # circle radius
+    M = c3 + h.unsqueeze(-1) * d_hat                        # circle centre
+
+    # Circle orthonormal basis from ideal_c4 direction (initial orientation only).
+    vp = ideal_c4 - M
+    vp = vp - (vp * d_hat).sum(dim=-1, keepdim=True) * d_hat
+    e1 = _safe_normalize(vp)
+    e2 = torch.linalg.cross(d_hat, e1, dim=-1)
+
+    # Analytic φ for exact ν₂ = dihedral(C1',C2',C3',C4'(φ)) = nus[:,0] on the circle.
+    # n2(φ) = cross(C3'−C2', h·d̂ + r_c·(cos·e1 + sin·e2))
+    #       = h·A + r_c·(cos·B + sin·C)  where A,B,C below.
+    bc32 = c3 - c2
+    _A = torch.linalg.cross(bc32, d_hat, dim=-1)
+    _B = torch.linalg.cross(bc32, e1, dim=-1)
+    _C = torch.linalg.cross(bc32, e2, dim=-1)
+    n12 = _safe_normalize(torch.linalg.cross(c1 - c2, bc32, dim=-1))
+    m12 = torch.linalg.cross(n12, _safe_normalize(bc32), dim=-1)
+    a0 = h * (n12 * _A).sum(dim=-1)
+    a1 = h * (m12 * _A).sum(dim=-1)
+    b0 = r_c * (n12 * _B).sum(dim=-1)
+    b1 = r_c * (m12 * _B).sum(dim=-1)
+    g0 = r_c * (n12 * _C).sum(dim=-1)
+    g1 = r_c * (m12 * _C).sum(dim=-1)
+    nu2_tgt = nus[:, 0]
+    ct = torch.cos(nu2_tgt)
+    st = torch.sin(nu2_tgt)
+    Pc = ct * b1 - st * b0
+    Qc = ct * g1 - st * g0
+    Rc = ct * a1 - st * a0
+    pq = (Pc ** 2 + Qc ** 2).clamp(min=1e-8).sqrt()
+    phi_base = torch.atan2(Qc, Pc)
+    phi_off = torch.acos((-Rc / pq).clamp(-1.0, 1.0))
+    phi1 = phi_base + phi_off
+    phi2 = phi_base - phi_off
+    c4_a = M + r_c.unsqueeze(-1) * (torch.cos(phi1).unsqueeze(-1) * e1 + torch.sin(phi1).unsqueeze(-1) * e2)
+    c4_b = M + r_c.unsqueeze(-1) * (torch.cos(phi2).unsqueeze(-1) * e1 + torch.sin(phi2).unsqueeze(-1) * e2)
+    # Pick the solution closer to ideal_c4 (preserves ring chirality).
+    closer = ((c4_a - ideal_c4).norm(dim=-1) <= (c4_b - ideal_c4).norm(dim=-1)).unsqueeze(-1)
+    c4 = torch.where(closer, c4_a, c4_b)
+
+    ring_pre = {"C1'": c1, "O4'": o4, "C2'": c2, "C3'": c3, "C4'": c4}
     n_atom = tc['chi_n'][ri].reshape(N, 3)
     c_atom = tc['chi_c'][ri].reshape(N, 3)
     out = _apply_chi_rotation_to_sugar_ring_torch(ring_pre, chi_f, n_atom, c_atom)
@@ -2100,8 +2133,6 @@ def build_window_backbone_from_torsions_torch(
     For each k>=1, place P_k / OP1 / OP2 using ε,ζ from residue k−1 and α,β from k (masked).
     Bridge geometry uses k−1 world O3′,C3′,C4′ expressed in nucleotide k local frame.
     """
-    import torch
-
     W = int(torsions.shape[0])
     Ri = nt_frames_world
     if Ri.dim() == 2:

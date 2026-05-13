@@ -2,22 +2,21 @@ import math
 import os.path as osp
 
 import lightning.pytorch as pl
-from lightning.pytorch.loggers import TensorBoardLogger
 import torch
 import torch.nn as nn
+from lightning.pytorch.loggers import TensorBoardLogger
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from .data import BACKBONE_ATOMS, BASE_TO_INDEX, N_CHAIN_END_CLASSES
 from .bridge_closure import compute_bridge_closure_loss
+from .data import BACKBONE_ATOMS, BASE_TO_INDEX, N_CHAIN_END_CLASSES
 from .geometry import build_batch_window_backbone_from_torsions
-from .torsion_constants import (LOG_TAU_M_MAX, LOG_TAU_M_MIN, TAU_M_MAX,
-                                TAU_M_MIN, N_LATENT, N_TORSIONS)
 from .score_diffusion import (decode_torsions, encode_torsions,
-                                      estimate_latent_from_ve_score,
-                                      perturb_torsions, reverse_ve_score_step,
-                                      sigma_schedule, ve_sigma_grid,
-                                      weighted_score_mse, wrap_angle)
+                              estimate_latent_from_ve_score, perturb_torsions,
+                              reverse_ve_score_step, sigma_schedule,
+                              ve_sigma_grid, weighted_score_mse, wrap_angle)
+from .torsion_constants import (LOG_TAU_M_MAX, LOG_TAU_M_MIN, N_LATENT,
+                                N_TORSIONS, TAU_M_MAX, TAU_M_MIN)
 
 # Same dimension constant name as in ONNX companion JSON (`N_TORSIONS_LATENT`).
 N_TORSIONS_LATENT = N_LATENT
@@ -82,8 +81,6 @@ def _require_window_batch_fields(batch) -> None:
             raise ValueError(
                 f'Batch missing `{name}` for window-level geometry (wrapped torsions layout).',
             )
-
-
 
 
 class BackboneLightningModule(pl.LightningModule):
@@ -343,11 +340,11 @@ class BackboneLightningModule(pl.LightningModule):
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
         )
         self.log(
-            'train/angular_score_loss', mse_theta,
+            'diagnostics/train/angular_score_loss', mse_theta,
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
         )
         self.log(
-            'train/tau_score_loss', mse_tau,
+            'diagnostics/train/tau_score_loss', mse_tau,
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
         )
         self.log(
@@ -385,7 +382,7 @@ class BackboneLightningModule(pl.LightningModule):
             'bridge_torsion_mae_deg',
         ):
             self.log(
-                f'train/{key}', clo_metrics[key],
+                f'diagnostics/train/{key}', clo_metrics[key],
                 on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
             )
         return loss
@@ -393,22 +390,22 @@ class BackboneLightningModule(pl.LightningModule):
     def on_train_epoch_end(self):
         self._write_epoch_scalars([
             'train/loss',
-            'train/angular_score_loss',
-            'train/tau_score_loss',
+            'diagnostics/train/angular_score_loss',
+            'diagnostics/train/tau_score_loss',
             'diagnostics/train/score_norm',
             'diagnostics/train/target_score_norm',
             'diagnostics/train/sigma_theta_mean',
             'diagnostics/train/sigma_tau_mean',
-            'train/closure_loss',
-            'train/closure_bond_loss',
-            'train/closure_angle_loss',
-            'train/closure_torsion_loss',
-            'train/closure_valid_bridge_fraction',
-            'train/closure_num_valid_bridges',
-            'train/closure_fail_rate',
-            'train/bridge_bond_mae',
-            'train/bridge_angle_mae_deg',
-            'train/bridge_torsion_mae_deg',
+            'diagnostics/train/closure_loss',
+            'diagnostics/train/closure_bond_loss',
+            'diagnostics/train/closure_angle_loss',
+            'diagnostics/train/closure_torsion_loss',
+            'diagnostics/train/closure_valid_bridge_fraction',
+            'diagnostics/train/closure_num_valid_bridges',
+            'diagnostics/train/closure_fail_rate',
+            'diagnostics/train/bridge_bond_mae',
+            'diagnostics/train/bridge_angle_mae_deg',
+            'diagnostics/train/bridge_torsion_mae_deg',
         ])
 
     def _is_edge_target(self, batch):
@@ -449,16 +446,16 @@ class BackboneLightningModule(pl.LightningModule):
     def _val_closure_tensorboard_keys(self):
         """TensorBoard scalars for bridge closure on validation samples."""
         return [
-            'val/closure_loss',
-            'val/closure_bond_loss',
-            'val/closure_angle_loss',
-            'val/closure_torsion_loss',
-            'val/closure_valid_bridge_fraction',
-            'val/closure_num_valid_bridges',
-            'val/closure_fail_rate',
-            'val/bridge_bond_mae',
-            'val/bridge_angle_mae_deg',
-            'val/bridge_torsion_mae_deg',
+            'diagnostics/val/closure_loss',
+            'diagnostics/val/closure_bond_loss',
+            'diagnostics/val/closure_angle_loss',
+            'diagnostics/val/closure_torsion_loss',
+            'diagnostics/val/closure_valid_bridge_fraction',
+            'diagnostics/val/closure_num_valid_bridges',
+            'diagnostics/val/closure_fail_rate',
+            'diagnostics/val/bridge_bond_mae',
+            'diagnostics/val/bridge_angle_mae_deg',
+            'diagnostics/val/bridge_torsion_mae_deg',
         ]
 
     def on_validation_epoch_end(self):

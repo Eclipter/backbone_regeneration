@@ -10,13 +10,13 @@ from pathlib import Path
 import lightning.pytorch as pl
 import torch
 from config import BASE, EXPERIMENTS, RUN_NAME, SEED
-from lightning.pytorch.callbacks import (LearningRateMonitor, ModelCheckpoint,
-                                         StochasticWeightAveraging)
+from lightning.pytorch.callbacks import ModelCheckpoint, StochasticWeightAveraging
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning_utilities.core.rank_zero import rank_zero_info
 
 from base2backbone.dataset import DNADataModule
 from base2backbone.model import BackboneLightningModule
+from base2backbone.training_lr_monitor import TrainingLrMonitor
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -119,7 +119,7 @@ def train_one(cfg):
         mode='min',
         enable_version_counter=False
     )
-    lr_callback = LearningRateMonitor(logging_interval='epoch')
+    lr_callback = TrainingLrMonitor(logging_interval='epoch')
     if cfg['SWA']:
         swa = StochasticWeightAveraging(
             swa_lrs=cfg['SWA_LR']*cfg['LR'],

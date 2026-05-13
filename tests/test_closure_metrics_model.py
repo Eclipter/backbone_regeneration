@@ -101,7 +101,7 @@ def test_validation_step_source_always_logs_val_closure():
     src = inspect.getsource(BackboneLightningModule.validation_step)
     assert 'log_closure_metrics_val' not in src
     assert '_bridge_closure_metrics' in src
-    assert "f'val/{key}'" in src.replace(' ', '')
+    assert "f'diagnostics/val/{key}'" in src.replace(' ', '')
 
 
 def test_tl_latent_width_matches_torch_geometry():

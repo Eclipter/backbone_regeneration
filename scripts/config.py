@@ -1,4 +1,4 @@
-import math
+from math import pi
 
 # Base config: applied to every run. Change values here to affect all experiments at once
 BASE = dict(
@@ -18,10 +18,10 @@ BASE = dict(
     SWA_LR=0.1,
     SWA_EPOCH_START=80,
     NUM_EPOCHS=100,
-    ANGULAR_SIGMA_MIN=0.01 * math.pi,
-    ANGULAR_SIGMA_MAX=math.pi,
-    TAU_SIGMA_MIN=0.01 * math.pi,
-    TAU_SIGMA_MAX=math.pi,
+    ANGULAR_SIGMA_MIN=0.01*pi,
+    ANGULAR_SIGMA_MAX=pi,
+    TAU_SIGMA_MIN=0.01*pi,
+    TAU_SIGMA_MAX=pi,
     SCORE_LOSS_WEIGHTING='sigma2',
     TAU_LOSS_WEIGHT=1.0,
     CLOSURE_LOSS_WEIGHT=0.0,

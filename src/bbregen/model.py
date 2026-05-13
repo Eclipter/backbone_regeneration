@@ -7,12 +7,11 @@ import torch.nn as nn
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
+from .data import BACKBONE_ATOMS, BASE_TO_INDEX, N_CHAIN_END_CLASSES
 from .bridge_closure import compute_bridge_closure_loss
+from .geometry import build_batch_window_backbone_from_torsions_torch
 from .torsion_constants import (LOG_TAU_M_MAX, LOG_TAU_M_MIN, TAU_M_MAX,
-                                TAU_M_MIN)
-from .torsion_geometry import (N_LATENT, N_TORSIONS,
-                               build_batch_window_backbone_from_torsions_torch)
-from .utils import N_CHAIN_END_CLASSES, backbone_atoms, base_to_idx
+                                TAU_M_MIN, N_LATENT, N_TORSIONS)
 from .wrapped_score_diffusion import (decode_torsions, encode_torsions,
                                       estimate_theta_tau_from_score_ve,
                                       perturb_torsions, reverse_ve_score_step,
@@ -128,7 +127,7 @@ class PytorchLightningModule(pl.LightningModule):
             + 9
             + 3   # pair_rel_origins
             + 9   # pair_rel_frames (flattened 3x3)
-            + len(base_to_idx)
+            + len(BASE_TO_INDEX)
             + 1
             + N_CHAIN_END_CLASSES
             + 1
@@ -198,7 +197,7 @@ class PytorchLightningModule(pl.LightningModule):
         tors_m[bi, ti] = pred_theta
         tau_m[bi, ti] = pred_tau_m.clamp(min=TAU_M_MIN, max=TAU_M_MAX)
 
-        restype = batch.base_types.view(b, ws, len(base_to_idx)).argmax(-1)
+        restype = batch.base_types.view(b, ws, len(BASE_TO_INDEX)).argmax(-1)
         mask = batch.torsion_mask.view(b, ws, N_TORSIONS)
         origins = batch.nt_origins_world.view(b, ws, 3)
         frames = batch.nt_frames_world.view(b, ws, 3, 3)
@@ -246,7 +245,7 @@ class PytorchLightningModule(pl.LightningModule):
         rel_R = batch.rel_frames.view(b, ws, 9)
         pair_o = batch.pair_rel_origins.view(b, ws, 3)
         pair_R = batch.pair_rel_frames.view(b, ws, 3, 3).reshape(b, ws, 9)
-        base = batch.base_types.view(b, ws, len(base_to_idx))
+        base = batch.base_types.view(b, ws, len(BASE_TO_INDEX))
         hp = batch.has_pair_nt.view(b, ws, 1).float()
         ce = batch.chain_end_class.view(b, ws, N_CHAIN_END_CLASSES)
         it = batch.is_target_nt.view(b, ws, 1)
@@ -571,7 +570,7 @@ class PytorchLightningModule(pl.LightningModule):
         bi = torch.arange(b, device=ti.device)
         dev = pred_torsions.device
 
-        n_bb = len(backbone_atoms)
+        n_bb = len(BACKBONE_ATOMS)
         bb_world_all = batch.bb_xyz_world.view(b, ws, n_bb, 3)
         gt_bb_world = bb_world_all[bi, ti]
         origins = batch.nt_origins_world.view(b, ws, 3)[bi, ti]
@@ -583,7 +582,7 @@ class PytorchLightningModule(pl.LightningModule):
         theta_w[bi, ti] = pred_torsions.float()
         tau_w[bi, ti] = pred_tau_m.clamp(min=TAU_M_MIN, max=TAU_M_MAX).float()
 
-        restype = batch.base_types.view(b, ws, len(base_to_idx)).argmax(-1)
+        restype = batch.base_types.view(b, ws, len(BASE_TO_INDEX)).argmax(-1)
         mask = batch.torsion_mask.view(b, ws, N_TORSIONS)
         origins_w = batch.nt_origins_world.view(b, ws, 3)
         frames_w = batch.nt_frames_world.view(b, ws, 3, 3)
@@ -599,12 +598,12 @@ class PytorchLightningModule(pl.LightningModule):
         pred_bb_world = coords_w[bi, ti]
         pred_local = (pred_bb_world - origins.unsqueeze(1)) @ frames
 
-        j1 = backbone_atoms.index('OP1')
-        j2 = backbone_atoms.index('OP2')
+        j1 = BACKBONE_ATOMS.index('OP1')
+        j2 = BACKBONE_ATOMS.index('OP2')
         contrib = torch.zeros(b, device=dev, dtype=torch.float64)
         count = torch.zeros(b, device=dev, dtype=torch.float64)
 
-        for j, nm in enumerate(backbone_atoms):
+        for j, nm in enumerate(BACKBONE_ATOMS):
             if nm in ('OP1', 'OP2'):
                 continue
             pred_xyz = pred_local[:, j, :].to(dtype=torch.float64)

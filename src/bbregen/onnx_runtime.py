@@ -5,8 +5,8 @@ import numpy as np
 import onnxruntime as ort
 import torch
 
+from .data import BASE_TO_INDEX, N_CHAIN_END_CLASSES
 from .torsion_constants import LOG_TAU_M_MAX, LOG_TAU_M_MIN, N_LATENT, N_TORSIONS
-from .utils import N_CHAIN_END_CLASSES, base_to_idx
 from .wrapped_score_diffusion import decode_torsions, reverse_ve_score_step, ve_sigma_grid, wrap_angle
 
 
@@ -49,7 +49,7 @@ class OnnxSampler:
         rel_r = batch.rel_frames.view(b, ws, 9)
         pair_o = batch.pair_rel_origins.view(b, ws, 3)
         pair_r = batch.pair_rel_frames.view(b, ws, 3, 3).reshape(b, ws, 9)
-        base = batch.base_types.view(b, ws, len(base_to_idx))
+        base = batch.base_types.view(b, ws, len(BASE_TO_INDEX))
         hp = batch.has_pair_nt.view(b, ws, 1).float()
         ce = batch.chain_end_class.view(b, ws, N_CHAIN_END_CLASSES)
         it = batch.is_target_nt.view(b, ws, 1)

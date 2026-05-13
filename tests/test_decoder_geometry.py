@@ -196,6 +196,35 @@ def test_exocyclic_stereochemistry(device):
     assert ch_geo.item() * tc['ring_chiral_triple'][ri].item() > 0
 
 
+def test_o3_depends_only_on_ring_geometry(device):
+    ri = torch.tensor([0], device=device)
+    P = torch.tensor([0.2], device=device)
+    tau = torch.tensor([0.34], device=device)
+    chi = torch.tensor([0.1], device=device)
+    ring = build_sugar_ring_closed_form_torch(chi, P, tau, ri)
+    tc = _template_tc(device)
+    base_atoms = add_exocyclic_sugar_atoms_torch(
+        ring, restype_indices=ri, geometry={'template_tensors': tc},
+    )
+    tc_shifted = {key: value.clone() for key, value in tc.items()}
+    tc_shifted['psi_c5'][ri] = tc_shifted['psi_c5'][ri] + 0.75
+    shifted_atoms = add_exocyclic_sugar_atoms_torch(
+        ring, restype_indices=ri, geometry={'template_tensors': tc_shifted},
+    )
+    assert not torch.allclose(
+        shifted_atoms["C5'"],
+        base_atoms["C5'"],
+        atol=1e-4,
+        rtol=1e-4,
+    )
+    assert torch.allclose(
+        shifted_atoms["O3'"],
+        base_atoms["O3'"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
 def test_gamma_places_o5(device):
     ri = torch.tensor([2], device=device)
     P = torch.tensor([-0.1], device=device)

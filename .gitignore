@@ -70,7 +70,7 @@ venv.bak/
 *.pt
 
 # Data files
-data/
+/data/
 
 # OS-specific files
 .DS_Store

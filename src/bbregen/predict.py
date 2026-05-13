@@ -3,7 +3,7 @@ import os.path as osp
 import tempfile
 import warnings
 from argparse import ArgumentParser
-from typing import Any, Tuple
+from typing import Any, Tuple, cast
 
 import MDAnalysis as mda
 import numpy as np
@@ -11,23 +11,24 @@ import torch
 from Bio.PDB.mmcifio import MMCIFIO
 from Bio.PDB.PDBParser import PDBParser
 from torch_geometric.data import Batch
-from .onnx_runtime import OnnxSampler
-from .torsion_constants import TAU_M_MAX, TAU_M_MIN
-from .torsion_geometry import (
-    N_TORSIONS,
-    TOR_ALPHA,
-    TOR_EPS,
-    TOR_ZETA,
-    build_batch_window_backbone_from_torsions_torch,
+
+from .data import (
+    BACKBONE_ATOMS,
+    CHAIN_END_CLASS_3_PRIME,
+    CHAIN_END_CLASS_5_PRIME,
+    FIVE_PRIME_PHOSPHATE_ATOMS,
+    parse_dna,
 )
+from .geometry import build_batch_window_backbone_from_torsions_torch
+from .io import default_atoms_provider, inference_atoms_provider
+from .onnx_runtime import OnnxSampler
+from .runtime import MODEL_DIR
+from .torsion_constants import N_TORSIONS, TAU_M_MAX, TAU_M_MIN, TOR_ALPHA, TOR_EPS, TOR_ZETA
 from tqdm import tqdm
 
-from . import utils
-from .utils import CHAIN_END_CLASS_3_PRIME, CHAIN_END_CLASS_5_PRIME
+from .utils import PBAR_COLOR
 
 WINDOW_SIZE = 3
-MODEL_DIR = osp.normpath(osp.join(osp.dirname(osp.abspath(__file__)), '..', '..', 'model'))
-_FIVE_PRIME_PHOSPHATE_ATOMS = frozenset({'P', 'OP1', 'OP2'})
 
 
 def _load_model(model_path, device):
@@ -35,7 +36,7 @@ def _load_model(model_path, device):
 
 
 def _chain_list_direction(chain):
-    """Same convention as utils.parse_dna: +1 if resid increases toward 3' in list order."""
+    """Same convention as ``parse_dna``: +1 if resid increases toward 3' in list order."""
     first_resid = chain[0].e_residue.resids[0]
     last_resid = chain[-1].e_residue.resids[0]
     return 1 if last_resid >= first_resid else -1
@@ -77,7 +78,7 @@ def _predict_full_window_predictions_dict(model, sample_data, device) -> dict[An
         dc.pair_rel_origins = ((dc.pair_origins_world - o_t) @ r_t).float()
         dc.pair_rel_frames = torch.einsum('ji,njk->nik', r_t, dc.pair_frames_world).float()
 
-        batch = Batch.from_data_list([dc]).to(device)
+        batch = cast(Any, Batch.from_data_list([dc])).to(device)
         pred_theta, pred_tau_m = model.sample(batch)
         theta_acc[k] = pred_theta[0].detach().cpu()
         tau_acc[k] = pred_tau_m[0].detach().cpu()
@@ -97,7 +98,7 @@ def _predict_full_window_predictions_dict(model, sample_data, device) -> dict[An
     coords = bb_t[0].cpu().numpy()
     for local_i, nt in enumerate(window):
         row_w = coords[local_i]
-        for j_atom, nm in enumerate(utils.backbone_atoms):
+        for j_atom, nm in enumerate(BACKBONE_ATOMS):
             pos = row_w[j_atom]
             if np.isfinite(pos).all():
                 preds[(nt.segid, int(nt.resid), nm)] = pos
@@ -147,7 +148,7 @@ def predict_backbone(
     device='cuda',
     show_progress: bool = False,
 ) -> Tuple[dict, Any]:
-    _, chain_records = utils.parse_dna(
+    _, chain_records = parse_dna(
         input_path,
         use_full_nucleotide=False,
         window_size=WINDOW_SIZE,
@@ -168,7 +169,7 @@ def predict_backbone(
                 desc='Backbone inference',
                 leave=False,
                 disable=not show_progress,
-                colour=utils.PBAR_COLOR,
+                colour=PBAR_COLOR,
         ):
             widx, _tidx = _window_tidx_for_chain_index(L, j)
             if widx not in w_by_start:
@@ -229,12 +230,12 @@ def _build_output_universe(chain_records, predictions, generate_5prime_phosphate
         for nucleotide in chain:
             segid = nucleotide.segid
             resid = int(nucleotide.resid)
-            exp_positions = dict(utils.default_atoms_provider(nucleotide))
+            exp_positions = dict(default_atoms_provider(nucleotide))
             residue_had_atoms = False
-            for atom_name, _ in utils.inference_atoms_provider(nucleotide):
-                if atom_name in utils.backbone_atoms:
+            for atom_name, _ in inference_atoms_provider(nucleotide):
+                if atom_name in BACKBONE_ATOMS:
                     if (
-                        atom_name in _FIVE_PRIME_PHOSPHATE_ATOMS
+                        atom_name in FIVE_PRIME_PHOSPHATE_ATOMS
                         and (segid, resid) in suppress_phosphate_keys
                     ):
                         continue

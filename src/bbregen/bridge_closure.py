@@ -7,20 +7,21 @@ from typing import Optional
 import numpy as np
 import torch
 
-from .torsion_geometry import (
+from .data import BACKBONE_ATOMS
+from .geometry import (
+    bond_angle_numpy,
+    bond_angle_torch,
+    dihedral_rad_torch,
+    get_template,
+    get_template_tensors,
+    wrap_dihedral_diff_torch,
+)
+from .torsion_constants import (
     TOR_ALPHA,
     TOR_BETA,
     TOR_EPS,
     TOR_ZETA,
-    _BACKBONE_ATOM_ORDER,
-    _bond_angle_np,
-    _bond_angle_torch,
-    _get_template,
-    _get_template_tensors,
-    dihedral_rad_torch,
-    wrap_dihedral_diff_torch,
 )
-from .utils import backbone_atoms
 
 _BASE_LETTERS = ('A', 'C', 'G', 'T')
 
@@ -43,14 +44,14 @@ def canonical_two_residue_bridge_positions_numpy(rest_prev: str, rest_next: str)
     This preserves intra-residue P– O5′ and sugar bond lengths unlike rescaling ``P``
     alone, which inflated ``bond_p_o5`` mismatch in closure loss fixtures.
     """
-    tp = _get_template(rest_prev)
-    tn_raw = _get_template(rest_next)
+    tp = get_template(rest_prev)
+    tn_raw = get_template(rest_next)
     o3_prev = np.asarray(tp["O3'"], dtype=np.float64)
-    prev = {k: np.asarray(tp[k], dtype=np.float64) - o3_prev for k in backbone_atoms if k in tp}
+    prev = {k: np.asarray(tp[k], dtype=np.float64) - o3_prev for k in BACKBONE_ATOMS if k in tp}
 
     _ri = {'A': 0, 'C': 1, 'G': 2, 'T': 3}
     inc = _ri[rest_next]
-    tt = _get_template_tensors('cpu')
+    tt = get_template_tensors('cpu')
     bond_o3_p = float(tt['bond_p_o3_inter'][inc].numpy())
 
     vp = np.asarray(tp['P'], dtype=np.float64) - o3_prev
@@ -60,7 +61,7 @@ def canonical_two_residue_bridge_positions_numpy(rest_prev: str, rest_next: str)
     p_tpl_next = np.asarray(tn_raw['P'], dtype=np.float64)
     nxt = {
         nm: np.asarray(tn_raw[nm], dtype=np.float64) - p_tpl_next + p_tgt
-        for nm in backbone_atoms
+        for nm in BACKBONE_ATOMS
         if nm in tn_raw
     }
     return prev, nxt
@@ -80,9 +81,9 @@ def paired_bridge_corner_angles_numpy(rest_prev: str, rest_next: str) -> tuple[f
     o5_n = nxt["O5'"]
     c5_n = nxt["C5'"]
     return (
-        _bond_angle_np(c3_p, o3_p, p_n),
-        _bond_angle_np(o3_p, p_n, o5_n),
-        _bond_angle_np(p_n, o5_n, c5_n),
+        bond_angle_numpy(c3_p, o3_p, p_n),
+        bond_angle_numpy(o3_p, p_n, o5_n),
+        bond_angle_numpy(p_n, o5_n, c5_n),
     )
 
 
@@ -125,8 +126,8 @@ def canonical_two_residue_bridge_bb_tensor(
     """Aligned with ``tests.test_bridge_closure_loss._ideal_bridge_bb_and_targets`` layout ``[2, n_bb, 3]``."""
     dev = device if isinstance(device, torch.device) else torch.device(device)
     prev, nxt = canonical_two_residue_bridge_positions_numpy(rest_prev, rest_next)
-    name_to_j = {nm: j for j, nm in enumerate(backbone_atoms)}
-    bb = torch.full((2, len(backbone_atoms), 3), float('nan'), dtype=dtype, device=dev)
+    name_to_j = {nm: j for j, nm in enumerate(BACKBONE_ATOMS)}
+    bb = torch.full((2, len(BACKBONE_ATOMS), 3), float('nan'), dtype=dtype, device=dev)
     for nm, j in name_to_j.items():
         if nm in prev:
             bb[0, j] = torch.as_tensor(prev[nm], dtype=dtype, device=dev)
@@ -154,7 +155,7 @@ def compute_bridge_closure_loss(
     Parameters
     ----------
     bb_xyz_world
-        ``[B, W, n_bb, 3]`` world coordinates (order matches ``utils.backbone_atoms``).
+        ``[B, W, n_bb, 3]`` world coordinates (order matches ``bbregen.data.BACKBONE_ATOMS``).
     target_torsions
         ``[B, W, N_TORSIONS]`` reference torsions (ε, ζ on residue i; α, β on i+1).
     torsion_mask
@@ -220,8 +221,7 @@ def compute_bridge_closure_loss(
             'bridge_torsion_mae_deg': zf,
         }
 
-    assert tuple(backbone_atoms) == _BACKBONE_ATOM_ORDER
-    name_to_j = {nm: j for j, nm in enumerate(backbone_atoms)}
+    name_to_j = {nm: j for j, nm in enumerate(BACKBONE_ATOMS)}
     j_c4, j_c3, j_o3 = name_to_j["C4'"], name_to_j["C3'"], name_to_j["O3'"]
     j_p, j_o5, j_c5 = name_to_j['P'], name_to_j["O5'"], name_to_j["C5'"]
 
@@ -288,7 +288,7 @@ def compute_bridge_closure_loss(
     ri_next = restype_indices[:, 1:].long()
     ri_prev = restype_indices[:, :-1].long()
 
-    tc = _get_template_tensors(str(dev))
+    tc = get_template_tensors(str(dev))
     d0_o3p = tc['bond_p_o3_inter'][ri_next]
     d0_po5 = tc['bond_p_o5'][ri_next]
 
@@ -302,9 +302,9 @@ def compute_bridge_closure_loss(
     ar_angle2 = ang_lut[ri_prev.long(), ri_next.long(), 1]
     ar_angle3 = ang_lut[ri_prev.long(), ri_next.long(), 2]
 
-    a1 = _bond_angle_torch(c3_p, o3_p, p_n, eps)
-    a2 = _bond_angle_torch(o3_p, p_n, o5_n, eps)
-    a3 = _bond_angle_torch(p_n, o5_n, c5_n, eps)
+    a1 = bond_angle_torch(c3_p, o3_p, p_n, eps)
+    a2 = bond_angle_torch(o3_p, p_n, o5_n, eps)
+    a3 = bond_angle_torch(p_n, o5_n, c5_n, eps)
     angle_sq = (
         ((a1 - ar_angle1) / (sigma_a + eps)) ** 2
         + ((a2 - ar_angle2) / (sigma_a + eps)) ** 2

@@ -23,8 +23,8 @@ if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
     __package__ = 'bbregen'
 
-from . import utils
-from .config import SEED
+from .data import get_pdb_ids, parse_dna
+from .utils import PBAR_COLOR
 
 EDGE_CACHE_NAME = 'edge_windows.txt'
 
@@ -33,7 +33,7 @@ class PyGDataset(Dataset):
     def __init__(self):
         self.window_size = 3
 
-        self.pdb_ids = utils.get_pdb_ids()
+        self.pdb_ids = get_pdb_ids()
 
         root_path = osp.join(osp.dirname(osp.abspath(__file__)), '..', '..', 'data')
         super().__init__(root_path)
@@ -87,7 +87,7 @@ class PyGDataset(Dataset):
                     executor.map(self.download_file, pdb_ids_to_download),
                     total=len(pdb_ids_to_download),
                     desc='\033[1;38;5;93mDownloading mmCIF files\033[0m',
-                    colour=utils.PBAR_COLOR
+                    colour=PBAR_COLOR
                 ))
         else:
             print('\033[1;31mUsing single-threaded downloading for debugging purposes...\033[0m')
@@ -95,7 +95,7 @@ class PyGDataset(Dataset):
                 map(self.download_file, pdb_ids_to_download),
                 total=len(pdb_ids_to_download),
                 desc='\033[1;38;5;93mDownloading mmCIF files\033[0m',
-                colour=utils.PBAR_COLOR
+                colour=PBAR_COLOR
             ))
 
         tag_path = osp.join(self.processed_dir, self.processed_file_names)
@@ -168,7 +168,7 @@ class PyGDataset(Dataset):
                 for per_file_edges in tqdm(
                     executor.map(self.process_file, self.pdb_ids),
                     total=len(self.pdb_ids),
-                    colour=utils.PBAR_COLOR
+                    colour=PBAR_COLOR
                 ):
                     edge_paths.extend(per_file_edges)
         else:
@@ -176,7 +176,7 @@ class PyGDataset(Dataset):
             for per_file_edges in tqdm(
                 map(self.process_file, self.pdb_ids),
                 total=len(self.pdb_ids),
-                colour=utils.PBAR_COLOR
+                colour=PBAR_COLOR
             ):
                 edge_paths.extend(per_file_edges)
 
@@ -203,7 +203,7 @@ class PyGDataset(Dataset):
         # Load the mmCIF, run pynamod's DNA analysis, and materialise windows
         raw_path = osp.join(self.raw_dir, f'{pdb_id}.cif')
         try:
-            _, chain_records = utils.parse_dna(
+            _, chain_records = parse_dna(
                 raw_path, use_full_nucleotide=True, window_size=self.window_size,
             )
         except:
@@ -219,6 +219,12 @@ class PyGDataset(Dataset):
                 data_idx += 1
 
         return edge_paths
+
+
+def prepare_dataset(seed: int) -> None:
+    """Download/process raw mmCIF data into `data/`."""
+    pl.seed_everything(seed, workers=True, verbose=False)
+    PyGDataset()
 
 
 class WindowTargetDataset(torch.utils.data.Dataset):
@@ -327,16 +333,17 @@ class EdgeCentralTargetSampler(Sampler[int]):
 
 class DNADataModule(pl.LightningDataModule):
     def __init__(self, batch_size, train_ratio=0.7, val_ratio=0.2,
-                 edge_weight=0.3):
+                 edge_weight=0.3, seed=42):
         super().__init__()
 
         self.batch_size = batch_size
         self.train_ratio = train_ratio
         self.val_ratio = val_ratio
         self.edge_weight = edge_weight
+        self.seed = seed
 
         self.num_workers = min(len(os.sched_getaffinity(0)), 16)
-        self.train_generator = torch.Generator().manual_seed(SEED)
+        self.train_generator = torch.Generator().manual_seed(seed)
 
     def prepare_data(self):
         PyGDataset()
@@ -392,7 +399,7 @@ class DNADataModule(pl.LightningDataModule):
             indices_by_split_group[split_group_by_pdb_id[pdb_id]].append(idx)
 
         split_groups = sorted(indices_by_split_group.keys())
-        rng = np.random.default_rng(SEED)
+        rng = np.random.default_rng(self.seed)
         rng.shuffle(split_groups)
 
         n_split_groups = len(split_groups)
@@ -449,7 +456,3 @@ class DNADataModule(pl.LightningDataModule):
             persistent_workers=True,
             multiprocessing_context='spawn'
         )  # type: ignore
-
-
-if __name__ == '__main__':
-    PyGDataset()

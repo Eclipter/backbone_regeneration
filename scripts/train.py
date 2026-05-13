@@ -2,18 +2,26 @@ import logging
 import os
 import os.path as osp
 import shutil
+import sys
 import warnings
 from datetime import datetime
+from pathlib import Path
 
 import lightning.pytorch as pl
 import torch
-from bbregen.config import BASE, EXPERIMENTS, RUN_NAME, SEED
-from bbregen.dataset import DNADataModule
-from bbregen.model import PytorchLightningModule
+from config import BASE, EXPERIMENTS, RUN_NAME, SEED
 from lightning.pytorch.callbacks import (LearningRateMonitor, ModelCheckpoint,
                                          StochasticWeightAveraging)
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning_utilities.core.rank_zero import rank_zero_info
+
+from bbregen.dataset import DNADataModule
+from bbregen.model import PytorchLightningModule
+
+_SCRIPT_DIR = Path(__file__).resolve().parent
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
+
 
 # Suppress PyTorch FutureWarning about functools.partial in DDP comm hooks (Python 3.13 compatibility)
 warnings.filterwarnings('ignore', category=FutureWarning, module='torch.distributed.algorithms.ddp_comm_hooks')
@@ -45,11 +53,12 @@ def _get_run_paths(cfg):
 
 
 def train_one(cfg):
-    pl.seed_everything(SEED, workers=True, verbose=False)
+    pl.seed_everything(cfg['SEED'], workers=True, verbose=False)
 
     data_module = DNADataModule(
         batch_size=cfg['BATCH_SIZE'],
         edge_weight=cfg['EDGE_WEIGHT'],
+        seed=cfg['SEED'],
     )
     pl_module = PytorchLightningModule(
         hidden_dim=cfg['HIDDEN_DIM'],
@@ -123,7 +132,6 @@ def train_one(cfg):
     trainer = pl.Trainer(
         max_epochs=cfg['NUM_EPOCHS'],
         gradient_clip_val=1,
-        precision='32',
         num_nodes=num_nodes,
         devices=([0, 1] if os.uname().nodename.partition('.')[0] == 'node07' else 'auto'),  # TODO: remove
         logger=logger,
@@ -151,6 +159,7 @@ def main():
     for exp in EXPERIMENTS:
         run_cfg = {**BASE, **exp}
         run_cfg['RUN_NAME'] = RUN_NAME
+        run_cfg['SEED'] = SEED
         run_cfg['RUN_VERSION'] = _make_run_version(run_cfg, BASE)
         rank_zero_info(f'\n\033[1;38;5;93mRunning experiment: {run_cfg["RUN_VERSION"]}\033[0m')
         train_one(run_cfg)

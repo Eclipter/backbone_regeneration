@@ -385,7 +385,7 @@ def _get_template_tensors(device_str: str) -> dict:
         'bl_op1', 'bl_op2',
         'ang_op1', 'ang_op2',
         'psi_op1', 'psi_op2',
-        'psi_o3', 'bl_o4_c4', 'ba_c1_o4_c4', 'ba_o4_c4_c3',
+        'psi_o3', 'psi_o3_ring', 'bl_o4_c4', 'ba_c1_o4_c4', 'ba_o4_c4_c3',
         'ring_chiral_triple',
     ]
 
@@ -431,6 +431,7 @@ def _get_template_tensors(device_str: str) -> dict:
         rows_1d['psi_op1'].append(_dr(tpl, "O3'", "O5'", 'P', 'OP1'))
         rows_1d['psi_op2'].append(_dr(tpl, "O3'", "O5'", 'P', 'OP2'))
         rows_1d['psi_o3'].append(_dr(tpl, "C5'", "C4'", "C3'", "O3'"))
+        rows_1d['psi_o3_ring'].append(_dr(tpl, "O4'", "C4'", "C3'", "O3'"))
         rows_1d['bl_o4_c4'].append(_bl(tpl, "O4'", "C4'"))
         rows_1d['ba_c1_o4_c4'].append(_ba(tpl, "C1'", "O4'", "C4'"))
         rows_1d['ba_o4_c4_c3'].append(_ba(tpl, "O4'", "C4'", "C3'"))
@@ -1067,10 +1068,10 @@ def add_exocyclic_sugar_atoms_torch(
         _template_select(tc, 'psi_c5', ri, dtype=dtype) - half_pi,
     )
     o3 = nerf_place_torch(
-        c5, c4, c3,
+        o4, c4, c3,
         _template_select(tc, 'bl_o3_c3', ri, dtype=dtype),
         _template_select(tc, 'ba_c4_c3_o3', ri, dtype=dtype),
-        _template_select(tc, 'psi_o3', ri, dtype=dtype) - half_pi,
+        _template_select(tc, 'psi_o3_ring', ri, dtype=dtype) - half_pi,
     )
 
     out = dict(ring_atoms)
@@ -1419,9 +1420,9 @@ def build_backbone_from_torsions(
         gamma - _HP,
     )
 
-    psi_o3 = float(tc['psi_o3'][ri].item())
+    psi_o3 = float(tc['psi_o3_ring'][ri].item())
     o3 = nerf_place(
-        c5, c4, c3,
+        o4, c4, c3,
         float(tc['bl_o3_c3'][ri].item()),
         float(tc['ba_c4_c3_o3'][ri].item()),
         psi_o3 - _HP,
@@ -1694,7 +1695,7 @@ def build_window_backbone_from_torsions_torch(
     nt_frames_world: torch.Tensor,
     torsion_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """World backbone [W, n_bb, 3] with the same atom order as ``utils.backbone_atoms``.
+    """World backbone [W, n_bb, 3] with the same atom order as ``bbregen.schema.BACKBONE_ATOMS``.
 
     For each k>=1, place P_k / OP1 / OP2 using ε,ζ from residue k−1 and α,β from k (masked).
     Bridge geometry uses k−1 world O3′,C3′,C4′ expressed in nucleotide k local frame.
@@ -1726,7 +1727,7 @@ def build_chain_backbone_from_predictions(
 
     Shapes: ``theta`` is ``[N, N_TORSIONS]`` or ``[1, N, N_TORSIONS]``; ``tau_m`` matches the
     leading structure (``[N]`` or ``[1, N]``). Returns ``[N, n_bb, 3]`` (atom order =
-    ``utils.backbone_atoms`` / ``_BACKBONE_ATOM_ORDER``). For B>1 batches use
+    ``bbregen.schema.BACKBONE_ATOMS`` / ``_BACKBONE_ATOM_ORDER``). For B>1 batches use
     ``build_batch_window_backbone_from_torsions_torch`` directly.
     """
     if theta.dim() == 2:

@@ -59,7 +59,7 @@ python scripts/analyze.py
 4. Export the best model to ONNX:
 
 ```bash
-python scripts/export.py --run-dir fixed_swa/baseline
+python scripts/export.py --run-dir torsions/1/baseline
 ```
 
 ## Usage

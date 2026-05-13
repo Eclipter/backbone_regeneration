@@ -1,5 +1,6 @@
 """Phosphate bridge closure loss: O3′_i – P_{i+1} – O5′_{i+1} (bonds, angles, wrapped torsions)."""
 
+import functools
 import math
 from typing import Optional
 
@@ -12,6 +13,8 @@ from .torsion_geometry import (
     TOR_EPS,
     TOR_ZETA,
     _BACKBONE_ATOM_ORDER,
+    _bond_angle_np,
+    _bond_angle_torch,
     _get_template,
     _get_template_tensors,
     dihedral_rad_torch,
@@ -63,16 +66,6 @@ def canonical_two_residue_bridge_positions_numpy(rest_prev: str, rest_next: str)
     return prev, nxt
 
 
-def _bond_angle_np(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-    """Interior angle ∠(a–b–c) in radians (numpy copy of ``_bond_angle_torch``)."""
-    ba = a - b
-    bc = c - b
-    denom = float(np.linalg.norm(ba)) * float(np.linalg.norm(bc)) + 1e-12
-    cos_t = float(np.dot(ba, bc)) / denom
-    cos_t = float(np.clip(cos_t, -1.0 + 1e-9, 1.0 - 1e-9))
-    return float(np.arccos(cos_t))
-
-
 def paired_bridge_corner_angles_numpy(rest_prev: str, rest_next: str) -> tuple[float, float, float]:
     """Three bridge-angle targets at residue boundary (prev → next), radians.
 
@@ -110,6 +103,18 @@ def _paired_bridge_corner_angles_lookup() -> np.ndarray:
     return tbl
 
 
+@functools.lru_cache(maxsize=None)
+def _paired_bridge_corner_angles_torch(
+    device_str: str,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    return torch.as_tensor(
+        _paired_bridge_corner_angles_lookup(),
+        device=torch.device(device_str),
+        dtype=dtype,
+    )
+
+
 def canonical_two_residue_bridge_bb_tensor(
         rest_prev: str = 'A',
         rest_next: str = 'A',
@@ -128,16 +133,6 @@ def canonical_two_residue_bridge_bb_tensor(
         if nm in nxt:
             bb[1, j] = torch.as_tensor(nxt[nm], dtype=dtype, device=dev)
     return bb
-
-
-def _bond_angle_torch(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor, eps: float) -> torch.Tensor:
-    """Interior angle ∠(a–b–c) in radians; batched last dim 3."""
-    ba = a - b
-    bc = c - b
-    denom = ba.norm(dim=-1) * bc.norm(dim=-1) + eps
-    cos_t = (ba * bc).sum(dim=-1) / denom
-    cos_t = cos_t.clamp(-1.0 + eps, 1.0 - eps)
-    return torch.acos(cos_t)
 
 
 def compute_bridge_closure_loss(
@@ -301,8 +296,7 @@ def compute_bridge_closure_loss(
     d2 = (o5_n - p_n).norm(dim=-1)
     bond_sq = ((d1 - d0_o3p) / (sigma_d + eps)) ** 2 + ((d2 - d0_po5) / (sigma_d + eps)) ** 2
 
-    ang_lut_np = _paired_bridge_corner_angles_lookup()
-    ang_lut = torch.as_tensor(ang_lut_np, device=dev, dtype=dtype)
+    ang_lut = _paired_bridge_corner_angles_torch(str(dev), dtype)
 
     ar_angle1 = ang_lut[ri_prev.long(), ri_next.long(), 0]
     ar_angle2 = ang_lut[ri_prev.long(), ri_next.long(), 1]

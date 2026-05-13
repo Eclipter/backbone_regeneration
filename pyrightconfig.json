@@ -2,5 +2,5 @@
   "include": ["src", "scripts"],
   "extraPaths": ["./pynamod", "./src"],
   "venvPath": "../.conda/envs",
-  "venv": "backbone_regen"
+  "venv": "base2backbone"
 }

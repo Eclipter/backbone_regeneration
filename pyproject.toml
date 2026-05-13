@@ -3,12 +3,12 @@ requires = ['setuptools<80', 'wheel']
 build-backend = 'setuptools.build_meta'
 
 [project]
-name = 'backbone-regeneration'
+name = 'base2backbone'
 version = '0.1.0'
 description = 'DNA backbone regeneration from base-only structures'
 readme = 'README.md'
 requires-python = '==3.13.12'
-urls = {Repository = 'https://github.com/Eclipter/backbone-regeneration'}
+urls = {Repository = 'https://github.com/Eclipter/base2backbone'}
 # PyNAMod remains a manual prerequisite; this project expects the local clone documented in README.
 dependencies = [
   'biopython>=1.86',
@@ -37,7 +37,7 @@ test = [
 ]
 
 [project.scripts]
-bbregen = 'bbregen.predict:main'
+base2backbone = 'base2backbone.inference:main'
 
 [tool.setuptools]
 package-dir = {'' = 'src'}

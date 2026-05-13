@@ -6,14 +6,12 @@ import warnings
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from functools import lru_cache
-from glob import glob
 from pathlib import Path
 from typing import Any, cast
 
 import matplotlib.path as mpath
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 import plotly.graph_objects as go
 import py3Dmol
 import requests
@@ -25,57 +23,52 @@ from sklearn.neighbors import NearestNeighbors
 from torch_geometric.data import Batch, Data
 from tqdm import tqdm
 
-from bbregen import utils
-from bbregen.dataset import DNADataModule, PyGDataset
-from bbregen.model import PytorchLightningModule
-from bbregen.predict import MODEL_DIR, predict_backbone, write_structure
-from bbregen.torsion_constants import N_LATENT
-from bbregen.torsion_geometry import build_backbone_from_torsions
-from pynamod.atomic_analysis.nucleotides_parser import nucleotide_graphs
+from base2backbone.data import BACKBONE_ATOMS, BASE_TO_INDEX, parse_dna
+from base2backbone.dataset import DNADataModule, PyGDataset
+from base2backbone.eval import (
+    backbone_local_in_target_frame,
+    backbone_segments_from_local_coords,
+    bond_segments_from_nt_graph,
+    coords_local_per_nt,
+    find_window_matching_sample,
+    local_backbone_rmsd,
+    ordered_backbone_segments,
+    phosphodiester_segments_local,
+    world_to_local_np,
+)
+from base2backbone.inference import predict_backbone, write_structure
+from base2backbone.io import default_atoms_provider
+from base2backbone.runtime import (
+    MODEL_DIR,
+    PROGRESS_BAR_COLOR,
+    collect_scalar_history,
+    load_analysis_run_artifacts,
+)
+from base2backbone.torsion_constants import N_LATENT
+from base2backbone.geometry.backbone import build_backbone_local
 
-# Angle channel order in tensors: α, β, γ, ε, ζ, χ, P (no backbone δ; τ_m is separate / log τ in latent).
-TOR_NAMES = ['α', 'β', 'γ', 'ε', 'ζ', 'χ', 'P']
+# Angle channel order in tensors: α, β, γ, ε, ζ, χ, pseudorotation phase
+# (no backbone δ; τ_m is separate / log τ in latent).
+TOR_NAMES = ['α', 'β', 'γ', 'ε', 'ζ', 'χ', 'phase']
 
 # %%
 # Load model and dataset
-log_dir = osp.join('..', 'logs')
-run_filename = osp.join('torsions', 'baseline')
-run_dir = osp.join(log_dir, run_filename)
-ckpt_path = utils.find_best_checkpoint(run_dir)
-test_dataset_path = osp.join(run_dir, 'test_dataset.pt')
-event_files = glob(osp.join(run_dir, 'events.*'))
-
-try:
-    test_dataset = torch.load(test_dataset_path, weights_only=False)
-except FileNotFoundError:
-    raise FileNotFoundError(f'`{test_dataset_path}` not found. Ensure training completed.')
-
-target_modes = ('all', 'central', 'edge')
-test_indices_per_mode = {
-    'all': list(range(len(test_dataset))),
-    'central': list(test_dataset.central_virtual),
-    'edge': list(test_dataset.edge_virtual),
-}
-test_datasets = {
-    mode: torch.utils.data.Subset(test_dataset, indices)
-    for mode, indices in test_indices_per_mode.items()
-}
+run_id = osp.join('torsions', 'baseline')
+run_artifacts = load_analysis_run_artifacts(run_id)
+run_dir = run_artifacts.run_dir
+ckpt_path = run_artifacts.ckpt_path
+event_files = run_artifacts.event_files
+test_dataset = run_artifacts.test_dataset
+target_modes = run_artifacts.target_modes
 mode_colors = {
     'all': 'indigo',
-    'central': utils.PBAR_COLOR,
+    'central': PROGRESS_BAR_COLOR,
     'edge': 'violet',
 }
 mode_linestyles = {'all': '-', 'central': '--', 'edge': '--'}
-
-try:
-    model = PytorchLightningModule.load_from_checkpoint(
-        ckpt_path, weights_only=False, map_location='cpu'
-    ).eval()
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model.to(device)
-    print(f'device: {device}')
-except FileNotFoundError:
-    raise FileNotFoundError(f'Checkpoint `{ckpt_path}` not found.')
+model = run_artifacts.model
+device = run_artifacts.device
+print(f'device: {device}')
 
 # %%
 # Load dataset
@@ -95,13 +88,7 @@ axis_tip_scale = 0.25
 
 def _to_target_local(points_world):
     # Express world-space points in the target nucleotide frame.
-    points_world = np.asarray(points_world, dtype=np.float64)
-    return (points_world - o_t_raw) @ R_t_raw
-
-
-def _to_local_frame(points_world, target_origin, target_frame):
-    points_world = np.asarray(points_world, dtype=np.float64)
-    return (points_world - target_origin) @ target_frame
+    return world_to_local_np(points_world, o_t_raw, R_t_raw)
 
 
 def _format_nt_label(nucleotide_idx, target_idx):
@@ -121,11 +108,11 @@ def _add_local_axes(
     opacity,
     label_prefix,
 ):
-    origin_local = _to_local_frame(origin_world, target_origin, target_frame).reshape(3)
+    origin_local = world_to_local_np(origin_world, target_origin, target_frame).reshape(3)
     axis_specs = [('X', 'red', 0), ('Y', 'green', 1), ('Z', 'blue', 2)]
     for axis_name, color, axis_idx in axis_specs:
         end_world = origin_world + axis_length * frame_world[:, axis_idx]
-        end_local = _to_local_frame(end_world, target_origin, target_frame).reshape(3)
+        end_local = world_to_local_np(end_world, target_origin, target_frame).reshape(3)
         direction_local = end_local - origin_local
         fig.add_trace(go.Scatter3d(
             x=[origin_local[0], end_local[0]],
@@ -155,44 +142,6 @@ def _add_local_axes(
             hoverinfo='skip',
         ))
 
-
-def _load_dataset_backbone_segments(bb_local, valid_mask):
-    rename_bb = {'O1P': 'OP1', 'O2P': 'OP2', 'O1A': 'OP1', 'O2A': 'OP2'}
-    bb_set = set(utils.backbone_atoms)
-    graph = nucleotide_graphs['A']
-    bonds = []
-    seen = set()
-    for src_idx, dst_idx in graph.edges():
-        src_name = rename_bb.get(
-            graph.nodes[src_idx]['atom'].name,
-            graph.nodes[src_idx]['atom'].name.rstrip('AB'),
-        )
-        dst_name = rename_bb.get(
-            graph.nodes[dst_idx]['atom'].name,
-            graph.nodes[dst_idx]['atom'].name.rstrip('AB'),
-        )
-        if src_name in bb_set and dst_name in bb_set and src_name != dst_name:
-            key = tuple(sorted([src_name, dst_name]))
-            if key not in seen:
-                seen.add(key)
-                bonds.append((src_name, dst_name))
-
-    atom_names = [
-        utils.backbone_atoms[j]
-        for j in range(len(utils.backbone_atoms))
-        if valid_mask[j]
-    ]
-    coords_by_name = {
-        atom_name: xyz
-        for atom_name, xyz in zip(atom_names, bb_local)
-    }
-    return [
-        (coords_by_name[name_a], coords_by_name[name_b])
-        for name_a, name_b in bonds
-        if name_a in coords_by_name and name_b in coords_by_name
-    ]
-
-
 bb_local_per_nt = []
 for i in range(ws):
     bb_world = raw_data.bb_xyz_world[i].numpy()
@@ -204,7 +153,7 @@ fig = go.Figure()
 
 source_lines_x, source_lines_y, source_lines_z = [], [], []
 for _i, pts, valid in bb_local_per_nt:
-    for p1, p2 in _load_dataset_backbone_segments(pts, valid):
+    for p1, p2 in backbone_segments_from_local_coords(pts, valid):
         source_lines_x.extend([p1[0], p2[0], None])
         source_lines_y.extend([p1[1], p2[1], None])
         source_lines_z.extend([p1[2], p2[2], None])
@@ -611,23 +560,7 @@ for i, sch in enumerate(_ck.get('lr_schedulers') or []):
 
 # %%
 # Training
-from tensorboard.backend.event_processing import \
-    event_accumulator  # noqa: E402
-
 plt.rcParams['font.family'] = 'Nunito'
-
-
-def load_event_accumulator(path):
-    ea = event_accumulator.EventAccumulator(
-        path, size_guidance={'scalars': 0, 'histograms': 0, 'images': 0}
-    )
-    ea.Reload()
-    return ea
-
-
-def scalars_to_dataframe(ea, tag):
-    rows = [(s.step, s.value) for s in ea.Scalars(tag)]
-    return pd.DataFrame(rows, columns=['epoch', 'value'])
 
 
 metric_tags = {
@@ -639,24 +572,9 @@ metric_tags = {
     'test_rmsd_central':                   ('central', 'test_rmsd'),
     'test_rmsd_edge':                      ('edge',    'test_rmsd'),
 }
-tracked_tags = set(metric_tags)
-
-dfs = []
-for ef in event_files:
-    ea = load_event_accumulator(ef)
-    for tag in ea.Tags()['scalars']:  # type: ignore
-        if tag not in tracked_tags:
-            continue
-        df = scalars_to_dataframe(ea, tag)
-        mode, metric = metric_tags[tag]
-        df['mode'] = mode
-        df['metric'] = metric
-        dfs.append(df)
-
-if not dfs:
+scalars = collect_scalar_history(event_files, metric_tags)
+if scalars.empty:
     raise ValueError(f'No tracked TensorBoard scalars in `{run_dir}`.')
-
-scalars = pd.concat(dfs, ignore_index=True)[['epoch', 'mode', 'metric', 'value']].reset_index(drop=True)
 wide_per_mode = {
     mode: scalars.loc[scalars['mode'] == mode].pivot_table(
         index='epoch', columns='metric', values='value', aggfunc='last'
@@ -773,128 +691,6 @@ if np.isnan(tidx_origin).any() or np.isnan(tidx_frame).any():
     tidx_origin = np.zeros(3, dtype=np.float64)
     tidx_frame = np.eye(3, dtype=np.float64)
 
-
-def _backbone_local_in_target_frame(sample_data, nucleotide_idx, origin_world, frame_world):
-    bb_world = sample_data.bb_xyz_world[nucleotide_idx].numpy()
-    valid = ~np.any(np.isnan(bb_world), axis=1)
-    if not valid.any():
-        return [], np.empty((0, 3), dtype=np.float64)
-    local = (bb_world[valid] - origin_world) @ frame_world
-    # Drop rows where the frame transformation itself produced NaN
-    row_valid = ~np.any(np.isnan(local), axis=1)
-    names = [
-        utils.backbone_atoms[j]
-        for k, j in enumerate(range(len(utils.backbone_atoms)))
-        if valid[j] and row_valid[k]
-    ]
-    return names, local[row_valid]
-
-
-_RENAMES_BB = {'O1P': 'OP1', 'O2P': 'OP2', 'O1A': 'OP1', 'O2A': 'OP2'}
-_bb_set = set(utils.backbone_atoms)
-
-
-def _get_backbone_bonds():
-    G = nucleotide_graphs['A']
-    bonds = []
-    seen = set()
-    for i, j in G.edges():
-        na = _RENAMES_BB.get(G.nodes[i]['atom'].name, G.nodes[i]['atom'].name.rstrip('AB'))
-        nb = _RENAMES_BB.get(G.nodes[j]['atom'].name, G.nodes[j]['atom'].name.rstrip('AB'))
-        if na in _bb_set and nb in _bb_set and na != nb:
-            key = tuple(sorted((str(na), str(nb))))
-            if key not in seen:
-                seen.add(key)
-                bonds.append((na, nb))
-    return bonds
-
-
-_BACKBONE_BONDS = _get_backbone_bonds()
-
-
-def _find_window_matching_sample(pyg_ds: PyGDataset, pdb_id: str, data: Data):
-    """Reload structure and locate the sliding window whose backbone tensor matches `data`."""
-    raw_path = osp.join(pyg_ds.raw_dir, f'{pdb_id}.cif')
-    if not osp.exists(raw_path):
-        return None
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', PDBConstructionWarning)
-        _, chain_records = utils.parse_dna(
-            raw_path,
-            use_full_nucleotide=True,
-            window_size=pyg_ds.window_size,
-        )
-    ref_bb = data.bb_xyz_world.detach().cpu()
-    for _chain_key, _chain, windows in chain_records:
-        for _window, _widx, wdata in windows:
-            cand = wdata.bb_xyz_world.detach().cpu()
-            if not torch.equal(torch.isnan(cand), torch.isnan(ref_bb)):
-                continue
-            if torch.allclose(
-                torch.nan_to_num(cand),
-                torch.nan_to_num(ref_bb),
-                rtol=5e-4,
-                atol=5e-4,
-            ):
-                return _window
-    return None
-
-
-def _world_to_target_local(xyz_world, origin_world, frame_world):
-    return (
-        (np.asarray(xyz_world, dtype=np.float64) - origin_world) @ frame_world
-    ).reshape(3)
-
-
-def _coords_local_per_nt(window, origin_world, frame_world):
-    """Per-residue atom name → coordinates in the target nucleotide frame."""
-    return [
-        {
-            name: _world_to_target_local(pos, origin_world, frame_world)
-            for name, pos in utils.default_atoms_provider(nucleotide)
-        }
-        for nucleotide in window
-    ]
-
-
-def _bond_segments_from_nt_graph(coords_by_name: dict, restype_letter: str):
-    """Intra-nucleotide bonds using the pynamod template graph (incl. base atoms)."""
-    if restype_letter not in nucleotide_graphs:
-        return []
-    graph = nucleotide_graphs[restype_letter]
-    segments = []
-    seen = set()
-    for i, j in graph.edges():
-        na = utils.rename_atom(graph.nodes[i]['atom'].name)
-        nb = utils.rename_atom(graph.nodes[j]['atom'].name)
-        if na in coords_by_name and nb in coords_by_name and na != nb:
-            key = tuple(sorted((str(na), str(nb))))
-            if key in seen:
-                continue
-            seen.add(key)
-            segments.append((coords_by_name[na], coords_by_name[nb]))
-    return segments
-
-
-def _phosphodiester_segments_local(data: Data, origin_world, frame_world):
-    """Inter-residue O3'(i) — P(i+1) in target frame when backbone atoms exist."""
-    ws_loc = data.bb_xyz_world.shape[0]
-    bb = utils.backbone_atoms
-    jo3 = bb.index("O3'")
-    jp = bb.index('P')
-    segments = []
-    for i in range(ws_loc - 1):
-        o3 = data.bb_xyz_world[i, jo3].numpy()
-        p_next = data.bb_xyz_world[i + 1, jp].numpy()
-        if np.isnan(o3).any() or np.isnan(p_next).any():
-            continue
-        segments.append((
-            _world_to_target_local(o3, origin_world, frame_world),
-            _world_to_target_local(p_next, origin_world, frame_world),
-        ))
-    return segments
-
-
 def _collect_frame_geometry(origins_world, frames_world, target_origin, target_frame, target_idx):
     labels = []
     axis_entries = []
@@ -902,7 +698,7 @@ def _collect_frame_geometry(origins_world, frames_world, target_origin, target_f
     for i, (origin_world, frame_world) in enumerate(zip(origins_world, frames_world)):
         if np.isnan(origin_world).any():
             continue
-        origin_local = _to_local_frame(origin_world, target_origin, target_frame).reshape(3)
+        origin_local = world_to_local_np(origin_world, target_origin, target_frame).reshape(3)
         if np.isnan(origin_local).any():
             continue
         local_points.append(origin_local)
@@ -912,18 +708,10 @@ def _collect_frame_geometry(origins_world, frames_world, target_origin, target_f
     return np.asarray(local_points, dtype=np.float64), labels, axis_entries
 
 
-def _ordered_segments(coords_by_name):
-    segments = []
-    for name_a, name_b in _BACKBONE_BONDS:
-        if name_a in coords_by_name and name_b in coords_by_name:
-            segments.append((coords_by_name[name_a], coords_by_name[name_b]))
-    return segments
-
-
 pos_full = []
 target_mask = []
 for i in range(data.bb_xyz_world.shape[0]):
-    names_i, local_i = _backbone_local_in_target_frame(data, i, tidx_origin, tidx_frame)
+    names_i, local_i = backbone_local_in_target_frame(data, i, tidx_origin, tidx_frame)
     pos_full.extend(local_i.tolist())
     target_mask.extend([i == tidx] * len(names_i))
 pos_full = np.asarray(pos_full, dtype=np.float64)
@@ -935,13 +723,13 @@ with torch.no_grad():
     batch = cast(Any, Batch.from_data_list([data])).to(device)
     pred_theta, pred_tau_m = model.sample(batch)
 
-restype = {v: k for k, v in utils.base_to_idx.items()}[
+restype = {v: k for k, v in BASE_TO_INDEX.items()}[
     int(data.base_types[tidx].argmax().item())
 ]
 _o3_prev_vis = None
 if bool(data.o3_prev_valid[tidx].item()):
     _o3_prev_vis = data.o3_prev_local[tidx].numpy()
-pred_local_dict = build_backbone_from_torsions(
+pred_local_dict = build_backbone_local(
     pred_theta[0].cpu().numpy(),
     restype,
     o3_prev_local=_o3_prev_vis,
@@ -951,29 +739,29 @@ pred_local_dict = build_backbone_from_torsions(
 true_local_dict = {
     name: xyz
     for name, xyz in zip(
-        [utils.backbone_atoms[j] for j in range(len(utils.backbone_atoms)) if not np.isnan(data.bb_xyz_world[tidx].numpy()[j]).any()],
+        [BACKBONE_ATOMS[j] for j in range(len(BACKBONE_ATOMS)) if not np.isnan(data.bb_xyz_world[tidx].numpy()[j]).any()],
         true_backbone,
     )
 }
 pred_backbone = np.array(
-    [pred_local_dict[name] for name in utils.backbone_atoms if name in pred_local_dict],
+    [pred_local_dict[name] for name in BACKBONE_ATOMS if name in pred_local_dict],
     dtype=np.float64,
 )
 
-_matched_window = _find_window_matching_sample(test_dataset.base, sample_pdb_id, data)
+_matched_window = find_window_matching_sample(test_dataset.base, sample_pdb_id, data)
 _full_source_segments: list[tuple[np.ndarray, np.ndarray]] = []
 _target_base_pts: list[np.ndarray] = []
 _side_base_pts: list[np.ndarray] = []
 if _matched_window is not None:
-    _per_nt_coords = _coords_local_per_nt(_matched_window, tidx_origin, tidx_frame)
+    _per_nt_coords = coords_local_per_nt(_matched_window, tidx_origin, tidx_frame)
     for nucleotide, cmap in zip(_matched_window, _per_nt_coords):
         _full_source_segments.extend(
-            _bond_segments_from_nt_graph(cmap, nucleotide.restype)
+            bond_segments_from_nt_graph(cmap, nucleotide.restype)
         )
     _full_source_segments.extend(
-        _phosphodiester_segments_local(data, tidx_origin, tidx_frame)
+        phosphodiester_segments_local(data, tidx_origin, tidx_frame)
     )
-    _bb_atom_names = set(utils.backbone_atoms)
+    _bb_atom_names = set(BACKBONE_ATOMS)
     for i, cmap in enumerate(_per_nt_coords):
         for aname, xyz in cmap.items():
             if aname in _bb_atom_names:
@@ -1015,7 +803,7 @@ if _full_source_segments:
         hoverinfo='skip',
     ))
 elif _matched_window is None:
-    _fb_only = _ordered_segments(true_local_dict)
+    _fb_only = ordered_backbone_segments(true_local_dict)
     if _fb_only:
         _osx, _osy, _osz = [], [], []
         for _p1, _p2 in _fb_only:
@@ -1114,7 +902,7 @@ if _side_base_pts:
     ))
 
 for segments, color, width, name in [
-    (_ordered_segments(pred_local_dict), 'rgba(8, 65, 140, 0.95)', 6, 'Связи сгенерированного остова'),
+    (ordered_backbone_segments(pred_local_dict), 'rgba(8, 65, 140, 0.95)', 6, 'Связи сгенерированного остова'),
 ]:
     if not segments:
         continue
@@ -1133,7 +921,7 @@ for segments, color, width, name in [
         hoverinfo='skip',
     ))
 
-shared_names = [name for name in utils.backbone_atoms if name in true_local_dict and name in pred_local_dict]
+shared_names = [name for name in BACKBONE_ATOMS if name in true_local_dict and name in pred_local_dict]
 if shared_names:
     corr_x, corr_y, corr_z = [], [], []
     for name in shared_names:
@@ -1227,7 +1015,7 @@ fig.add_trace(go.Scatter3d(
 ))
 
 fig.update_layout(
-    title=f'Эксперимент {run_filename}: PDB {sample_pdb_id}, окно {sample_window}',
+    title=f'Эксперимент {run_dir}: PDB {sample_pdb_id}, окно {sample_window}',
     scene=dict(
         xaxis=dict(visible=False),
         yaxis=dict(visible=False),
@@ -1257,7 +1045,7 @@ predictions, inference_chain_records = predict_backbone(
 
 with warnings.catch_warnings():
     warnings.simplefilter('ignore', PDBConstructionWarning)
-    _, full_chain_records = utils.parse_dna(
+    _, full_chain_records = parse_dna(
         raw_inference_path,
         use_full_nucleotide=True,
         window_size=test_dataset.base.window_size,
@@ -1266,8 +1054,8 @@ with warnings.catch_warnings():
 original_predictions = {}
 for _, chain, _ in full_chain_records:
     for nucleotide in chain:
-        exp_positions = dict(utils.default_atoms_provider(nucleotide))
-        for atom_name in utils.backbone_atoms:
+        exp_positions = dict(default_atoms_provider(nucleotide))
+        for atom_name in BACKBONE_ATOMS:
             xyz = exp_positions.get(atom_name)
             if xyz is not None:
                 original_predictions[(nucleotide.segid, int(nucleotide.resid), atom_name)] = xyz
@@ -1341,7 +1129,7 @@ def _parsed_chain_records(pdb_id):
         ).content)
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', PDBConstructionWarning)
-        _, chain_records = utils.parse_dna(
+        _, chain_records = parse_dna(
             path, use_full_nucleotide=True, window_size=test_dataset.base.window_size,
         )
     return chain_records
@@ -1367,8 +1155,8 @@ def _central_backbone_local(data):
     valid = ~np.any(np.isnan(bb_world), axis=1)
     local = (bb_world - o_t) @ R_t             # transform to local frame
     return {
-        utils.backbone_atoms[j]: local[j]
-        for j in range(len(utils.backbone_atoms))
+        BACKBONE_ATOMS[j]: local[j]
+        for j in range(len(BACKBONE_ATOMS))
         if valid[j]
     }
 
@@ -1380,7 +1168,7 @@ def _experimental_rmsd_windows(pdb_id1, pdb_id2):
     for key in set(idx1) & set(idx2):
         atoms1 = _central_backbone_local(idx1[key])
         atoms2 = _central_backbone_local(idx2[key])
-        shared = [n for n in utils.backbone_atoms if n in atoms1 and n in atoms2]
+        shared = [n for n in BACKBONE_ATOMS if n in atoms1 and n in atoms2]
         if not shared:
             continue
         pos1 = np.array([atoms1[n] for n in shared])
@@ -1453,8 +1241,8 @@ K = 10
 N_SAMPLES = 60
 
 _skip_atoms = {'OP1', 'OP2', 'P'}
-_valid_bb_atoms = [a for a in utils.backbone_atoms if a not in _skip_atoms]
-_idx_to_base = {v: k for k, v in utils.base_to_idx.items()}
+_valid_bb_atoms = [a for a in BACKBONE_ATOMS if a not in _skip_atoms]
+_idx_to_base = {v: k for k, v in BASE_TO_INDEX.items()}
 
 _pool_size = len(test_dataset)
 _inter_run_indices = rng.choice(
@@ -1468,7 +1256,7 @@ with torch.no_grad():
     for _wi in tqdm(
             _inter_run_indices,
             desc='Inter-run RMSD',
-            colour=utils.PBAR_COLOR,
+            colour=PROGRESS_BAR_COLOR,
     ):
         data = cast(Any, test_dataset[_wi].clone())
         tidx = int(data.target_nt_idx.item())
@@ -1484,7 +1272,7 @@ with torch.no_grad():
             pred_theta, pred_tau_m = model.sample(batch)
             torsions_np = pred_theta[0].cpu().numpy()
             tau_m_val = float(pred_tau_m[0].clamp(min=1e-3).item())
-            bb = build_backbone_from_torsions(
+            bb = build_backbone_local(
                 torsions_np, restype, o3_prev_local=_o3_ir, tau_m=tau_m_val,
             )
             run_coords.append({k: v for k, v in bb.items() if k not in _skip_atoms})
@@ -1544,10 +1332,7 @@ _dm = DNADataModule(batch_size=1)
 _dm.setup()
 train_dataset = _dm.train_dataset
 
-_n_bb = len(utils.backbone_atoms)
-_j_op1 = utils.backbone_atoms.index('OP1')
-_j_op2 = utils.backbone_atoms.index('OP2')
-
+_n_bb = len(BACKBONE_ATOMS)
 # --- Build train feature matrix and local backbone targets ---
 _train_feats: list[np.ndarray] = []
 _train_locals: list[np.ndarray] = []  # each [n_bb, 3], NaN where atom absent
@@ -1555,7 +1340,7 @@ _train_locals: list[np.ndarray] = []  # each [n_bb, 3], NaN where atom absent
 for _i in tqdm(
         range(len(train_dataset)),
         desc='kNN: building train index',
-        colour=utils.PBAR_COLOR,
+        colour=PROGRESS_BAR_COLOR,
 ):
     _d = train_dataset[_i]
     _ti = int(_d.target_nt_idx.item())
@@ -1571,27 +1356,6 @@ _nn_index = NearestNeighbors(n_neighbors=1, algorithm='ball_tree')
 _nn_index.fit(_train_feats_arr)
 
 
-def _knn_local_rmsd(pred_local: np.ndarray, gt_local: np.ndarray) -> float:
-    """RMSD in local frame; skips NaN atoms; permutation-invariant for OP1/OP2."""
-    sq: list[float] = []
-    for _j, _nm in enumerate(utils.backbone_atoms):
-        if _nm in ('OP1', 'OP2'):
-            continue
-        _p, _g = pred_local[_j], gt_local[_j]
-        if np.isnan(_p).any() or np.isnan(_g).any():
-            continue
-        sq.append(float(np.sum((_p - _g) ** 2)))
-    # permutation-invariant matching for the two equivalent phosphate oxygens
-    _p1, _p2 = pred_local[_j_op1], pred_local[_j_op2]
-    _g1, _g2 = gt_local[_j_op1], gt_local[_j_op2]
-    if not (np.isnan(_p1).any() or np.isnan(_p2).any()
-            or np.isnan(_g1).any() or np.isnan(_g2).any()):
-        _d_str = np.sum((_p1 - _g1) ** 2) + np.sum((_p2 - _g2) ** 2)
-        _d_swp = np.sum((_p1 - _g2) ** 2) + np.sum((_p2 - _g1) ** 2)
-        sq.append(float(min(_d_str, _d_swp)) / 2)
-    return float(np.sqrt(np.mean(sq))) if sq else np.nan
-
-
 # --- Evaluate on test dataset ---
 _knn_rmsds: list[float] = []
 _knn_is_edge: list[bool] = []
@@ -1599,7 +1363,7 @@ _knn_is_edge: list[bool] = []
 for _i in tqdm(
         range(len(test_dataset)),
         desc='kNN: evaluating test',
-        colour=utils.PBAR_COLOR,
+        colour=PROGRESS_BAR_COLOR,
 ):
     _d = test_dataset[_i]
     _ti = int(_d.target_nt_idx.item())
@@ -1612,7 +1376,7 @@ for _i in tqdm(
     _R = _d.nt_frames_world[_ti].numpy()
     _gt_local = (_bb_w - _o) @ _R
 
-    _knn_rmsds.append(_knn_local_rmsd(_train_locals[_nn_i], _gt_local))
+    _knn_rmsds.append(local_backbone_rmsd(_train_locals[_nn_i], _gt_local))
     _knn_is_edge.append(bool(_d.is_chain_edge_nt[_ti].item()))
 
 _knn_rmsds_arr = np.array(_knn_rmsds, dtype=np.float64)

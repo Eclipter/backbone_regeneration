@@ -1,4 +1,4 @@
-"""Export the diffusion denoiser from a Lightning checkpoint to ONNX."""
+"""Export the score network from a Lightning checkpoint to ONNX."""
 
 from argparse import ArgumentParser
 import json
@@ -7,11 +7,11 @@ import os.path as osp
 
 import torch
 
-from bbregen.data import BASE_TO_INDEX
-from bbregen.model import N_TORSIONS_LATENT, PytorchLightningModule
-from bbregen.runtime import MODEL_DIR, find_best_checkpoint, resolve_run_dir
+from base2backbone.data import BASE_TO_INDEX
+from base2backbone.model import N_TORSIONS_LATENT, BackboneLightningModule
+from base2backbone.runtime import MODEL_DIR, find_best_checkpoint, resolve_run_dir
 
-# Keys describing denoiser I/O and sigma endpoints at inference time.
+# Keys describing score-network I/O and sigma endpoints at inference time.
 HPARAM_KEYS = (
     'hidden_dim',
     'num_heads',
@@ -32,16 +32,16 @@ EXPORT_OPSET = 17
 
 
 def export_to_onnx(ckpt_path: str, opset: int = EXPORT_OPSET):
-    """Export the denoiser to ``MODEL_DIR`` (``model.onnx`` + ``model.json``)."""
+    """Export the score network to ``MODEL_DIR`` (``model.onnx`` + ``model.json``)."""
     os.makedirs(MODEL_DIR, exist_ok=True)
 
     pl_module = (
-        PytorchLightningModule
+        BackboneLightningModule
         .load_from_checkpoint(ckpt_path, map_location='cpu')
         .float()
         .eval()
     )
-    net = pl_module.denoiser
+    net = pl_module.score_network
     d_in = pl_module.node_dim
     x = torch.randn(1, ONNX_EXPORT_SEQ_LEN, d_in)
 
@@ -84,8 +84,8 @@ def export_to_onnx(ckpt_path: str, opset: int = EXPORT_OPSET):
     return onnx_path, json_path
 
 
-def main(run: str, opset: int = EXPORT_OPSET):
-    run_dir = resolve_run_dir(run)
+def main(run_id: str, opset: int = EXPORT_OPSET):
+    run_dir = resolve_run_dir(run_id)
     ckpt_path = find_best_checkpoint(run_dir)
     print(f'Best checkpoint:         {ckpt_path}')
     onnx_path, json_path = export_to_onnx(ckpt_path, opset)
@@ -96,7 +96,7 @@ def main(run: str, opset: int = EXPORT_OPSET):
 def _parse_args():
     parser = ArgumentParser(description='Export the best checkpoint of a training run to ONNX.')
     parser.add_argument(
-        '--run-dir',
+        '--run-id',
         required=True,
         help='Experiment id relative to logs/ (e.g. "fixed_swa/baseline").',
     )
@@ -105,4 +105,4 @@ def _parse_args():
 
 if __name__ == '__main__':
     args = _parse_args()
-    main(args.run_dir)
+    main(args.run_id)

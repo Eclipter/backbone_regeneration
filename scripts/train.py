@@ -15,8 +15,8 @@ from lightning.pytorch.callbacks import (LearningRateMonitor, ModelCheckpoint,
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning_utilities.core.rank_zero import rank_zero_info
 
-from bbregen.dataset import DNADataModule
-from bbregen.model import PytorchLightningModule
+from base2backbone.dataset import DNADataModule
+from base2backbone.model import BackboneLightningModule
 
 _SCRIPT_DIR = Path(__file__).resolve().parent
 if str(_SCRIPT_DIR) not in sys.path:
@@ -60,7 +60,7 @@ def train_one(cfg):
         edge_weight=cfg['EDGE_WEIGHT'],
         seed=cfg['SEED'],
     )
-    pl_module = PytorchLightningModule(
+    pl_module = BackboneLightningModule(
         hidden_dim=cfg['HIDDEN_DIM'],
         num_heads=cfg['NUM_HEADS'],
         num_layers=cfg['NUM_LAYERS'],
@@ -88,19 +88,19 @@ def train_one(cfg):
 
     log_dir, run_name, run_version, ckpt_path = _get_run_paths(cfg)
 
-    # Compile only when not resuming: torch.compile changes param keys (denoiser._orig_mod.*) and
+    # Compile only when not resuming: torch.compile changes param keys (score_network._orig_mod.*) and
     # breaks Lightning's checkpoint load_order (eager ckpt vs compiled module).
     if cfg['TORCH_COMPILE']:
         if torch.cuda.is_available():
             if ckpt_path is None:
                 rank_zero_info(
-                    'torch.compile: wrapping denoiser (first *_step will JIT-compile; exclude from timings)'
+                    'torch.compile: wrapping score network (first *_step will JIT-compile; exclude from timings)'
                 )
-                # OptimizedModule is not TorsionDenoiser; runtime API matches nn.Module.forward.
-                pl_module.denoiser = torch.compile(pl_module.denoiser)  # type: ignore[assignment]
+                # OptimizedModule is not TorsionScoreNetwork; runtime API matches nn.Module.forward.
+                pl_module.score_network = torch.compile(pl_module.score_network)  # type: ignore[assignment]
             else:
                 rank_zero_info(
-                    'TORCH_COMPILE set but resuming from checkpoint: training denoiser eager '
+                    'TORCH_COMPILE set but resuming from checkpoint: training score network eager '
                     '(compile-before-load mismatches state_dict; compile-after-load needs pre-DDP hook).'
                 )
         else:

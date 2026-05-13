@@ -1,12 +1,12 @@
-# Backbone Regeneration
+# Base2Backbone
 
 ## Setup
 
 1. Clone the repository:
 
 ```bash
-git clone https://github.com/Eclipter/backbone-regeneration.git
-cd backbone-regeneration
+git clone https://github.com/Eclipter/base2backbone.git
+cd base2backbone
 ```
 
 2. Install Conda. See [Conda Installation](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
@@ -22,7 +22,7 @@ cd pynamod
 
 ```bash
 /opt/miniconda/bin/conda env create \
-  --name backbone_regen \
+  --name base2backbone \
   --file pynamod/environment.yml
 ```
 
@@ -30,10 +30,10 @@ cd pynamod
 
 ```bash
 /opt/miniconda/bin/conda env update \
-  --name backbone_regen \
+  --name base2backbone \
   --file environment.yml
 /opt/miniconda/bin/conda run \
-  -n backbone_regen \
+  -n base2backbone \
   pip install \
     -e ./pynamod \
     -e .[test] \
@@ -59,7 +59,7 @@ python scripts/analyze.py
 4. Export the best model to ONNX:
 
 ```bash
-python scripts/export.py --run-dir torsions/1/baseline
+python scripts/export.py --run-id torsions/1/baseline
 ```
 
 ## Usage
@@ -69,7 +69,7 @@ python scripts/export.py --run-dir torsions/1/baseline
 2. Predict the backbone. Input and output may be PDB or mmCIF independently (e.g. PDB in, mmCIF out). By default **5'-terminal phosphate atoms** (`P`, `OP1`, `OP2`) are **not** predicted. Pass `--generate-5-prime-phosphate` to include them.
 
 ```bash
-bbregen \
+base2backbone \
     --input input.pdb \
     --output output.pdb
 ```

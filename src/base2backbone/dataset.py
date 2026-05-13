@@ -21,10 +21,10 @@ from tqdm import tqdm
 
 if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-    __package__ = 'bbregen'
+    __package__ = 'base2backbone'
 
 from .data import get_pdb_ids, parse_dna
-from .utils import PBAR_COLOR
+from .runtime import PROGRESS_BAR_COLOR
 
 EDGE_CACHE_NAME = 'edge_windows.txt'
 
@@ -87,7 +87,7 @@ class PyGDataset(Dataset):
                     executor.map(self.download_file, pdb_ids_to_download),
                     total=len(pdb_ids_to_download),
                     desc='\033[1;38;5;93mDownloading mmCIF files\033[0m',
-                    colour=PBAR_COLOR
+                    colour=PROGRESS_BAR_COLOR
                 ))
         else:
             print('\033[1;31mUsing single-threaded downloading for debugging purposes...\033[0m')
@@ -95,7 +95,7 @@ class PyGDataset(Dataset):
                 map(self.download_file, pdb_ids_to_download),
                 total=len(pdb_ids_to_download),
                 desc='\033[1;38;5;93mDownloading mmCIF files\033[0m',
-                colour=PBAR_COLOR
+                colour=PROGRESS_BAR_COLOR
             ))
 
         tag_path = osp.join(self.processed_dir, self.processed_file_names)
@@ -168,7 +168,7 @@ class PyGDataset(Dataset):
                 for per_file_edges in tqdm(
                     executor.map(self.process_file, self.pdb_ids),
                     total=len(self.pdb_ids),
-                    colour=PBAR_COLOR
+                    colour=PROGRESS_BAR_COLOR
                 ):
                     edge_paths.extend(per_file_edges)
         else:
@@ -176,7 +176,7 @@ class PyGDataset(Dataset):
             for per_file_edges in tqdm(
                 map(self.process_file, self.pdb_ids),
                 total=len(self.pdb_ids),
-                colour=PBAR_COLOR
+                colour=PROGRESS_BAR_COLOR
             ):
                 edge_paths.extend(per_file_edges)
 

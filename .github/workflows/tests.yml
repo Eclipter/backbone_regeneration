@@ -21,7 +21,7 @@ jobs:
     timeout-minutes: 5
 
     steps:
-      - name: Checkout backbone-regeneration
+      - name: Checkout base2backbone
         uses: actions/checkout@v5
 
       - name: Checkout PyNAMod
@@ -34,7 +34,7 @@ jobs:
         uses: mamba-org/setup-micromamba@v3
         with:
           environment-file: pynamod/environment.yml
-          environment-name: backbone_regen
+          environment-name: base2backbone
           cache-environment: false
           cache-downloads: true
           cache-downloads-key: conda-${{ hashFiles('environment.yml', 'pynamod/environment.yml', '.github/workflows/tests.yml') }}
@@ -44,7 +44,7 @@ jobs:
         shell: bash -el {0}
         run: |
           micromamba env update \
-              -n backbone_regen \
+              -n base2backbone \
               -f environment.yml
 
       - name: Cache pip downloads
@@ -64,12 +64,12 @@ jobs:
       - name: Install editable packages
         shell: bash -el {0}
         run: |
-          micromamba run -n backbone_regen \
+          micromamba run -n base2backbone \
               pip install -U pip
-          micromamba run -n backbone_regen \
+          micromamba run -n base2backbone \
               pip install -e '.[test]' -e ./pynamod
 
       - name: Run pytest
         shell: bash -el {0}
         run: |
-          micromamba run -n backbone_regen pytest tests
+          micromamba run -n base2backbone pytest tests

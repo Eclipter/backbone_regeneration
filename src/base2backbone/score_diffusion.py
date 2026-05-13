@@ -145,7 +145,7 @@ def perturb_torsions(
     }
 
 
-def estimate_theta_tau_from_score_ve(
+def estimate_latent_from_ve_score(
     theta_t: torch.Tensor,
     log_tau_t: torch.Tensor,
     score_pred: torch.Tensor,

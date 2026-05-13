@@ -3,7 +3,7 @@ from pathlib import Path
 
 from config import SEED
 
-from bbregen.dataset import prepare_dataset
+from base2backbone.dataset import prepare_dataset
 
 # Allow `from config import ...` when running as a script (same pattern as train.py)
 _SCRIPT_DIR = Path(__file__).resolve().parent

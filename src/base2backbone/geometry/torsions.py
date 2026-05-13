@@ -13,10 +13,10 @@ from ..torsion_constants import (
     TOR_CHI,
     TOR_EPS,
     TOR_GAMMA,
-    TOR_PUCKER_P,
+    TOR_PSEUDOROTATION_PHASE,
     TOR_ZETA,
 )
-from .primitives import dihedral_rad, dihedral_rad_torch
+from .primitives import _dihedral_rad, dihedral_rad
 
 RING_TORSION_DEFS = (
     ("C1'", "C2'", "C3'", "C4'"),
@@ -31,12 +31,7 @@ _PSEUDOROTATION_OFFSETS = (
 )
 
 
-def pseudorotation_nus_numpy(P_rad: float, tau_m: float) -> np.ndarray:
-    """Return ν₂…ν₁ cycle from pseudorotation phase and amplitude."""
-    return float(tau_m) * np.cos(float(P_rad) + _PSEUDOROTATION_OFFSETS)
-
-
-def pseudorotation_P_rad_from_nus(nu_deg):
+def pseudorotation_phase_rad_from_nus(nu_deg):
     """Return MDAnalysis `phase_as` phase angle in radians from five endocyclic torsions."""
     nu = np.asarray(nu_deg, dtype=np.float64)
     b = np.dot(nu, np.sin(_RING_ANGLES)) * (-2.0 / 5.0)
@@ -61,83 +56,64 @@ def _chi_quads(base_one_letter):
     return ("O4'", "C1'", 'N1', 'C2')
 
 
-def nucleotide_torsions_numpy(
-    xyz_by_name_cur,
-    xyz_by_name_prev,
-    xyz_by_name_next,
-    base_one_letter,
-):
+def nucleotide_torsions(xyz_by_name_cur, xyz_by_name_prev, xyz_by_name_next, base_one_letter):
     """Return torsions, mask, τ_m and τ_m validity for a nucleotide."""
 
-    def get_xyz(atom_dict, atom_name):
-        if atom_dict is None or atom_name not in atom_dict:
+    def g(d, name):
+        if d is None or name not in d:
             return None
-        return np.asarray(atom_dict[atom_name], dtype=np.float64).reshape(3)
+        return np.asarray(d[name], dtype=np.float64).reshape(3)
 
     torsions = np.zeros(N_TORSIONS, dtype=np.float64)
     mask = np.zeros(N_TORSIONS, dtype=bool)
 
-    o3_prev = get_xyz(xyz_by_name_prev, "O3'")
-    p_cur = get_xyz(xyz_by_name_cur, 'P')
-    o5 = get_xyz(xyz_by_name_cur, "O5'")
-    c5 = get_xyz(xyz_by_name_cur, "C5'")
-    c4 = get_xyz(xyz_by_name_cur, "C4'")
-    c3 = get_xyz(xyz_by_name_cur, "C3'")
-    o3_cur = get_xyz(xyz_by_name_cur, "O3'")
-    p_next = get_xyz(xyz_by_name_next, 'P')
-    o5_next = get_xyz(xyz_by_name_next, "O5'")
+    o3_prev = g(xyz_by_name_prev, "O3'")
+    p_cur = g(xyz_by_name_cur, 'P')
+    o5 = g(xyz_by_name_cur, "O5'")
+    c5 = g(xyz_by_name_cur, "C5'")
+    c4 = g(xyz_by_name_cur, "C4'")
+    c3 = g(xyz_by_name_cur, "C3'")
+    o3_cur = g(xyz_by_name_cur, "O3'")
+    p_next = g(xyz_by_name_next, 'P')
+    o5_next = g(xyz_by_name_next, "O5'")
 
-    if all(x is not None for x in (o3_prev, p_cur, o5, c5)):
-        torsions[TOR_ALPHA] = dihedral_rad(o3_prev, p_cur, o5, c5)
-        mask[TOR_ALPHA] = True
-    if all(x is not None for x in (p_cur, o5, c5, c4)):
-        torsions[TOR_BETA] = dihedral_rad(p_cur, o5, c5, c4)
-        mask[TOR_BETA] = True
-    if all(x is not None for x in (o5, c5, c4, c3)):
-        torsions[TOR_GAMMA] = dihedral_rad(o5, c5, c4, c3)
-        mask[TOR_GAMMA] = True
-    if all(x is not None for x in (c4, c3, o3_cur, p_next)):
-        torsions[TOR_EPS] = dihedral_rad(c4, c3, o3_cur, p_next)
-        mask[TOR_EPS] = True
-    if all(x is not None for x in (c3, o3_cur, p_next, o5_next)):
-        torsions[TOR_ZETA] = dihedral_rad(c3, o3_cur, p_next, o5_next)
-        mask[TOR_ZETA] = True
+    def _set(idx, *pts):
+        if all(x is not None for x in pts):
+            torsions[idx] = _dihedral_rad(*pts)
+            mask[idx] = True
 
-    o4 = get_xyz(xyz_by_name_cur, "O4'")
-    c1 = get_xyz(xyz_by_name_cur, "C1'")
+    _set(TOR_ALPHA, o3_prev, p_cur, o5, c5)
+    _set(TOR_BETA,  p_cur, o5, c5, c4)
+    _set(TOR_GAMMA, o5, c5, c4, c3)
+    _set(TOR_EPS,   c4, c3, o3_cur, p_next)
+    _set(TOR_ZETA,  c3, o3_cur, p_next, o5_next)
+
+    o4 = g(xyz_by_name_cur, "O4'")
+    c1 = g(xyz_by_name_cur, "C1'")
     a0, a1, a2, a3 = _chi_quads(base_one_letter)
-    atom2 = get_xyz(xyz_by_name_cur, a2)
-    atom3 = get_xyz(xyz_by_name_cur, a3)
-    if all(x is not None for x in (o4, c1, atom2, atom3)):
-        torsions[TOR_CHI] = dihedral_rad(o4, c1, atom2, atom3)
-        mask[TOR_CHI] = True
+    _set(TOR_CHI, o4, c1, g(xyz_by_name_cur, a2), g(xyz_by_name_cur, a3))
 
     nu_deg = []
     for atom0, atom1, atom2, atom3 in RING_TORSION_DEFS:
-        pts = [
-            get_xyz(xyz_by_name_cur, atom0),
-            get_xyz(xyz_by_name_cur, atom1),
-            get_xyz(xyz_by_name_cur, atom2),
-            get_xyz(xyz_by_name_cur, atom3),
-        ]
+        pts = [g(xyz_by_name_cur, n) for n in (atom0, atom1, atom2, atom3)]
         if not all(x is not None for x in pts):
             nu_deg = None
             break
-        nu_deg.append(float(np.degrees(dihedral_rad(pts[0], pts[1], pts[2], pts[3]))))
+        nu_deg.append(float(np.degrees(_dihedral_rad(*pts))))
 
     tau_m_val = 0.0
     if nu_deg is not None:
         nu_arr = np.asarray(nu_deg, dtype=np.float64)
-        p_rad = pseudorotation_P_rad_from_nus(nu_arr)
-        torsions[TOR_PUCKER_P] = p_rad
-        mask[TOR_PUCKER_P] = True
+        p_rad = pseudorotation_phase_rad_from_nus(nu_arr)
+        torsions[TOR_PSEUDOROTATION_PHASE] = p_rad
+        mask[TOR_PSEUDOROTATION_PHASE] = True
         tau_m_val = float(pucker_amplitude_rad(nu_arr, p_rad))
     tau_m_valid = nu_deg is not None
     return torsions, mask, tau_m_val, tau_m_valid
 
 
 @functools.lru_cache(maxsize=None)
-def _pseudorotation_offsets_torch(
+def _pseudorotation_offsets(
     device_str: str,
     dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -148,25 +124,25 @@ def _pseudorotation_offsets_torch(
     )
 
 
-def nus_rad_from_P_tau_torch(
+def nus_rad_from_phase_and_amplitude(
     P_rad: torch.Tensor,
     tau_m: torch.Tensor,
 ) -> torch.Tensor:
     """Return five endocyclic ν in the same order as `RING_TORSION_DEFS`."""
     p = P_rad.reshape(-1, 1)
     t = tau_m.reshape(-1, 1)
-    offsets = _pseudorotation_offsets_torch(str(P_rad.device), P_rad.dtype)
+    offsets = _pseudorotation_offsets(str(P_rad.device), P_rad.dtype)
     return t * torch.cos(p + offsets.unsqueeze(0))
 
 
-pseudorotation_to_nus_torch = nus_rad_from_P_tau_torch
+phase_and_amplitude_to_nus = nus_rad_from_phase_and_amplitude
 
 
-def _ring_dihedrals_from_coords_torch(ring_atoms: dict[str, torch.Tensor]) -> torch.Tensor:
+def _ring_dihedrals_from_coords(ring_atoms: dict[str, torch.Tensor]) -> torch.Tensor:
     out = []
     for atom0, atom1, atom2, atom3 in RING_TORSION_DEFS:
         out.append(
-            dihedral_rad_torch(
+            dihedral_rad(
                 ring_atoms[atom0],
                 ring_atoms[atom1],
                 ring_atoms[atom2],
@@ -176,6 +152,6 @@ def _ring_dihedrals_from_coords_torch(ring_atoms: dict[str, torch.Tensor]) -> to
     return torch.cat(out, dim=-1)
 
 
-def sugar_ring_torsions_torch(atoms: dict[str, torch.Tensor]) -> torch.Tensor:
+def sugar_ring_torsions(atoms: dict[str, torch.Tensor]) -> torch.Tensor:
     """Return endocyclic ν torsions in `RING_TORSION_DEFS` order."""
-    return _ring_dihedrals_from_coords_torch(atoms)
+    return _ring_dihedrals_from_coords(atoms)

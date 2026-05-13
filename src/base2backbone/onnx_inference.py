@@ -7,11 +7,11 @@ import torch
 
 from .data import BASE_TO_INDEX, N_CHAIN_END_CLASSES
 from .torsion_constants import LOG_TAU_M_MAX, LOG_TAU_M_MIN, N_LATENT, N_TORSIONS
-from .wrapped_score_diffusion import decode_torsions, reverse_ve_score_step, ve_sigma_grid, wrap_angle
+from .score_diffusion import decode_torsions, reverse_ve_score_step, ve_sigma_grid, wrap_angle
 
 
 class OnnxSampler:
-    """Inference-only VE sampler backed by an exported ONNX denoiser."""
+    """Inference-only VE sampler backed by an exported ONNX score network."""
 
     def __init__(self, model_path: str, device: str = 'cuda'):
         self.model_dir, self.onnx_path, self.meta_path = _resolve_model_artifacts(model_path)
@@ -73,7 +73,7 @@ class OnnxSampler:
         pad[bi, tidx, o:o + N_LATENT] = sc
         return torch.cat([rel_o, rel_r, pair_o, pair_r, base, hp, ce, it, pad], dim=-1)
 
-    def forward_denoiser(self, batch, x_t_latent, log_sigma_per_graph, sc):
+    def forward_score_network(self, batch, x_t_latent, log_sigma_per_graph, sc):
         b, _ = self._b_ws(batch)
         x = self._build_x(batch, x_t_latent, log_sigma_per_graph, sc)
         score_all_np = self.session.run(
@@ -128,7 +128,7 @@ class OnnxSampler:
                 device=dev,
                 dtype=dtype,
             )
-            pred = self.forward_denoiser(batch, x_t, log_s, sc)
+            pred = self.forward_score_network(batch, x_t, log_s, sc)
             theta, logt = reverse_ve_score_step(
                 x_t[..., :N_TORSIONS],
                 x_t[..., N_TORSIONS:N_LATENT],

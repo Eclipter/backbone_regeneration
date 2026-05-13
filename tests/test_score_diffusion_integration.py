@@ -7,15 +7,21 @@ from typing import Any, cast
 
 import torch
 
-from bbregen.model import PytorchLightningModule, TorsionDenoiser
-from bbregen.torsion_constants import assert_torsion_layout, N_LATENT, N_TORSIONS, TORSION_NAMES
-from bbregen.torsion_geometry import (
-    build_sugar_ring_closed_form_torch,
-    dihedral_rad_torch,
-    wrap_dihedral_diff_torch,
+from base2backbone.model import BackboneLightningModule, TorsionScoreNetwork
+from base2backbone.torsion_constants import assert_torsion_layout, N_LATENT, N_TORSIONS, TORSION_NAMES
+from base2backbone.geometry.backbone import (
+    _get_template_tensors,
+    build_sugar_ring_closed_form,
+    dihedral_rad,
+    wrap_dihedral_diff,
 )
-from bbregen.wrapped_score_diffusion import (decode_torsions, encode_torsions,
-                                             perturb_torsions, wrap_angle)
+from base2backbone.score_diffusion import (
+    decode_torsions,
+    encode_torsions,
+    perturb_torsions,
+    wrap_angle,
+    wrapped_angle_diff,
+)
 
 
 def test_wrap_angle_range():
@@ -25,8 +31,6 @@ def test_wrap_angle_range():
 
 
 def test_wrapped_angle_diff_boundary():
-    from bbregen.wrapped_score_diffusion import wrapped_angle_diff
-
     a = torch.tensor([179.0 * math.pi / 180.0])
     b = torch.tensor([-179.0 * math.pi / 180.0])
     d = wrapped_angle_diff(a, b)
@@ -72,8 +76,8 @@ def test_model_output_shape_wrapped():
         log_closure_metrics_train=False,
         log_closure_metrics_val=True,
     )
-    pl = PytorchLightningModule(**cast(Any, hp)).float()
-    den = TorsionDenoiser(pl.node_dim, hp['hidden_dim'], hp['num_heads'], hp['num_layers'])
+    pl = BackboneLightningModule(**cast(Any, hp)).float()
+    den = TorsionScoreNetwork(pl.node_dim, hp['hidden_dim'], hp['num_heads'], hp['num_layers'])
     x = torch.randn(2, 3, pl.node_dim)
     out = den(x)
     assert out.shape == (2, 3, N_LATENT)
@@ -87,12 +91,12 @@ def test_delta_absent_everywhere():
     assert 'delta' not in TORSION_NAMES
     assert N_TORSIONS == 7
     assert N_LATENT == 8
-    cl_text = Path(__file__).resolve().parents[1] / 'src' / 'bbregen' / 'bridge_closure.py'
+    cl_text = Path(__file__).resolve().parents[1] / 'src' / 'base2backbone' / 'bridge_closure.py'
     assert 'delta' not in cl_text.read_text().lower()
 
 
 def test_no_sincos_latent_in_model_source():
-    text = Path(__file__).resolve().parents[1] / 'src' / 'bbregen' / 'model.py'
+    text = Path(__file__).resolve().parents[1] / 'src' / 'base2backbone' / 'model.py'
     src = text.read_text()
     assert not re.search(r'N_TORSIONS\s*\*\s*2\s*\+\s*1', src)
     assert 'interleaved sin/cos' not in src.lower()
@@ -105,15 +109,13 @@ def test_chi_affects_coordinates():
     tau = torch.tensor([0.33])
     chi_a = torch.tensor([-0.55])
     chi_b = torch.tensor([1.1])
-    r_a = build_sugar_ring_closed_form_torch(chi_a, P, tau, ri)
-    r_b = build_sugar_ring_closed_form_torch(chi_b, P, tau, ri)
+    r_a = build_sugar_ring_closed_form(chi_a, P, tau, ri)
+    r_b = build_sugar_ring_closed_form(chi_b, P, tau, ri)
     assert not torch.allclose(r_a["O4'"], r_b["O4'"], atol=1e-4)
-    from bbregen.torsion_geometry import _get_template_tensors
-
     tc = _get_template_tensors('cpu')
     n_atom = tc['chi_n'][ri].reshape(1, 3)
     c_atom = tc['chi_c'][ri].reshape(1, 3)
-    meas = dihedral_rad_torch(
+    meas = dihedral_rad(
         r_a["O4'"].reshape(1, 3),
         r_a["C1'"].reshape(1, 3),
         n_atom,
@@ -127,19 +129,17 @@ def test_chi_torch_pyrimidine_matches_measured_dihedral():
     P = torch.tensor([0.12])
     tau = torch.tensor([0.34])
     chi_tgt = torch.tensor([-0.4])
-    r = build_sugar_ring_closed_form_torch(chi_tgt, P, tau, ri)
-    from bbregen.torsion_geometry import _get_template_tensors
-
+    r = build_sugar_ring_closed_form(chi_tgt, P, tau, ri)
     tc = _get_template_tensors('cpu')
     n_atom = tc['chi_n'][ri].reshape(1, 3)
     c_atom = tc['chi_c'][ri].reshape(1, 3)
-    meas = dihedral_rad_torch(
+    meas = dihedral_rad(
         r["O4'"].reshape(1, 3),
         r["C1'"].reshape(1, 3),
         n_atom,
         c_atom,
     )
-    assert wrap_dihedral_diff_torch(meas, chi_tgt).abs().item() < 0.02
+    assert wrap_dihedral_diff(meas, chi_tgt).abs().item() < 0.02
 
 
 def test_world_local_roundtrip():
@@ -156,9 +156,7 @@ def test_world_local_roundtrip():
 def test_bridge_closure_wrapped_torsions():
     pred = torch.tensor([179.0 * math.pi / 180.0], dtype=torch.float64)
     tgt = torch.tensor([-179.0 * math.pi / 180.0], dtype=torch.float64)
-    from bbregen.torsion_geometry import wrap_dihedral_diff_torch
-
-    err = wrap_dihedral_diff_torch(pred, tgt)
+    err = wrap_dihedral_diff(pred, tgt)
     err_deg = abs(float(err)) * 180.0 / math.pi
     assert abs(err_deg - 2.0) < 0.1
 

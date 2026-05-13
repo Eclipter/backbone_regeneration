@@ -9,6 +9,15 @@ GEO_EPS = 1e-8
 GEO_EPS_NP = 1e-12
 
 
+def _preferred_geometry_device() -> torch.device:
+    return torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+
+
+def device() -> torch.device:
+    """Prefer CUDA for numeric geometry (CPU fallback when CUDA is unavailable)."""
+    return _preferred_geometry_device()
+
+
 def expand_point_origin(origin: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
     while origin.ndim < points.ndim:
         origin = origin.unsqueeze(-2)
@@ -49,91 +58,27 @@ def local_to_world_points(
     )
 
 
-world_to_local_torch = world_to_local_points
-local_to_world_torch = local_to_world_points
-
-
 def wrap_angle_rad(x):
     """Map angles to ``(-pi, pi]``."""
     return np.arctan2(np.sin(x), np.cos(x))
 
 
-def bond_angle_numpy(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-    """Interior angle ``∠(a-b-c)`` in radians."""
-    ba = a - b
-    bc = c - b
-    denom = float(np.linalg.norm(ba)) * float(np.linalg.norm(bc)) + GEO_EPS_NP
-    cos_t = float(np.dot(ba, bc)) / denom
-    cos_t = float(np.clip(cos_t, -1.0 + 1e-9, 1.0 - 1e-9))
-    return float(np.arccos(cos_t))
+def _dihedral_rad(p0, p1, p2, p3) -> float:
+    b1 = p1 - p0; b2 = p2 - p1; b3 = p3 - p2
+    n1 = np.cross(b1, b2); n2 = np.cross(b2, b3)
+    n1u = n1 / (np.linalg.norm(n1) + GEO_EPS_NP)
+    n2u = n2 / (np.linalg.norm(n2) + GEO_EPS_NP)
+    m1 = np.cross(n1u, b2 / (np.linalg.norm(b2) + GEO_EPS_NP))
+    return float(np.arctan2(np.dot(m1, n2u), np.dot(n1u, n2u)))
 
 
-def nerf_place(a, b, c, r, theta, psi):
-    """Place D given prior atoms A-B-C, bond C-D length r, angle and dihedral in radians."""
-    a = np.asarray(a, dtype=np.float64).reshape(3)
-    b = np.asarray(b, dtype=np.float64).reshape(3)
-    c = np.asarray(c, dtype=np.float64).reshape(3)
-    ba = a - b
-    bc = c - b
-    bc_u = bc / (np.linalg.norm(bc) + GEO_EPS_NP)
-    normal = np.cross(ba, bc_u)
-    normal_norm = np.linalg.norm(normal)
-    if normal_norm < 1e-10:
-        normal = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    else:
-        normal = normal / normal_norm
-    binormal = np.cross(normal, bc_u)
-    return c + r * (
-        np.cos(math.pi - theta) * bc_u
-        + np.sin(math.pi - theta) * (np.cos(psi) * normal + np.sin(psi) * binormal)
-    )
+def _bond_angle(a, b, c) -> float:
+    ba = a - b; bc = c - b
+    cos_t = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + GEO_EPS_NP)
+    return float(np.arccos(np.clip(cos_t, -1.0 + 1e-9, 1.0 - 1e-9)))
 
 
-def nerf_place_torch(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    c: torch.Tensor,
-    r: torch.Tensor,
-    theta: torch.Tensor,
-    psi: torch.Tensor,
-) -> torch.Tensor:
-    """Batched differentiable NERF. Mirrors ``nerf_place``."""
-    ba = a - b
-    bc = c - b
-    bc_u = bc / (bc.norm(dim=-1, keepdim=True) + GEO_EPS_NP)
-    normal = torch.linalg.cross(ba, bc_u)
-    normal_norm = normal.norm(dim=-1, keepdim=True)
-    fallback = torch.zeros_like(normal)
-    fallback[..., 0] = 1.0
-    normal = torch.where(normal_norm < 1e-10, fallback, normal / (normal_norm + GEO_EPS_NP))
-    binormal = torch.linalg.cross(normal, bc_u)
-    radius = r.unsqueeze(-1)
-    return c + radius * (
-        torch.cos(theta.new_tensor(math.pi) - theta).unsqueeze(-1) * bc_u
-        + torch.sin(theta.new_tensor(math.pi) - theta).unsqueeze(-1)
-        * (
-            torch.cos(psi).unsqueeze(-1) * normal
-            + torch.sin(psi).unsqueeze(-1) * binormal
-        )
-    )
-
-
-def dihedral_rad(p0, p1, p2, p3):
-    """Signed dihedral angle in radians for points ``p0-p3``."""
-    b1 = p1 - p0
-    b2 = p2 - p1
-    b3 = p3 - p2
-    n1 = np.cross(b1, b2)
-    n2 = np.cross(b2, b3)
-    n1_u = n1 / (np.linalg.norm(n1) + GEO_EPS_NP)
-    n2_u = n2 / (np.linalg.norm(n2) + GEO_EPS_NP)
-    m1 = np.cross(n1_u, b2 / (np.linalg.norm(b2) + GEO_EPS_NP))
-    x = np.dot(n1_u, n2_u)
-    y = np.dot(m1, n2_u)
-    return float(np.arctan2(y, x))
-
-
-def dihedral_rad_torch(
+def dihedral_rad(
     p0: torch.Tensor,
     p1: torch.Tensor,
     p2: torch.Tensor,
@@ -156,7 +101,60 @@ def dihedral_rad_torch(
     return torch.atan2(y, x)
 
 
-def bond_angle_torch(
+def dihedral_rad_coords(p0, p1, p2, p3, *, dtype: torch.dtype = torch.float64) -> torch.Tensor:
+    """Dihedral for array-like points; auto-selects CUDA when available."""
+    device = _preferred_geometry_device()
+    return dihedral_rad(
+        torch.as_tensor(p0, dtype=dtype, device=device),
+        torch.as_tensor(p1, dtype=dtype, device=device),
+        torch.as_tensor(p2, dtype=dtype, device=device),
+        torch.as_tensor(p3, dtype=dtype, device=device),
+    )
+
+
+def nerf_place(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    c: torch.Tensor,
+    r: torch.Tensor,
+    theta: torch.Tensor,
+    psi: torch.Tensor,
+) -> torch.Tensor:
+    """Batched differentiable NERF."""
+    ba = a - b
+    bc = c - b
+    bc_u = bc / (bc.norm(dim=-1, keepdim=True) + GEO_EPS_NP)
+    normal = torch.linalg.cross(ba, bc_u)
+    normal_norm = normal.norm(dim=-1, keepdim=True)
+    fallback = torch.zeros_like(normal)
+    fallback[..., 0] = 1.0
+    normal = torch.where(normal_norm < 1e-10, fallback, normal / (normal_norm + GEO_EPS_NP))
+    binormal = torch.linalg.cross(normal, bc_u)
+    radius = r.unsqueeze(-1)
+    return c + radius * (
+        torch.cos(theta.new_tensor(math.pi) - theta).unsqueeze(-1) * bc_u
+        + torch.sin(theta.new_tensor(math.pi) - theta).unsqueeze(-1)
+        * (
+            torch.cos(psi).unsqueeze(-1) * normal
+            + torch.sin(psi).unsqueeze(-1) * binormal
+        )
+    )
+
+
+def nerf_place_coords(a, b, c, r, theta, psi, *, dtype: torch.dtype = torch.float64) -> torch.Tensor:
+    """Single-point NeRF; returns ``[3]``, auto-selects CUDA when available."""
+    device = _preferred_geometry_device()
+    return nerf_place(
+        torch.as_tensor(a, dtype=dtype, device=device).reshape(1, 3),
+        torch.as_tensor(b, dtype=dtype, device=device).reshape(1, 3),
+        torch.as_tensor(c, dtype=dtype, device=device).reshape(1, 3),
+        torch.as_tensor(r, dtype=dtype, device=device).reshape(1),
+        torch.as_tensor(theta, dtype=dtype, device=device).reshape(1),
+        torch.as_tensor(psi, dtype=dtype, device=device).reshape(1),
+    ).reshape(3)
+
+
+def bond_angle(
     a: torch.Tensor,
     b: torch.Tensor,
     c: torch.Tensor,
@@ -171,7 +169,18 @@ def bond_angle_torch(
     return torch.acos(cos_t)
 
 
-def wrap_dihedral_diff_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+def bond_angle_coords(a, b, c, *, dtype: torch.dtype = torch.float64, eps: float = GEO_EPS) -> torch.Tensor:
+    """Bond angle for array-like vertices; auto-selects CUDA when available."""
+    device = _preferred_geometry_device()
+    return bond_angle(
+        torch.as_tensor(a, dtype=dtype, device=device),
+        torch.as_tensor(b, dtype=dtype, device=device),
+        torch.as_tensor(c, dtype=dtype, device=device),
+        eps,
+    )
+
+
+def wrap_dihedral_diff(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return (a - b + torch.pi) % (2.0 * torch.pi) - torch.pi
 
 
@@ -206,7 +215,7 @@ def signed_tetra_volume(
     return (torch.linalg.cross(b - a, c - a, dim=-1) * (d - a)).sum(dim=-1)
 
 
-def rodrigues_rotate_point_torch(
+def rodrigues_rotate_point(
     v: torch.Tensor,
     k: torch.Tensor,
     theta: torch.Tensor,

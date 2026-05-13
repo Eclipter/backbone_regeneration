@@ -31,7 +31,7 @@ BASE = dict(
     LOG_CLOSURE_METRICS_TRAIN=False,
     LOG_CLOSURE_METRICS_VAL=True,
     TORCH_COMPILE=True,
-    START_FROM_LAST_CKPT=True,
+    START_FROM_LAST_CKPT=False,
 )
 
 # One entry = one experiment. Put ONLY the overrides from BASE here
@@ -40,7 +40,7 @@ EXPERIMENTS = [
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'torsions/1'
+RUN_NAME = 'torsions/2'
 
 SEED = 42
 

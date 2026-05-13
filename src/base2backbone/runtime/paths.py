@@ -41,11 +41,11 @@ def find_best_checkpoint(run_dir: str) -> str:
     raise RuntimeError(f'best_model_path not present in ModelCheckpoint state of {source}.')
 
 
-def resolve_run_dir(run: str) -> str:
-    """Map a user-facing experiment id (e.g. 'fixed_swa/baseline') to its log directory."""
-    if osp.isabs(run):
-        return run
-    run_norm = osp.normpath(run)
+def resolve_run_dir(run_id: str) -> str:
+    """Map a user-facing experiment id to its absolute log directory."""
+    if osp.isabs(run_id):
+        return run_id
+    run_norm = osp.normpath(run_id)
     if run_norm.split(os.sep, 1)[0] == 'logs':
         run_norm = run_norm.split(os.sep, 1)[1] if os.sep in run_norm else ''
     return osp.normpath(osp.join(LOG_DIR, run_norm))

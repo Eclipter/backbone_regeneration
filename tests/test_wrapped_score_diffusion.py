@@ -6,10 +6,20 @@ from typing import Any, cast
 import pytest
 import torch
 
-from bbregen import utils
-from bbregen.model import PytorchLightningModule
-from bbregen.torsion_constants import LOG_TAU_M_MAX, N_LATENT, N_TORSIONS, TORSION_NAMES
-from bbregen.wrapped_score_diffusion import (
+import base2backbone.score_diffusion as m
+from base2backbone.data import BACKBONE_ATOMS
+from base2backbone.bridge_closure import compute_bridge_closure_loss
+from base2backbone.model import BackboneLightningModule
+from base2backbone.torsion_constants import (
+    LOG_TAU_M_MAX,
+    N_LATENT,
+    N_TORSIONS,
+    TAU_M_MAX,
+    TAU_M_MIN,
+    TORSION_NAMES,
+)
+from base2backbone.geometry.backbone import build_batch_window_backbone_from_torsions
+from base2backbone.score_diffusion import (
     decode_torsions,
     gaussian_score,
     perturb_torsions,
@@ -25,9 +35,9 @@ from bbregen.wrapped_score_diffusion import (
 
 def _assert_window_bb_finiteness_design(bb: torch.Tensor) -> None:
     ph = frozenset({
-        utils.backbone_atoms.index('P'),
-        utils.backbone_atoms.index('OP1'),
-        utils.backbone_atoms.index('OP2'),
+        BACKBONE_ATOMS.index('P'),
+        BACKBONE_ATOMS.index('OP1'),
+        BACKBONE_ATOMS.index('OP2'),
     })
     assert bb.dim() == 4 and bb.shape[-1] == 3
     for j in range(bb.shape[2]):
@@ -127,8 +137,6 @@ def test_delta_absent():
 
 
 def test_decode_clamps_extreme_log_tau():
-    from bbregen.torsion_constants import TAU_M_MAX, TAU_M_MIN
-
     x = torch.zeros(2, N_LATENT)
     x[:, N_TORSIONS] = 10.0
     _, tau = decode_torsions(x)
@@ -214,9 +222,6 @@ def test_perturb_raises_on_wrong_torsion_width():
 
 
 def test_synthetic_perturb_decode_window_builder_closure_finite():
-    from bbregen.bridge_closure import compute_bridge_closure_loss
-    from bbregen.torsion_geometry import build_batch_window_backbone_from_torsions_torch
-
     torch.manual_seed(0)
     B, W = 2, 4
     theta0 = torch.randn(B, W, N_TORSIONS) * 0.05
@@ -230,7 +235,7 @@ def test_synthetic_perturb_decode_window_builder_closure_finite():
     ori = torch.randn(B, W, 3)
     frm = torch.eye(3, dtype=torch.float32).unsqueeze(0).unsqueeze(0).expand(B, W, 3, 3).contiguous()
     m = torch.ones(B, W, N_TORSIONS, dtype=torch.bool)
-    bb = build_batch_window_backbone_from_torsions_torch(
+    bb = build_batch_window_backbone_from_torsions(
         th2.float(), tau2.float(), ri.long(), ori.float(), frm.float(), m,
     )
     _assert_window_bb_finiteness_design(bb)
@@ -241,8 +246,6 @@ def test_synthetic_perturb_decode_window_builder_closure_finite():
 
 def test_perturb_log_tau_forward_no_clamp_before_gaussian_score(monkeypatch):
     """Forward noising path must remain Gaussian matching ``tau_score_target``."""
-    import bbregen.wrapped_score_diffusion as m
-
     def _flat_sigma(t, *_a, **_k):
         return torch.full_like(t, 120.0, dtype=torch.float32)
 
@@ -260,7 +263,7 @@ def test_perturb_log_tau_forward_no_clamp_before_gaussian_score(monkeypatch):
     assert float(pert['log_tau_t'].max()) > float(LOG_TAU_M_MAX)
 
 
-def test_torsion_denoiser_out_features_is_packed_latent():
+def test_torsion_score_network_out_features_is_packed_latent():
     hp = dict(
         hidden_dim=16,
         num_heads=4,
@@ -286,6 +289,6 @@ def test_torsion_denoiser_out_features_is_packed_latent():
         log_closure_metrics_train=False,
         log_closure_metrics_val=True,
     )
-    pl_mod = PytorchLightningModule(**cast(Any, hp)).float()
-    assert pl_mod.denoiser.out.out_features == N_LATENT == 8
-    assert pl_mod.denoiser.out.out_features != N_TORSIONS * 2 + 1
+    pl_mod = BackboneLightningModule(**cast(Any, hp)).float()
+    assert pl_mod.score_network.out.out_features == N_LATENT == 8
+    assert pl_mod.score_network.out.out_features != N_TORSIONS * 2 + 1

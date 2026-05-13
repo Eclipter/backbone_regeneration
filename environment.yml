@@ -1,4 +1,4 @@
-name: backbone_regen
+name: base2backbone
 
 channels:
   - conda-forge

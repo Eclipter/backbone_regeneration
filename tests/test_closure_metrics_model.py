@@ -1,19 +1,19 @@
 """Bridge closure diagnostics on the Lightning module (no NameError when logging enabled)."""
 
+import inspect
 from typing import Any, cast
 
 import torch
 from torch_geometric.data import Batch, Data
 
-from bbregen import utils
-from bbregen.model import PytorchLightningModule
-from bbregen.torsion_constants import N_LATENT, N_TORSIONS
-from bbregen.torsion_geometry import N_LATENT as TG_NLAT
-from bbregen.wrapped_score_diffusion import encode_torsions
+from base2backbone.data import BACKBONE_ATOMS
+from base2backbone.model import BackboneLightningModule
+from base2backbone.torsion_constants import N_LATENT, N_TORSIONS
+from base2backbone.score_diffusion import encode_torsions
 
 
 def _minimal_train_batch(ws: int = 3, *, device=torch.device('cpu')) -> Batch:
-    n_bb = len(utils.backbone_atoms)
+    n_bb = len(BACKBONE_ATOMS)
     nt_o = torch.zeros(ws, 3, dtype=torch.float32, device=device)
     nt_f = torch.eye(3, dtype=torch.float32, device=device).unsqueeze(0).expand(ws, 3, 3).contiguous()
     pair_o = torch.zeros(ws, 3, dtype=torch.float32, device=device)
@@ -81,7 +81,7 @@ def test_bridge_closure_metrics_returns_finite_dict():
         log_closure_metrics_train=False,
         log_closure_metrics_val=True,
     )
-    mod = PytorchLightningModule(**cast(Any, hp)).eval()
+    mod = BackboneLightningModule(**cast(Any, hp)).eval()
     batch = _minimal_train_batch()
     th = torch.randn(1, N_TORSIONS)
     tau = torch.ones(1) * 0.45
@@ -100,16 +100,14 @@ def test_bridge_closure_metrics_returns_finite_dict():
 
 
 def test_validation_step_source_logs_val_closure_when_flag_true():
-    import inspect
-
-    src = inspect.getsource(PytorchLightningModule.validation_step)
+    src = inspect.getsource(BackboneLightningModule.validation_step)
     assert 'log_closure_metrics_val' in src
     assert '_bridge_closure_metrics' in src
     assert "f'val/{key}'" in src.replace(' ', '')
 
 
 def test_tl_latent_width_matches_torch_geometry():
-    assert TG_NLAT == N_LATENT == 8
+    assert N_LATENT == 8
 
 
 def test_p_sample_loop_finite_shapes_with_stub_scores(monkeypatch):
@@ -138,7 +136,7 @@ def test_p_sample_loop_finite_shapes_with_stub_scores(monkeypatch):
         log_closure_metrics_train=False,
         log_closure_metrics_val=True,
     )
-    mod = PytorchLightningModule(**cast(Any, hp)).eval()
+    mod = BackboneLightningModule(**cast(Any, hp)).eval()
 
     def _stub_fwd(self, batch, x_tl, lg, sc):  # noqa: ARG001
         return torch.zeros(
@@ -148,7 +146,7 @@ def test_p_sample_loop_finite_shapes_with_stub_scores(monkeypatch):
             dtype=torch.float32,
         )
 
-    monkeypatch.setattr(PytorchLightningModule, 'forward_denoiser', _stub_fwd)
+    monkeypatch.setattr(BackboneLightningModule, 'forward_score_network', _stub_fwd)
     batch = _minimal_train_batch()
     theta0, (pred_theta, pred_tau_m) = mod.p_sample_loop(batch)
     b = batch.num_graphs

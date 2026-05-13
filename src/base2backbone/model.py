@@ -2,6 +2,7 @@ import math
 import os.path as osp
 
 import lightning.pytorch as pl
+from lightning.pytorch.loggers import TensorBoardLogger
 import torch
 import torch.nn as nn
 from torch.optim import AdamW
@@ -9,11 +10,11 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from .data import BACKBONE_ATOMS, BASE_TO_INDEX, N_CHAIN_END_CLASSES
 from .bridge_closure import compute_bridge_closure_loss
-from .geometry import build_batch_window_backbone_from_torsions_torch
+from .geometry import build_batch_window_backbone_from_torsions
 from .torsion_constants import (LOG_TAU_M_MAX, LOG_TAU_M_MIN, TAU_M_MAX,
                                 TAU_M_MIN, N_LATENT, N_TORSIONS)
-from .wrapped_score_diffusion import (decode_torsions, encode_torsions,
-                                      estimate_theta_tau_from_score_ve,
+from .score_diffusion import (decode_torsions, encode_torsions,
+                                      estimate_latent_from_ve_score,
                                       perturb_torsions, reverse_ve_score_step,
                                       sigma_schedule, ve_sigma_grid,
                                       weighted_score_mse, wrap_angle)
@@ -37,7 +38,7 @@ class SinusoidalPositionalEmbeddings(nn.Module):
         return embeddings
 
 
-class TorsionDenoiser(nn.Module):
+class TorsionScoreNetwork(nn.Module):
     def __init__(self, node_dim, hidden_dim, num_heads, num_layers, dropout=0.0):
         super().__init__()
         if hidden_dim % num_heads != 0:
@@ -100,7 +101,7 @@ def _zero_bridge_closure_metrics(pred_x0: torch.Tensor) -> dict[str, torch.Tenso
     }
 
 
-class PytorchLightningModule(pl.LightningModule):
+class BackboneLightningModule(pl.LightningModule):
     def __init__(
         self, hidden_dim, num_heads, num_layers, num_timesteps, batch_size, lr,
         lr_scheduler, lr_scheduler_patience, lr_scheduler_threshold, lr_scheduler_cooldown,
@@ -137,7 +138,7 @@ class PytorchLightningModule(pl.LightningModule):
             + N_LATENT
         )
 
-        self.denoiser = TorsionDenoiser(
+        self.score_network = TorsionScoreNetwork(
             node_dim=self.node_dim,
             hidden_dim=hidden_dim,
             num_heads=num_heads,
@@ -145,13 +146,18 @@ class PytorchLightningModule(pl.LightningModule):
         )
 
     def load_state_dict(self, state_dict, strict=True):  # type: ignore[no-untyped-def]
-        # Checkpoints saved with torch.compile(denoiser) use denoiser._orig_mod.*; eager module expects denoiser.*.
-        _orig = 'denoiser._orig_mod.'
-        if any(str(k).startswith(_orig) for k in state_dict):
-            state_dict = {
-                ('denoiser.' + str(k)[len(_orig):] if str(k).startswith(_orig) else k): v
-                for k, v in state_dict.items()
-            }
+        # Support checkpoints saved before the `score_network` rename and before torch.compile wrapping.
+        renamed_state_dict = {}
+        for key, value in state_dict.items():
+            key_str = str(key)
+            if key_str.startswith('denoiser._orig_mod.'):
+                key_str = 'score_network.' + key_str[len('denoiser._orig_mod.'):]
+            elif key_str.startswith('denoiser.'):
+                key_str = 'score_network.' + key_str[len('denoiser.'):]
+            elif key_str.startswith('score_network._orig_mod.'):
+                key_str = 'score_network.' + key_str[len('score_network._orig_mod.'):]
+            renamed_state_dict[key_str] = value
+        state_dict = renamed_state_dict
         return super().load_state_dict(state_dict, strict=strict)
 
     def on_test_start(self):
@@ -202,7 +208,7 @@ class PytorchLightningModule(pl.LightningModule):
         origins = batch.nt_origins_world.view(b, ws, 3)
         frames = batch.nt_frames_world.view(b, ws, 3, 3)
 
-        bb = build_batch_window_backbone_from_torsions_torch(
+        bb = build_batch_window_backbone_from_torsions(
             tors_m.float(),
             tau_m.float(),
             restype.long(),
@@ -269,10 +275,10 @@ class PytorchLightningModule(pl.LightningModule):
         pad[bi, tidx, o:o + N_LATENT] = sc
         return torch.cat([rel_o, rel_R, pair_o, pair_R, base, hp, ce, it, pad], dim=-1)
 
-    def forward_denoiser(self, batch, x_t_latent, log_sigma_per_graph, sc):
+    def forward_score_network(self, batch, x_t_latent, log_sigma_per_graph, sc):
         b, _ = self._b_ws(batch)
         x = self._build_x(batch, x_t_latent, log_sigma_per_graph, sc)
-        score_all = self.denoiser(x)
+        score_all = self.score_network(x)
         bi = torch.arange(b, device=score_all.device)
         return score_all[bi, batch.target_nt_idx.long()]
 
@@ -317,7 +323,7 @@ class PytorchLightningModule(pl.LightningModule):
             float(self.hparams['angular_sigma_max']),
         )
         log_sigma_cond = torch.log(sigma_theta_b.clamp(min=1e-8))
-        pred = self.forward_denoiser(batch, x_t, log_sigma_cond, sc)
+        pred = self.forward_score_network(batch, x_t, log_sigma_cond, sc)
         sw = str(self.hparams.get('score_loss_weighting', 'sigma2'))
         lam_theta = (pert['sigma_theta'] ** 2) if sw == 'sigma2' else None
         lam_tau = (pert['sigma_tau'] ** 2) if sw == 'sigma2' else None
@@ -337,7 +343,7 @@ class PytorchLightningModule(pl.LightningModule):
         )
         tw = float(self.hparams.get('tau_loss_weight', 1.0))
         mse = mse_theta + tw * mse_tau
-        pred_x0_cl = estimate_theta_tau_from_score_ve(
+        pred_x0_cl = estimate_latent_from_ve_score(
             pert['theta_t'],
             log_tau_t,
             pred,
@@ -437,7 +443,6 @@ class PytorchLightningModule(pl.LightningModule):
 
     def _write_epoch_scalars(self, keys):
         """Read accumulated callback_metrics and write to TensorBoard via add_scalar."""
-        from lightning.pytorch.loggers import TensorBoardLogger
         if (
             self.trainer is None
             or not self.trainer.is_global_zero
@@ -532,7 +537,7 @@ class PytorchLightningModule(pl.LightningModule):
                 device=dev,
                 dtype=dtype,
             )
-            pred = self.forward_denoiser(batch, x_t, log_s, sc)
+            pred = self.forward_score_network(batch, x_t, log_s, sc)
             theta, logt = reverse_ve_score_step(
                 x_t[..., :N_TORSIONS],
                 x_t[..., N_TORSIONS:N_LATENT],
@@ -587,7 +592,7 @@ class PytorchLightningModule(pl.LightningModule):
         origins_w = batch.nt_origins_world.view(b, ws, 3)
         frames_w = batch.nt_frames_world.view(b, ws, 3, 3)
 
-        coords_w = build_batch_window_backbone_from_torsions_torch(
+        coords_w = build_batch_window_backbone_from_torsions(
             theta_w,
             tau_w,
             restype.long(),

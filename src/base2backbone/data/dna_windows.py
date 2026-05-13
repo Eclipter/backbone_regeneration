@@ -18,7 +18,7 @@ from ..io import (
     load_mmcif_universe,
     load_pdb_universe,
 )
-from ..geometry import nucleotide_torsions_numpy, wrap_angle_rad
+from ..geometry import nucleotide_torsions, wrap_angle_rad
 from .vocab import (
     BACKBONE_ATOMS,
     BASE_TO_INDEX,
@@ -175,7 +175,7 @@ def build_window_data(window, window_idx, chain_len, chain_direction, structure,
         central_nt_mask.append(nucleotide_idx == window_size // 2)
 
         torsion_xyz = _neighbor_xyz_for_torsions(window, nucleotide_idx)
-        torsions, torsion_mask, tau_m, tau_m_ok = nucleotide_torsions_numpy(
+        torsions, torsion_mask, tau_m, tau_m_ok = nucleotide_torsions(
             torsion_xyz[0],
             torsion_xyz[1],
             torsion_xyz[2],

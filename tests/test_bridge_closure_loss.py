@@ -3,30 +3,22 @@
 import math
 from pathlib import Path
 
-import numpy as np
 import pytest
 import torch
 
-from bbregen.bridge_closure import (
-    canonical_two_residue_bridge_bb_tensor,
-    compute_bridge_closure_loss,
-)
-from bbregen.torsion_geometry import (
-    N_TORSIONS,
-    TOR_ALPHA,
-    TOR_BETA,
-    TOR_EPS,
-    TOR_ZETA,
-    dihedral_rad_torch,
-    wrap_dihedral_diff_torch,
-)
-from bbregen.utils import backbone_atoms
+from base2backbone.bridge_closure import (
+    canonical_two_residue_bridge_bb_tensor, compute_bridge_closure_loss)
+from base2backbone.data import BACKBONE_ATOMS
+from base2backbone.geometry.backbone import (N_TORSIONS, TOR_ALPHA, TOR_BETA,
+                                             TOR_EPS, TOR_ZETA,
+                                             _get_template_tensors,
+                                             dihedral_rad, wrap_dihedral_diff)
 
 
 def _ideal_bridge_bb_and_targets(dtype=torch.float64, device='cpu'):
     """Aligned with bridge closure refs: canonical A–A pair bb from ``bridge_closure`` helpers."""
     B, W = 1, 2
-    nj = {nm: j for j, nm in enumerate(backbone_atoms)}
+    nj = {nm: j for j, nm in enumerate(BACKBONE_ATOMS)}
     bb2 = canonical_two_residue_bridge_bb_tensor('A', 'A', dtype=dtype, device=device)
     bb = bb2.unsqueeze(0)
 
@@ -41,10 +33,10 @@ def _ideal_bridge_bb_and_targets(dtype=torch.float64, device='cpu'):
     c5_n = bb[:, 1, j_c5]
     c4_n = bb[:, 1, j_c4]
 
-    eps = dihedral_rad_torch(c4_p, c3_p, o3_p, p_n)
-    ze = dihedral_rad_torch(c3_p, o3_p, p_n, o5_n)
-    al = dihedral_rad_torch(o3_p, p_n, o5_n, c5_n)
-    be = dihedral_rad_torch(p_n, o5_n, c5_n, c4_n)
+    eps = dihedral_rad(c4_p, c3_p, o3_p, p_n)
+    ze = dihedral_rad(c3_p, o3_p, p_n, o5_n)
+    al = dihedral_rad(o3_p, p_n, o5_n, c5_n)
+    be = dihedral_rad(p_n, o5_n, c5_n, c4_n)
 
     tors = torch.zeros(B, W, N_TORSIONS, dtype=dtype, device=device)
     tors[:, 0, TOR_EPS] = eps
@@ -76,8 +68,8 @@ def test_bridge_closure_loss_zero_or_low_on_reference_geometry():
 def test_bridge_closure_loss_penalizes_broken_bond():
     bb, tors, mask, _, ri = _ideal_bridge_bb_and_targets()
     base = compute_bridge_closure_loss(bb, tors, mask, ri)
-    j_p = backbone_atoms.index('P')
-    j_o3 = backbone_atoms.index("O3'")
+    j_p = BACKBONE_ATOMS.index('P')
+    j_o3 = BACKBONE_ATOMS.index("O3'")
     bb_bad = bb.clone()
     dv = bb_bad[:, 1, j_p] - bb_bad[:, 0, j_o3]
     bb_bad[:, 1, j_p] = bb_bad[:, 1, j_p] + 0.35 * dv / (dv.norm(dim=-1, keepdim=True) + 1e-12)
@@ -88,7 +80,7 @@ def test_bridge_closure_loss_penalizes_broken_bond():
 def test_bridge_closure_loss_penalizes_wrong_angle():
     bb, tors, mask, _, ri = _ideal_bridge_bb_and_targets()
     base = compute_bridge_closure_loss(bb, tors, mask, ri)
-    j_o5 = backbone_atoms.index("O5'")
+    j_o5 = BACKBONE_ATOMS.index("O5'")
     bb_bad = bb.clone()
     bb_bad[:, 1, j_o5] = bb_bad[:, 1, j_o5] + torch.tensor([0.0, 0.55, 0.0], dtype=bb.dtype, device=bb.device)
     bad = compute_bridge_closure_loss(bb_bad, tors, mask, ri)
@@ -98,7 +90,7 @@ def test_bridge_closure_loss_penalizes_wrong_angle():
 def test_bridge_closure_loss_uses_wrapped_torsion_error():
     pred = torch.tensor([179.0 * math.pi / 180.0], dtype=torch.float64)
     tgt = torch.tensor([-179.0 * math.pi / 180.0], dtype=torch.float64)
-    err = wrap_dihedral_diff_torch(pred, tgt)
+    err = wrap_dihedral_diff(pred, tgt)
     err_deg = abs(float(err)) * 180.0 / math.pi
     assert abs(err_deg - 2.0) < 0.1
 
@@ -114,7 +106,7 @@ def test_bridge_closure_loss_ignores_invalid_bridges():
 
 
 def test_delta_absent_from_closure_loss():
-    text = Path(__file__).resolve().parents[1] / 'src' / 'bbregen' / 'bridge_closure.py'
+    text = Path(__file__).resolve().parents[1] / 'src' / 'base2backbone' / 'bridge_closure.py'
     low = text.read_text().lower()
     assert 'delta' not in low
 
@@ -147,8 +139,6 @@ def test_processed_pt_smoke_if_present():
 
 
 def test_bridge_o3p_bond_target_is_not_intraresidue_o3_p_separation():
-    from bbregen.torsion_geometry import _get_template_tensors
-
     tc = _get_template_tensors('cpu')
     for idx in range(4):
         tgt = tc['bond_p_o3_inter'][idx].item()
@@ -168,7 +158,7 @@ def test_bridge_mask_allows_bridge_without_full_nucleotide_validity_flags():
 
 def test_bridge_mask_rejects_when_required_bridge_atom_is_nan():
     bb, tors, mask, _, ri = _ideal_bridge_bb_and_targets()
-    j_o3 = backbone_atoms.index("O3'")
+    j_o3 = BACKBONE_ATOMS.index("O3'")
     bb2 = bb.clone()
     bb2[0, 0, j_o3] = float('nan')
     vb = torch.ones(1, 1, dtype=torch.bool)
@@ -181,4 +171,3 @@ def test_bridge_closure_valid_bridge_mask_wrong_shape_raises():
     bad = torch.ones(1, 2, dtype=torch.bool)
     with pytest.raises(ValueError, match='valid_bridge_mask'):
         compute_bridge_closure_loss(bb, tors, mask, ri, valid_bridge_mask=bad)
-

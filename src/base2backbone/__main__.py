@@ -1,4 +1,4 @@
-from .predict import main
+from .inference import main
 
 
 if __name__ == '__main__':

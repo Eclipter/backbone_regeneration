@@ -8,7 +8,7 @@ import torch
 from pynamod.atomic_analysis.nucleotides_parser import \
     get_base_u  # pyright: ignore[reportMissingImports]
 
-from .primitives import bond_angle_numpy, dihedral_rad
+from .primitives import _bond_angle, _dihedral_rad
 from .torsions import RING_TORSION_DEFS
 
 _TEMPLATE_CACHE: dict[str, dict[str, np.ndarray]] = {}
@@ -35,7 +35,7 @@ def get_template(restype: str) -> dict[str, np.ndarray]:
         template[atom_name] = np.asarray(atom.position, dtype=np.float64)
 
     nu_rad = np.array([
-        dihedral_rad(template[a0], template[a1], template[a2], template[a3])
+        _dihedral_rad(template[a0], template[a1], template[a2], template[a3])
         for a0, a1, a2, a3 in RING_TORSION_DEFS
     ])
     _TEMPLATE_TAU_M[restype] = float(np.sqrt(0.4 * float(np.dot(nu_rad, nu_rad))))
@@ -57,11 +57,11 @@ def get_template_tensors(device_str: str) -> dict[str, torch.Tensor]:
     def bond_length(template: dict[str, np.ndarray], a: str, b: str) -> float:
         return float(np.linalg.norm(template[a] - template[b]))
 
-    def bond_angle(template: dict[str, np.ndarray], a: str, b: str, c: str) -> float:
-        return bond_angle_numpy(template[a], template[b], template[c])
+    def tpl_bond_angle(template, a, b, c):
+        return _bond_angle(template[a], template[b], template[c])
 
-    def dihedral(template: dict[str, np.ndarray], a: str, b: str, c: str, d: str) -> float:
-        return float(dihedral_rad(template[a], template[b], template[c], template[d]))
+    def tpl_dihedral(template, a, b, c, d):
+        return _dihedral_rad(template[a], template[b], template[c], template[d])
 
     keys_3d = ('c1', 'o4', 'c2_ref', 'c4_ref', 'chi_n', 'chi_c')
     keys_1d = (
@@ -113,18 +113,18 @@ def get_template_tensors(device_str: str) -> dict[str, torch.Tensor]:
             rows_3d['chi_c'].append(template['C2'])
 
         rows_1d['bl_c2_c1'].append(bond_length(template, "C2'", "C1'"))
-        rows_1d['ba_o4_c1_c2'].append(bond_angle(template, "O4'", "C1'", "C2'"))
+        rows_1d['ba_o4_c1_c2'].append(tpl_bond_angle(template, "O4'", "C1'", "C2'"))
         rows_1d['bl_c3_c2'].append(bond_length(template, "C3'", "C2'"))
-        rows_1d['ba_c1_c2_c3'].append(bond_angle(template, "C1'", "C2'", "C3'"))
+        rows_1d['ba_c1_c2_c3'].append(tpl_bond_angle(template, "C1'", "C2'", "C3'"))
         rows_1d['bl_c4_c3'].append(bond_length(template, "C4'", "C3'"))
-        rows_1d['ba_c2_c3_c4'].append(bond_angle(template, "C2'", "C3'", "C4'"))
+        rows_1d['ba_c2_c3_c4'].append(tpl_bond_angle(template, "C2'", "C3'", "C4'"))
         rows_1d['bl_c5_c4'].append(bond_length(template, "C5'", "C4'"))
-        rows_1d['ba_c3_c4_c5'].append(bond_angle(template, "C3'", "C4'", "C5'"))
-        rows_1d['psi_c5'].append(dihedral(template, "O4'", "C3'", "C4'", "C5'"))
+        rows_1d['ba_c3_c4_c5'].append(tpl_bond_angle(template, "C3'", "C4'", "C5'"))
+        rows_1d['psi_c5'].append(tpl_dihedral(template, "O4'", "C3'", "C4'", "C5'"))
         rows_1d['bl_o5_c5'].append(bond_length(template, "O5'", "C5'"))
-        rows_1d['ba_c4_c5_o5'].append(bond_angle(template, "C4'", "C5'", "O5'"))
+        rows_1d['ba_c4_c5_o5'].append(tpl_bond_angle(template, "C4'", "C5'", "O5'"))
         rows_1d['bl_o3_c3'].append(bond_length(template, "O3'", "C3'"))
-        rows_1d['ba_c4_c3_o3'].append(bond_angle(template, "C4'", "C3'", "O3'"))
+        rows_1d['ba_c4_c3_o3'].append(tpl_bond_angle(template, "C4'", "C3'", "O3'"))
         po5_len = bond_length(template, 'P', "O5'")
         rows_1d['r_po3'].append(po5_len)
         rows_1d['bond_p_o5'].append(po5_len)
@@ -132,15 +132,15 @@ def get_template_tensors(device_str: str) -> dict[str, torch.Tensor]:
         rows_1d['tpl_o3_sep_p'].append(bond_length(template, "O3'", 'P'))
         rows_1d['bl_op1'].append(bond_length(template, 'P', 'OP1'))
         rows_1d['bl_op2'].append(bond_length(template, 'P', 'OP2'))
-        rows_1d['ang_op1'].append(bond_angle(template, "O5'", 'P', 'OP1'))
-        rows_1d['ang_op2'].append(bond_angle(template, "O5'", 'P', 'OP2'))
-        rows_1d['psi_op1'].append(dihedral(template, "O3'", "O5'", 'P', 'OP1'))
-        rows_1d['psi_op2'].append(dihedral(template, "O3'", "O5'", 'P', 'OP2'))
-        rows_1d['psi_o3'].append(dihedral(template, "C5'", "C4'", "C3'", "O3'"))
-        rows_1d['psi_o3_ring'].append(dihedral(template, "O4'", "C4'", "C3'", "O3'"))
+        rows_1d['ang_op1'].append(tpl_bond_angle(template, "O5'", 'P', 'OP1'))
+        rows_1d['ang_op2'].append(tpl_bond_angle(template, "O5'", 'P', 'OP2'))
+        rows_1d['psi_op1'].append(tpl_dihedral(template, "O3'", "O5'", 'P', 'OP1'))
+        rows_1d['psi_op2'].append(tpl_dihedral(template, "O3'", "O5'", 'P', 'OP2'))
+        rows_1d['psi_o3'].append(tpl_dihedral(template, "C5'", "C4'", "C3'", "O3'"))
+        rows_1d['psi_o3_ring'].append(tpl_dihedral(template, "O4'", "C4'", "C3'", "O3'"))
         rows_1d['bl_o4_c4'].append(bond_length(template, "O4'", "C4'"))
-        rows_1d['ba_c1_o4_c4'].append(bond_angle(template, "C1'", "O4'", "C4'"))
-        rows_1d['ba_o4_c4_c3'].append(bond_angle(template, "O4'", "C4'", "C3'"))
+        rows_1d['ba_c1_o4_c4'].append(tpl_bond_angle(template, "C1'", "O4'", "C4'"))
+        rows_1d['ba_o4_c4_c3'].append(tpl_bond_angle(template, "O4'", "C4'", "C3'"))
         v2 = template["C2'"] - template["O4'"]
         v3 = template["C3'"] - template["O4'"]
         v4 = template["C4'"] - template["O4'"]

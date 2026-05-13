@@ -9,13 +9,13 @@ import torch
 
 from .data import BACKBONE_ATOMS
 from .geometry import (
-    bond_angle_numpy,
-    bond_angle_torch,
-    dihedral_rad_torch,
+    bond_angle,
+    dihedral_rad,
     get_template,
     get_template_tensors,
-    wrap_dihedral_diff_torch,
+    wrap_dihedral_diff,
 )
+from .geometry.primitives import _bond_angle
 from .torsion_constants import (
     TOR_ALPHA,
     TOR_BETA,
@@ -36,7 +36,7 @@ CLOSURE_FAIL_THRESHOLD_TORSION_SIGMA = 3.0
 _PAIR_BRIDGE_ANGLE_CACHE: Optional[np.ndarray] = None
 
 
-def canonical_two_residue_bridge_positions_numpy(rest_prev: str, rest_next: str) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+def canonical_two_residue_bridge_positions(rest_prev: str, rest_next: str) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """Prev / next backbone for a contiguous pair (prev O3' at origin).
 
     Next residue is placed as a rigid translate of ``rest_next`` aligned so ``P_next``
@@ -67,23 +67,23 @@ def canonical_two_residue_bridge_positions_numpy(rest_prev: str, rest_next: str)
     return prev, nxt
 
 
-def paired_bridge_corner_angles_numpy(rest_prev: str, rest_next: str) -> tuple[float, float, float]:
+def paired_bridge_corner_angles(rest_prev: str, rest_next: str) -> tuple[float, float, float]:
     """Three bridge-angle targets at residue boundary (prev → next), radians.
 
     Must match angles in ``compute_bridge_closure_loss``::
         ∠(C3'ᵢ,O3'ᵢ,Pᵢ₊₁), ∠(O3'ᵢ,Pᵢ₊₁,O5'ᵢ₊₁), ∠(Pᵢ₊₁,O5'ᵢ₊₁,C5'ᵢ₊₁).
     These differ from naive single-template corners that use intra-residue C3–O3–P_same.
     """
-    prev, nxt = canonical_two_residue_bridge_positions_numpy(rest_prev, rest_next)
+    prev, nxt = canonical_two_residue_bridge_positions(rest_prev, rest_next)
     c3_p = prev["C3'"]
     o3_p = prev["O3'"]
     p_n = nxt['P']
     o5_n = nxt["O5'"]
     c5_n = nxt["C5'"]
     return (
-        bond_angle_numpy(c3_p, o3_p, p_n),
-        bond_angle_numpy(o3_p, p_n, o5_n),
-        bond_angle_numpy(p_n, o5_n, c5_n),
+        _bond_angle(c3_p, o3_p, p_n),
+        _bond_angle(o3_p, p_n, o5_n),
+        _bond_angle(p_n, o5_n, c5_n),
     )
 
 
@@ -96,7 +96,7 @@ def _paired_bridge_corner_angles_lookup() -> np.ndarray:
     tbl = np.zeros((4, 4, 3), dtype=np.float64)
     for ip, rp in enumerate(_BASE_LETTERS):
         for jn, rn in enumerate(_BASE_LETTERS):
-            a1, a2, a3 = paired_bridge_corner_angles_numpy(rp, rn)
+            a1, a2, a3 = paired_bridge_corner_angles(rp, rn)
             tbl[ip, jn, 0] = a1
             tbl[ip, jn, 1] = a2
             tbl[ip, jn, 2] = a3
@@ -105,7 +105,7 @@ def _paired_bridge_corner_angles_lookup() -> np.ndarray:
 
 
 @functools.lru_cache(maxsize=None)
-def _paired_bridge_corner_angles_torch(
+def _paired_bridge_corner_angles(
     device_str: str,
     dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -124,15 +124,15 @@ def canonical_two_residue_bridge_bb_tensor(
         device: torch.device | str = 'cpu',
 ) -> torch.Tensor:
     """Aligned with ``tests.test_bridge_closure_loss._ideal_bridge_bb_and_targets`` layout ``[2, n_bb, 3]``."""
-    dev = device if isinstance(device, torch.device) else torch.device(device)
-    prev, nxt = canonical_two_residue_bridge_positions_numpy(rest_prev, rest_next)
+    device = device if isinstance(device, torch.device) else torch.device(device)
+    prev, nxt = canonical_two_residue_bridge_positions(rest_prev, rest_next)
     name_to_j = {nm: j for j, nm in enumerate(BACKBONE_ATOMS)}
-    bb = torch.full((2, len(BACKBONE_ATOMS), 3), float('nan'), dtype=dtype, device=dev)
+    bb = torch.full((2, len(BACKBONE_ATOMS), 3), float('nan'), dtype=dtype, device=device)
     for nm, j in name_to_j.items():
         if nm in prev:
-            bb[0, j] = torch.as_tensor(prev[nm], dtype=dtype, device=dev)
+            bb[0, j] = torch.as_tensor(prev[nm], dtype=dtype, device=device)
         if nm in nxt:
-            bb[1, j] = torch.as_tensor(nxt[nm], dtype=dtype, device=dev)
+            bb[1, j] = torch.as_tensor(nxt[nm], dtype=dtype, device=device)
     return bb
 
 
@@ -155,7 +155,7 @@ def compute_bridge_closure_loss(
     Parameters
     ----------
     bb_xyz_world
-        ``[B, W, n_bb, 3]`` world coordinates (order matches ``bbregen.data.BACKBONE_ATOMS``).
+        ``[B, W, n_bb, 3]`` world coordinates (order matches ``base2backbone.data.BACKBONE_ATOMS``).
     target_torsions
         ``[B, W, N_TORSIONS]`` reference torsions (ε, ζ on residue i; α, β on i+1).
     torsion_mask
@@ -194,20 +194,20 @@ def compute_bridge_closure_loss(
     thr_t = float(g.get('fail_threshold_torsion_sigma', CLOSURE_FAIL_THRESHOLD_TORSION_SIGMA))
 
     eps = float(g.get('eps', 1e-8))
-    dev = bb_xyz_world.device
+    device = bb_xyz_world.device
     dtype = bb_xyz_world.dtype
 
     def _zero() -> torch.Tensor:
         if grad_prop_tensor is not None:
             return grad_prop_tensor.sum() * 0.0
-        return torch.zeros((), device=dev, dtype=dtype)
+        return torch.zeros((), device=device, dtype=dtype)
 
     if bb_xyz_world.dim() != 4:
         raise ValueError(f'Expected bb_xyz_world [B,W,n_bb,3], got {tuple(bb_xyz_world.shape)}')
     B, W, n_bb, _ = bb_xyz_world.shape
     if W < 2:
         z = _zero()
-        zf = torch.zeros((), device=dev, dtype=dtype)
+        zf = torch.zeros((), device=device, dtype=dtype)
         return {
             'closure_loss': z,
             'closure_bond_loss': z,
@@ -233,7 +233,7 @@ def compute_bridge_closure_loss(
     tgt_prev = target_torsions[:, :-1]
     tgt_curr = target_torsions[:, 1:]
 
-    pair_gate = torch.ones(B, W - 1, dtype=torch.bool, device=dev)
+    pair_gate = torch.ones(B, W - 1, dtype=torch.bool, device=device)
     if same_chain_mask is not None:
         pair_gate = pair_gate & same_chain_mask
     if valid_pair_mask is not None:
@@ -288,7 +288,7 @@ def compute_bridge_closure_loss(
     ri_next = restype_indices[:, 1:].long()
     ri_prev = restype_indices[:, :-1].long()
 
-    tc = get_template_tensors(str(dev))
+    tc = get_template_tensors(str(device))
     d0_o3p = tc['bond_p_o3_inter'][ri_next]
     d0_po5 = tc['bond_p_o5'][ri_next]
 
@@ -296,30 +296,30 @@ def compute_bridge_closure_loss(
     d2 = (o5_n - p_n).norm(dim=-1)
     bond_sq = ((d1 - d0_o3p) / (sigma_d + eps)) ** 2 + ((d2 - d0_po5) / (sigma_d + eps)) ** 2
 
-    ang_lut = _paired_bridge_corner_angles_torch(str(dev), dtype)
+    ang_lut = _paired_bridge_corner_angles(str(device), dtype)
 
     ar_angle1 = ang_lut[ri_prev.long(), ri_next.long(), 0]
     ar_angle2 = ang_lut[ri_prev.long(), ri_next.long(), 1]
     ar_angle3 = ang_lut[ri_prev.long(), ri_next.long(), 2]
 
-    a1 = bond_angle_torch(c3_p, o3_p, p_n, eps)
-    a2 = bond_angle_torch(o3_p, p_n, o5_n, eps)
-    a3 = bond_angle_torch(p_n, o5_n, c5_n, eps)
+    a1 = bond_angle(c3_p, o3_p, p_n, eps)
+    a2 = bond_angle(o3_p, p_n, o5_n, eps)
+    a3 = bond_angle(p_n, o5_n, c5_n, eps)
     angle_sq = (
         ((a1 - ar_angle1) / (sigma_a + eps)) ** 2
         + ((a2 - ar_angle2) / (sigma_a + eps)) ** 2
         + ((a3 - ar_angle3) / (sigma_a + eps)) ** 2
     )
 
-    eps_pred = dihedral_rad_torch(c4_p, c3_p, o3_p, p_n)
-    ze_pred = dihedral_rad_torch(c3_p, o3_p, p_n, o5_n)
-    al_pred = dihedral_rad_torch(o3_p, p_n, o5_n, c5_n)
-    be_pred = dihedral_rad_torch(p_n, o5_n, c5_n, c4_n)
+    eps_pred = dihedral_rad(c4_p, c3_p, o3_p, p_n)
+    ze_pred = dihedral_rad(c3_p, o3_p, p_n, o5_n)
+    al_pred = dihedral_rad(o3_p, p_n, o5_n, c5_n)
+    be_pred = dihedral_rad(p_n, o5_n, c5_n, c4_n)
 
-    e_eps = wrap_dihedral_diff_torch(eps_pred, tgt_prev[..., TOR_EPS])
-    e_ze = wrap_dihedral_diff_torch(ze_pred, tgt_prev[..., TOR_ZETA])
-    e_al = wrap_dihedral_diff_torch(al_pred, tgt_curr[..., TOR_ALPHA])
-    e_be = wrap_dihedral_diff_torch(be_pred, tgt_curr[..., TOR_BETA])
+    e_eps = wrap_dihedral_diff(eps_pred, tgt_prev[..., TOR_EPS])
+    e_ze = wrap_dihedral_diff(ze_pred, tgt_prev[..., TOR_ZETA])
+    e_al = wrap_dihedral_diff(al_pred, tgt_curr[..., TOR_ALPHA])
+    e_be = wrap_dihedral_diff(be_pred, tgt_curr[..., TOR_BETA])
 
     torsion_sq = (
         (e_eps / (sigma_t + eps)) ** 2
@@ -359,7 +359,7 @@ def compute_bridge_closure_loss(
 
     if not bridge_ok.any():
         z = _zero()
-        zf = torch.zeros((), device=dev, dtype=dtype)
+        zf = torch.zeros((), device=device, dtype=dtype)
         return {
             'closure_loss': z,
             'closure_bond_loss': z,
@@ -388,7 +388,7 @@ def compute_bridge_closure_loss(
     valid_frac = n_ok / bb_xyz_world.new_tensor(n_br)
     fail_rate = viol.float().sum() / (n_ok + eps)
 
-    rad2deg = torch.tensor(180.0 / math.pi, device=dev, dtype=dtype)
+    rad2deg = torch.tensor(180.0 / math.pi, device=device, dtype=dtype)
 
     return {
         'closure_loss': closure,

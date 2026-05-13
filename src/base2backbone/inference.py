@@ -19,14 +19,12 @@ from .data import (
     FIVE_PRIME_PHOSPHATE_ATOMS,
     parse_dna,
 )
-from .geometry import build_batch_window_backbone_from_torsions_torch
+from .geometry import build_batch_window_backbone_from_torsions
 from .io import default_atoms_provider, inference_atoms_provider
-from .onnx_runtime import OnnxSampler
-from .runtime import MODEL_DIR
+from .onnx_inference import OnnxSampler
+from .runtime import MODEL_DIR, PROGRESS_BAR_COLOR
 from .torsion_constants import N_TORSIONS, TAU_M_MAX, TAU_M_MIN, TOR_ALPHA, TOR_EPS, TOR_ZETA
 from tqdm import tqdm
-
-from .utils import PBAR_COLOR
 
 WINDOW_SIZE = 3
 
@@ -90,7 +88,7 @@ def _predict_full_window_predictions_dict(model, sample_data, device) -> dict[An
     origins_w = sample_data.nt_origins_world.float().unsqueeze(0).to(device)
     frames_w = sample_data.nt_frames_world.float().unsqueeze(0).to(device)
 
-    bb_t = build_batch_window_backbone_from_torsions_torch(
+    bb_t = build_batch_window_backbone_from_torsions(
         theta_w, tau_w, ri, origins_w, frames_w, mask,
     )
 
@@ -169,7 +167,7 @@ def predict_backbone(
                 desc='Backbone inference',
                 leave=False,
                 disable=not show_progress,
-                colour=PBAR_COLOR,
+                colour=PROGRESS_BAR_COLOR,
         ):
             widx, _tidx = _window_tidx_for_chain_index(L, j)
             if widx not in w_by_start:

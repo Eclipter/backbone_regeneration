@@ -7,46 +7,30 @@ from typing import Any, Optional, cast
 import numpy as np
 import torch
 
-from .torsion_constants import (N_LATENT, N_TORSIONS, N_TORSIONS_LATENT,
-                                TOR_ALPHA, TOR_BETA, TOR_CHI, TOR_EPS,
-                                TOR_GAMMA, TOR_PUCKER_P, TOR_ZETA,
-                                TORSION_IS_CIRCULAR, TORSION_NAMES)
-
-
-def world_to_local_points(
-    x_world: torch.Tensor,
-    origin: torch.Tensor,
-    frame: torch.Tensor,
-) -> torch.Tensor:
-    """Row-vector convention: ``local = (world - origin) @ frame`` (same as training frames)."""
-    d = x_world - _expand_point_origin(origin, x_world)
-    if frame.dim() == 2:
-        return torch.matmul(d, frame)
-    return torch.matmul(d.unsqueeze(-2), _expand_point_frame(frame, d)).squeeze(-2)
-
-
-def local_to_world_points(
-    x_local: torch.Tensor,
-    origin: torch.Tensor,
-    frame: torch.Tensor,
-) -> torch.Tensor:
-    """Row-vector convention: ``world = local @ frame.T + origin``."""
-    r = frame.transpose(-2, -1)
-    origin_exp = _expand_point_origin(origin, x_local)
-    if frame.dim() == 2:
-        return torch.matmul(x_local, r) + origin_exp
-    return torch.matmul(
-        x_local.unsqueeze(-2),
-        _expand_point_frame(r, x_local),
-    ).squeeze(-2) + origin_exp
-
-
-world_to_local_torch = world_to_local_points
-local_to_world_torch = local_to_world_points
-
+from ..torsion_constants import (
+    N_TORSIONS,
+    TOR_ALPHA,
+    TOR_BETA,
+    TOR_CHI,
+    TOR_EPS,
+    TOR_GAMMA,
+    TOR_PSEUDOROTATION_PHASE,
+    TOR_ZETA,
+)
+from .primitives import (
+    _bond_angle,
+    _dihedral_rad,
+    dihedral_rad,
+    local_to_world_points,
+    nerf_place,
+    rodrigues_rotate_point,
+    world_to_local_points,
+    wrap_angle_rad,
+    wrap_dihedral_diff,
+)
+from .torsions import nucleotide_torsions
 
 _GEO_EPS = 1e-8
-_GEO_EPS_NP = 1e-12
 _PHI_PHOS_GRID = 128
 _HALF_PI = math.pi / 2.0
 _PSEUDOROTATION_OFFSETS = (
@@ -54,157 +38,10 @@ _PSEUDOROTATION_OFFSETS = (
 )
 
 
-def _expand_point_origin(origin: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
-    while origin.ndim < points.ndim:
-        origin = origin.unsqueeze(-2)
-    return origin
 
 
-def _expand_point_frame(frame: torch.Tensor, points: torch.Tensor) -> torch.Tensor:
-    while frame.ndim < points.ndim + 1:
-        frame = frame.unsqueeze(-3)
-    return frame
 
 
-def wrap_angle_rad(x):
-    """Map angles to (-π, π]."""
-    return np.arctan2(np.sin(x), np.cos(x))
-
-
-def _bond_angle_np(a: np.ndarray, b: np.ndarray, c: np.ndarray) -> float:
-    """Interior angle ∠(a–b–c) in radians."""
-    ba = a - b
-    bc = c - b
-    denom = float(np.linalg.norm(ba)) * float(np.linalg.norm(bc)) + _GEO_EPS_NP
-    cos_t = float(np.dot(ba, bc)) / denom
-    cos_t = float(np.clip(cos_t, -1.0 + 1e-9, 1.0 - 1e-9))
-    return float(np.arccos(cos_t))
-
-
-def _pseudorotation_nus_numpy(P_rad: float, tau_m: float) -> np.ndarray:
-    """Return ν₂…ν₁ cycle from pseudorotation phase/amplitude."""
-    return float(tau_m) * np.cos(float(P_rad) + _PSEUDOROTATION_OFFSETS)
-
-
-def nerf_place(a, b, c, r, theta, psi):
-    """Place D given prior atoms A–B–C, bond C–D length r, interior angle ∠(B–C–D)=theta, dihedral(A,B,C,D)=psi (rad)."""
-    a = np.asarray(a, dtype=np.float64).reshape(3)
-    b = np.asarray(b, dtype=np.float64).reshape(3)
-    c = np.asarray(c, dtype=np.float64).reshape(3)
-    ba = a - b
-    bc = c - b
-    bc_u = bc / (np.linalg.norm(bc) + _GEO_EPS_NP)
-    n = np.cross(ba, bc_u)
-    nn = np.linalg.norm(n)
-    if nn < 1e-10:
-        n = np.array([1.0, 0.0, 0.0], dtype=np.float64)
-    else:
-        n = n / nn
-    m = np.cross(n, bc_u)
-    return c + r * (
-        np.cos(math.pi - theta) * bc_u
-        + np.sin(math.pi - theta) * (np.cos(psi) * n + np.sin(psi) * m)
-    )
-
-
-def nerf_place_torch(
-    a: 'torch.Tensor',  # [B, 3]
-    b: 'torch.Tensor',  # [B, 3]
-    c: 'torch.Tensor',  # [B, 3]
-    r: 'torch.Tensor',  # [B]
-    theta: 'torch.Tensor',  # [B]
-    psi: 'torch.Tensor',    # [B]
-) -> 'torch.Tensor':        # [B, 3]
-    """Batched differentiable NERF. Mirrors nerf_place exactly."""
-    import torch
-    ba = a - b
-    bc = c - b
-    bc_u = bc / (bc.norm(dim=-1, keepdim=True) + _GEO_EPS_NP)
-    n = torch.linalg.cross(ba, bc_u)
-    nn = n.norm(dim=-1, keepdim=True)
-    fallback = torch.zeros_like(n)
-    fallback[..., 0] = 1.0
-    n = torch.where(nn < 1e-10, fallback, n / (nn + _GEO_EPS_NP))
-    m = torch.linalg.cross(n, bc_u)
-    r_ = r.unsqueeze(-1)
-    return c + r_ * (
-        torch.cos(theta.new_tensor(math.pi) - theta).unsqueeze(-1) * bc_u
-        + torch.sin(theta.new_tensor(math.pi) - theta).unsqueeze(-1) * (
-            torch.cos(psi).unsqueeze(-1) * n
-            + torch.sin(psi).unsqueeze(-1) * m
-        )
-    )
-
-
-def dihedral_rad(p0, p1, p2, p3):
-    """Signed dihedral angle (radians) for points p0–p3 (column vectors in R^3)."""
-    b1 = p1 - p0
-    b2 = p2 - p1
-    b3 = p3 - p2
-    n1 = np.cross(b1, b2)
-    n2 = np.cross(b2, b3)
-    n1_u = n1 / (np.linalg.norm(n1) + _GEO_EPS_NP)
-    n2_u = n2 / (np.linalg.norm(n2) + _GEO_EPS_NP)
-    m1 = np.cross(n1_u, b2 / (np.linalg.norm(b2) + _GEO_EPS_NP))
-    x = np.dot(n1_u, n2_u)
-    y = np.dot(m1, n2_u)
-    return float(np.arctan2(y, x))
-
-
-def close_phosphate_bridge(
-    o3: np.ndarray,
-    o5: np.ndarray,
-    c5: np.ndarray,
-    r_o3p: float,
-    r_po5: float,
-    alpha_hint: float,
-) -> np.ndarray:
-    """Place P on the O3'–O5' intersecting circle matching O3'–P and P–O5' lengths.
-
-    Picks the point whose α dihedral O3'–P–O5'–C5' best matches ``alpha_hint``.
-    """
-    o3 = np.asarray(o3, dtype=np.float64).reshape(3)
-    o5 = np.asarray(o5, dtype=np.float64).reshape(3)
-    c5 = np.asarray(c5, dtype=np.float64).reshape(3)
-    d = float(np.linalg.norm(o5 - o3))
-    sum_l = r_o3p + r_po5
-    diff_l = abs(r_o3p - r_po5)
-    eps = 1e-12
-    if d > sum_l + eps or d < diff_l - eps:
-        o5_minus_o3 = o5 - o3
-        dn = float(np.linalg.norm(o5_minus_o3))
-        if dn < eps:
-            return o3.copy()
-        return o3 + o5_minus_o3 * (r_o3p / sum_l)
-    a = (r_o3p * r_o3p - r_po5 * r_po5 + d * d) / (2.0 * d)
-    h = float(np.sqrt(max(r_o3p * r_o3p - a * a, 0.0)))
-    axis = (o5 - o3) / d
-    midpoint = o3 + a * axis
-    tmp = (
-        np.array([1.0, 0.0, 0.0], dtype=np.float64)
-        if abs(axis[0]) < 0.9
-        else np.array([0.0, 1.0, 0.0], dtype=np.float64)
-    )
-    v1 = np.cross(tmp, axis)
-    v1n = float(np.linalg.norm(v1))
-    if v1n < eps:
-        v1 = np.cross(np.array([0.0, 0.0, 1.0], dtype=np.float64), axis)
-        v1n = float(np.linalg.norm(v1))
-    v1 = v1 / v1n
-    v2 = np.cross(axis, v1)
-
-    n_samples = 360
-    best_t = 0.0
-    best_err = float('inf')
-    for k in range(n_samples):
-        t = 2.0 * np.pi * k / n_samples
-        p_t = midpoint + h * (np.cos(t) * v1 + np.sin(t) * v2)
-        dihed = dihedral_rad(o3, p_t, o5, c5)
-        err = abs(wrap_angle_rad(dihed - alpha_hint))
-        if err < best_err:
-            best_err = err
-            best_t = t
-    return midpoint + h * (np.cos(best_t) * v1 + np.sin(best_t) * v2)
 
 
 _RING_TORSION_DEFS = [
@@ -217,7 +54,7 @@ _RING_TORSION_DEFS = [
 _RING_ANGLES = 2.0 * 2.0 * math.pi * np.arange(5, dtype=np.float64) / 5.0
 
 
-def pseudorotation_P_rad_from_nus(nu_deg):
+def pseudorotation_phase_rad_from_nus(nu_deg):
     """MDAnalysis `phase_as` phase angle in radians from five endocyclic torsions (degrees)."""
     nu = np.asarray(nu_deg, dtype=np.float64)
     B = np.dot(nu, np.sin(_RING_ANGLES)) * (-2.0 / 5.0)
@@ -234,89 +71,6 @@ def pucker_amplitude_rad(nu_deg, P_rad):
     den = float(np.dot(c, c)) + 1e-12
     tau = float(np.dot(nu, c) / np.sqrt(den))
     return abs(tau)
-
-
-def _chi_quads(base_one_letter):
-    if base_one_letter in ('A', 'G'):
-        return ("O4'", "C1'", "N9", "C4")
-    return ("O4'", "C1'", "N1", "C2")
-
-
-def nucleotide_torsions_numpy(
-    xyz_by_name_cur,
-    xyz_by_name_prev,
-    xyz_by_name_next,
-    base_one_letter,
-):
-    """Return (torsions [N_TORSIONS], mask [N_TORSIONS], tau_m [rad], tau_m_valid).
-
-    tau_m_valid is False when sugar ring ν torsions were incomplete.
-    """
-
-    def g(d, name):
-        if d is None or name not in d:
-            return None
-        return np.asarray(d[name], dtype=np.float64).reshape(3)
-
-    t = np.zeros(N_TORSIONS, dtype=np.float64)
-    m = np.zeros(N_TORSIONS, dtype=bool)
-
-    o3_prev = g(xyz_by_name_prev, "O3'")
-    p_c = g(xyz_by_name_cur, 'P')
-    o5 = g(xyz_by_name_cur, "O5'")
-    c5 = g(xyz_by_name_cur, "C5'")
-    c4 = g(xyz_by_name_cur, "C4'")
-    c3 = g(xyz_by_name_cur, "C3'")
-    o3_c = g(xyz_by_name_cur, "O3'")
-    p_next = g(xyz_by_name_next, 'P')
-    o5_next = g(xyz_by_name_next, "O5'")
-
-    # α O3'(i-1)–P–O5'–C5'
-    if all(x is not None for x in (o3_prev, p_c, o5, c5)):
-        t[TOR_ALPHA] = dihedral_rad(o3_prev, p_c, o5, c5)
-        m[TOR_ALPHA] = True
-    # β P–O5'–C5'–C4'
-    if all(x is not None for x in (p_c, o5, c5, c4)):
-        t[TOR_BETA] = dihedral_rad(p_c, o5, c5, c4)
-        m[TOR_BETA] = True
-    # γ O5'–C5'–C4'–C3'
-    if all(x is not None for x in (o5, c5, c4, c3)):
-        t[TOR_GAMMA] = dihedral_rad(o5, c5, c4, c3)
-        m[TOR_GAMMA] = True
-    # ε C4'–C3'–O3'–P(i+1)
-    if all(x is not None for x in (c4, c3, o3_c, p_next)):
-        t[TOR_EPS] = dihedral_rad(c4, c3, o3_c, p_next)
-        m[TOR_EPS] = True
-    # ζ C3'–O3'–P(i+1)–O5'(i+1)
-    if all(x is not None for x in (c3, o3_c, p_next, o5_next)):
-        t[TOR_ZETA] = dihedral_rad(c3, o3_c, p_next, o5_next)
-        m[TOR_ZETA] = True
-
-    o4 = g(xyz_by_name_cur, "O4'")
-    c1 = g(xyz_by_name_cur, "C1'")
-    a0, a1, a2, a3 = _chi_quads(base_one_letter)
-    ap2 = g(xyz_by_name_cur, a2)
-    ap3 = g(xyz_by_name_cur, a3)
-    if all(x is not None for x in (o4, c1, ap2, ap3)):
-        t[TOR_CHI] = dihedral_rad(o4, c1, ap2, ap3)
-        m[TOR_CHI] = True
-
-    nu_deg = []
-    for a0n, a1n, a2n, a3n in _RING_TORSION_DEFS:
-        pts = [g(xyz_by_name_cur, a0n), g(xyz_by_name_cur, a1n), g(xyz_by_name_cur, a2n), g(xyz_by_name_cur, a3n)]
-        if not all(x is not None for x in pts):
-            nu_deg = None
-            break
-        nu_deg.append(float(np.degrees(dihedral_rad(pts[0], pts[1], pts[2], pts[3]))))
-    tau_m_val = 0.0
-    if nu_deg is not None:
-        nu_arr = np.asarray(nu_deg, dtype=np.float64)
-        P_rad = pseudorotation_P_rad_from_nus(nu_arr)
-        t[TOR_PUCKER_P] = P_rad
-        m[TOR_PUCKER_P] = True
-        tau_m_val = float(pucker_amplitude_rad(nu_arr, P_rad))
-    tau_m_valid = nu_deg is not None
-    return t, m, tau_m_val, tau_m_valid
 
 
 # Cache template atom dicts per restype to avoid repeated pynamod calls.
@@ -342,7 +96,7 @@ def _get_template(restype: str) -> 'dict[str, np.ndarray]':
     # Compute canonical ring amplitude τm_AS = sqrt(2/5 · Σ νₖ²) from template.
     # This is consistent with the A-S inverse formula νₖ = τm cos(P + offsets[k]).
     nu_rad = np.array([
-        dihedral_rad(tpl[q[0]], tpl[q[1]], tpl[q[2]], tpl[q[3]])
+        _dihedral_rad(tpl[q[0]], tpl[q[1]], tpl[q[2]], tpl[q[3]])
         for q in _RING_TORSION_DEFS
     ])
     _template_tau_m[restype] = float(np.sqrt(0.4 * float(np.dot(nu_rad, nu_rad))))
@@ -357,7 +111,6 @@ def _get_template_tensors(device_str: str) -> dict:
     All tensors have shape [4, ...] — one entry per restype in order A C G T.
     Cached per device string; call once per device.
     """
-    import torch
     device = torch.device(device_str)
     restypes = ['A', 'C', 'G', 'T']
 
@@ -365,10 +118,10 @@ def _get_template_tensors(device_str: str) -> dict:
         return float(np.linalg.norm(tpl[a] - tpl[b]))
 
     def _ba(tpl, a, b, c):
-        return _bond_angle_np(tpl[a], tpl[b], tpl[c])
+        return _bond_angle(tpl[a], tpl[b], tpl[c])
 
     def _dr(tpl, a, b, c, d):
-        return float(dihedral_rad(tpl[a], tpl[b], tpl[c], tpl[d]))
+        return _dihedral_rad(tpl[a], tpl[b], tpl[c], tpl[d])
 
     keys_3d = ['c1', 'o4', 'c2_ref', 'c4_ref', 'chi_n', 'chi_c']
     keys_1d = [
@@ -474,64 +227,23 @@ def _orthonormal_basis_from_axis(
     return u, e1, e2
 
 
-def dihedral_rad_torch(
-    p0: torch.Tensor,
-    p1: torch.Tensor,
-    p2: torch.Tensor,
-    p3: torch.Tensor,
-) -> torch.Tensor:
-    """Batched signed dihedral in radians; shapes broadcast to [..., 3]."""
-    b1 = p1 - p0
-    b2 = p2 - p1
-    b3 = p3 - p2
-    n1 = torch.linalg.cross(b1, b2)
-    n2 = torch.linalg.cross(b2, b3)
-    b2u = b2 / (b2.norm(dim=-1, keepdim=True) + _GEO_EPS)
-    n1n = n1.norm(dim=-1, keepdim=True) + _GEO_EPS
-    n2n = n2.norm(dim=-1, keepdim=True) + _GEO_EPS
-    n1u = n1 / n1n
-    n2u = n2 / n2n
-    m1 = torch.linalg.cross(n1u, b2u)
-    x = (n1u * n2u).sum(dim=-1)
-    y = (m1 * n2u).sum(dim=-1)
-    return torch.atan2(y, x)
 
 
-def _bond_angle_torch(
-    a: torch.Tensor,
-    b: torch.Tensor,
-    c: torch.Tensor,
-    eps: float = _GEO_EPS,
-) -> torch.Tensor:
-    """Interior angle ∠(a–b–c) in radians; batched last dim 3."""
-    ba = a - b
-    bc = c - b
-    denom = ba.norm(dim=-1) * bc.norm(dim=-1) + eps
-    cos_t = (ba * bc).sum(dim=-1) / denom
-    cos_t = cos_t.clamp(-1.0 + eps, 1.0 - eps)
-    return torch.acos(cos_t)
-
-
-def wrap_dihedral_diff_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    d = (a - b + torch.pi) % (2.0 * torch.pi) - torch.pi
-    return d
-
-
-def nus_rad_from_P_tau_torch(
+def nus_rad_from_phase_and_amplitude(
     P_rad: torch.Tensor,
     tau_m: torch.Tensor,
 ) -> torch.Tensor:
     """Five endocyclic ν (rad) in the same order as _RING_TORSION_DEFS (ν₂…ν₁ cycle)."""
     p = P_rad.reshape(-1, 1)
     t = tau_m.reshape(-1, 1)
-    offs = _pseudorotation_offsets_torch(str(P_rad.device), P_rad.dtype)
+    offs = _pseudorotation_offsets(str(P_rad.device), P_rad.dtype)
     return t * torch.cos(p + offs.unsqueeze(0))
 
 
-pseudorotation_to_nus_torch = nus_rad_from_P_tau_torch
+phase_and_amplitude_to_nus = nus_rad_from_phase_and_amplitude
 
 
-def _ring_dihedrals_from_coords_torch(
+def _ring_dihedrals_from_coords(
     ring_atoms: dict[str, torch.Tensor],
 ) -> torch.Tensor:
     """[B, 5] dihedrals in _RING_TORSION_DEFS order."""
@@ -539,7 +251,7 @@ def _ring_dihedrals_from_coords_torch(
     out = []
     for a0n, a1n, a2n, a3n in names:
         out.append(
-            dihedral_rad_torch(
+            dihedral_rad(
                 ring_atoms[a0n], ring_atoms[a1n],
                 ring_atoms[a2n], ring_atoms[a3n],
             ).unsqueeze(-1),
@@ -547,9 +259,9 @@ def _ring_dihedrals_from_coords_torch(
     return torch.cat(out, dim=-1)
 
 
-def sugar_ring_torsions_torch(atoms: dict[str, torch.Tensor]) -> torch.Tensor:
-    """Endocyclic ν₀…ν₄ (rad) in ``_RING_TORSION_DEFS`` order; same convention as ``pseudorotation_to_nus_torch``."""
-    return _ring_dihedrals_from_coords_torch(atoms)
+def sugar_ring_torsions(atoms: dict[str, torch.Tensor]) -> torch.Tensor:
+    """Endocyclic ν₀…ν₄ (rad) in ``_RING_TORSION_DEFS`` order; same convention as ``phase_and_amplitude_to_nus``."""
+    return _ring_dihedrals_from_coords(atoms)
 
 
 def signed_tetra_volume(
@@ -562,24 +274,9 @@ def signed_tetra_volume(
     return (torch.linalg.cross(b - a, c - a, dim=-1) * (d - a)).sum(dim=-1)
 
 
-def _rodrigues_rotate_point_torch(
-    v: torch.Tensor,
-    k: torch.Tensor,
-    theta: torch.Tensor,
-) -> torch.Tensor:
-    """Rotate vectors v [...,3] around unit axes k [...,3] by theta [...]."""
-    cos_t = torch.cos(theta)
-    sin_t = torch.sin(theta)
-    cross = torch.linalg.cross(k, v, dim=-1)
-    dot = (k * v).sum(dim=-1, keepdim=True)
-    return (
-        v * cos_t.unsqueeze(-1)
-        + cross * sin_t.unsqueeze(-1)
-        + k * dot * (1.0 - cos_t.unsqueeze(-1))
-    )
 
 
-def _apply_chi_rotation_to_sugar_ring_torch(
+def _apply_chi_rotation_to_sugar_ring(
     ring: dict[str, torch.Tensor],
     chi_target: torch.Tensor,
     n_atom: torch.Tensor,
@@ -591,12 +288,12 @@ def _apply_chi_rotation_to_sugar_ring_torch(
     axis = n_atom - c1
     axn = axis.norm(dim=-1, keepdim=True).clamp(min=_GEO_EPS)
     u = axis / axn
-    chi_meas = dihedral_rad_torch(o4, c1, n_atom, c_atom)
-    dchi = wrap_dihedral_diff_torch(chi_target, chi_meas)
+    chi_meas = dihedral_rad(o4, c1, n_atom, c_atom)
+    dchi = wrap_dihedral_diff(chi_target, chi_meas)
     out = dict(ring)
     for nm in ("O4'", "C2'", "C3'", "C4'"):
         v = ring[nm] - c1
-        out[nm] = _rodrigues_rotate_point_torch(v, u, dchi) + c1
+        out[nm] = rodrigues_rotate_point(v, u, dchi) + c1
     return out
 
 
@@ -657,12 +354,9 @@ def _calibrate_planar_sugar_from_pts(pts_mean: np.ndarray) -> dict[str, Any]:
     def _ring_dict_from_xyz(pos: np.ndarray) -> dict[str, np.ndarray]:
         return {ATOM_ORDER[j]: pos[j] for j in range(5)}
 
-    def _nus_np(d: dict[str, np.ndarray]) -> np.ndarray:
+    def _ring_nus_from_xyz_dict(d: dict[str, np.ndarray]) -> np.ndarray:
         return np.array(
-            [
-                dihedral_rad(d[a0], d[a1], d[a2], d[a3])
-                for a0, a1, a2, a3 in _RING_TORSION_DEFS
-            ],
+            [_dihedral_rad(d[a0], d[a1], d[a2], d[a3]) for a0, a1, a2, a3 in _RING_TORSION_DEFS],
             dtype=np.float64,
         )
 
@@ -693,7 +387,7 @@ def _calibrate_planar_sugar_from_pts(pts_mean: np.ndarray) -> dict[str, Any]:
                     ],
                     axis=0,
                 )
-                nu_act = _nus_np(_ring_dict_from_xyz(pos))
+                nu_act = _ring_nus_from_xyz_dict(_ring_dict_from_xyz(pos))
                 nu_tgt = tv * np.cos(Pv + base_phases)
                 dnu = np.arctan2(
                     np.sin(nu_act - nu_tgt),
@@ -779,7 +473,7 @@ def _planar_sugar_spec() -> dict[str, Any]:
 
 
 @functools.lru_cache(maxsize=None)
-def _pseudorotation_offsets_torch(
+def _pseudorotation_offsets(
     device_str: str,
     dtype: torch.dtype,
 ) -> torch.Tensor:
@@ -791,7 +485,7 @@ def _pseudorotation_offsets_torch(
 
 
 @functools.lru_cache(maxsize=None)
-def _scalar_constant_torch(
+def _scalar_constant(
     value: float,
     device_str: str,
     dtype: torch.dtype,
@@ -800,7 +494,7 @@ def _scalar_constant_torch(
 
 
 @functools.lru_cache(maxsize=None)
-def _phi_grid_torch(
+def _phi_grid(
     device_str: str,
     dtype: torch.dtype,
     n_grid: int,
@@ -846,7 +540,7 @@ def _template_select(
     return out
 
 
-def sugar_ring_from_xy_z_torch(
+def sugar_ring_from_xy_z(
     xy: torch.Tensor,
     z: torch.Tensor,
     center: torch.Tensor,
@@ -877,7 +571,7 @@ def sugar_ring_from_xy_z_torch(
     return base_exp + z3
 
 
-def build_sugar_ring_closed_form_torch(
+def build_sugar_ring_closed_form(
     chi: torch.Tensor,
     P: torch.Tensor,
     tau_m: torch.Tensor,
@@ -911,16 +605,16 @@ def build_sugar_ring_closed_form_torch(
         squeeze_batch = False
     orig = P.shape
     N = int(P.numel())
-    dev = P.device
+    device = P.device
     dtype = P.dtype
-    dev_str = str(dev)
+    device_str = str(device)
     chi_f = chi.reshape(N)
     P_f = P.reshape(N)
     tm_f = tau_m.reshape(N)
     ri = restype_indices.reshape(N).long()
     tc = g.get('template_tensors')
     if tc is None:
-        tc = _get_template_tensors(dev_str)
+        tc = _get_template_tensors(device_str)
 
     def _g1(key: str) -> torch.Tensor:
         return _template_select(tc, key, ri, dtype=dtype)
@@ -928,7 +622,7 @@ def build_sugar_ring_closed_form_torch(
     # PCA ring: gives P-appropriate 3D positions for all ring atoms.
     spec = g.get('planar_spec_tensors')
     if spec is None:
-        spec = _planar_sugar_spec_tensors(dev_str, dtype)
+        spec = _planar_sugar_spec_tensors(device_str, dtype)
     xy = cast(torch.Tensor, spec['xy'])
     ctr = cast(torch.Tensor, spec['center'])
     e1v = cast(torch.Tensor, spec['e1'])
@@ -941,7 +635,7 @@ def build_sugar_ring_closed_form_torch(
     z = z_sc * tm_f.clamp(min=1e-4).unsqueeze(-1) * torch.cos(
         sgn_p * P_f.unsqueeze(-1) + phases.unsqueeze(0)
     )
-    stacked = sugar_ring_from_xy_z_torch(xy, z, ctr, e1v, e2v, env)  # [N, 5, 3]
+    stacked = sugar_ring_from_xy_z(xy, z, ctr, e1v, e2v, env)  # [N, 5, 3]
     # _SUGAR_RING_BUILD_ATOM_ORDER: C4'=0, O4'=1, C1'=2, C2'=3, C3'=4
 
     # Translate-only: move C1' to template position, preserve P-appropriate O4'/C2' directions.
@@ -954,18 +648,18 @@ def build_sugar_ring_closed_form_torch(
     c2 = c1 + _g1('bl_c2_c1').unsqueeze(-1) * _safe_normalize(stacked[:, 3] + transl - c1)
 
     # ν₁ = dihedral(O4',C1',C2',C3'); ν₂ = dihedral(C1',C2',C3',C4') — AS formula.
-    half_pi = _scalar_constant_torch(_HALF_PI, dev_str, dtype)
-    nus = nus_rad_from_P_tau_torch(P_f, tm_f)  # [N, 5]
+    half_pi = _scalar_constant(_HALF_PI, device_str, dtype)
+    nus = nus_rad_from_phase_and_amplitude(P_f, tm_f)  # [N, 5]
 
     # Place C3' via NeRF: exact bl_c3c2, exact ν₁ (index 4 in _RING_TORSION_DEFS order).
-    c3 = nerf_place_torch(
+    c3 = nerf_place(
         o4, c1, c2,
         _g1('bl_c3_c2'), _g1('ba_c1_c2_c3'),
         nus[:, 4] - half_pi,
     )
 
     # Place ideal C4' via NeRF with ν₂ (index 0); used only to initialise circle basis.
-    ideal_c4 = nerf_place_torch(
+    ideal_c4 = nerf_place(
         c1, c2, c3,
         _g1('bl_c4_c3'), _g1('ba_c2_c3_c4'),
         nus[:, 0] - half_pi,
@@ -1023,7 +717,7 @@ def build_sugar_ring_closed_form_torch(
     ring_pre = {"C1'": c1, "O4'": o4, "C2'": c2, "C3'": c3, "C4'": c4}
     n_atom = _g1('chi_n').reshape(N, 3)
     c_atom = _g1('chi_c').reshape(N, 3)
-    out = _apply_chi_rotation_to_sugar_ring_torch(ring_pre, chi_f, n_atom, c_atom)
+    out = _apply_chi_rotation_to_sugar_ring(ring_pre, chi_f, n_atom, c_atom)
     for nm in ("C1'", "C2'", "C3'", "C4'", "O4'"):
         out[nm] = out[nm].reshape(*orig, 3)
     if squeeze_batch:
@@ -1031,7 +725,7 @@ def build_sugar_ring_closed_form_torch(
     return out
 
 
-def add_exocyclic_sugar_atoms_torch(
+def add_exocyclic_sugar_atoms(
     ring_atoms: dict[str, torch.Tensor],
     *,
     restype_indices: Optional[torch.Tensor] = None,
@@ -1052,22 +746,22 @@ def add_exocyclic_sugar_atoms_torch(
         squeeze = True
     else:
         squeeze = False
-    dev = o4.device
+    device = o4.device
     dtype = o4.dtype
-    dev_str = str(dev)
+    device_str = str(device)
     ri = ri.long()
     tc = g.get('template_tensors')
     if tc is None:
-        tc = _get_template_tensors(dev_str)
-    half_pi = _scalar_constant_torch(_HALF_PI, dev_str, dtype)
+        tc = _get_template_tensors(device_str)
+    half_pi = _scalar_constant(_HALF_PI, device_str, dtype)
 
-    c5 = nerf_place_torch(
+    c5 = nerf_place(
         o4, c3, c4,
         _template_select(tc, 'bl_c5_c4', ri, dtype=dtype),
         _template_select(tc, 'ba_c3_c4_c5', ri, dtype=dtype),
         _template_select(tc, 'psi_c5', ri, dtype=dtype) - half_pi,
     )
-    o3 = nerf_place_torch(
+    o3 = nerf_place(
         o4, c4, c3,
         _template_select(tc, 'bl_o3_c3', ri, dtype=dtype),
         _template_select(tc, 'ba_c4_c3_o3', ri, dtype=dtype),
@@ -1084,7 +778,7 @@ def add_exocyclic_sugar_atoms_torch(
     return out
 
 
-def add_o5_from_gamma_torch(
+def add_o5_from_gamma(
     atoms: dict[str, torch.Tensor],
     gamma: torch.Tensor,
     *,
@@ -1109,15 +803,15 @@ def add_o5_from_gamma_torch(
     if ri is None:
         raise ValueError('Pass restype_indices= or atoms["_ri"].')
     ri = ri.long()
-    dev = c3.device
+    device = c3.device
     dtype = c3.dtype
-    dev_str = str(dev)
+    device_str = str(device)
     tc = gctx.get('template_tensors')
     if tc is None:
-        tc = _get_template_tensors(dev_str)
-    half_pi = _scalar_constant_torch(_HALF_PI, dev_str, dtype)
+        tc = _get_template_tensors(device_str)
+    half_pi = _scalar_constant(_HALF_PI, device_str, dtype)
 
-    o5 = nerf_place_torch(
+    o5 = nerf_place(
         c3,
         c4,
         c5,
@@ -1133,7 +827,7 @@ def add_o5_from_gamma_torch(
     return out
 
 
-def close_phosphate_bridge_multi_torch(
+def close_phosphate_bridge_multi(
     prev_atoms: dict[str, torch.Tensor],
     next_atoms: dict[str, torch.Tensor],
     epsilon_prev: torch.Tensor,
@@ -1149,15 +843,14 @@ def close_phosphate_bridge_multi_torch(
 ) -> dict[str, torch.Tensor]:
     """Place P on the O3'prev–O5'next circle; scan φ to match up to four target dihedrals."""
     g = geometry or {}
-    dev = epsilon_prev.device
+    device = epsilon_prev.device
     dtype = epsilon_prev.dtype
-    dev_str = str(dev)
+    device_str = str(device)
 
     def _broadcast_bridge_weight(w, batch_sz: int) -> torch.Tensor:
         """Scalar or per-batch weight column [B, 1] for loss grid broadcast."""
-        import torch as _t
-        if isinstance(w, _t.Tensor):
-            t = w.reshape(-1).to(device=dev, dtype=dtype)
+        if isinstance(w, torch.Tensor):
+            t = w.reshape(-1).to(device=device, dtype=dtype)
             if t.numel() == 1:
                 t = t.expand(batch_sz)
             elif t.numel() != batch_sz:
@@ -1165,7 +858,7 @@ def close_phosphate_bridge_multi_torch(
                     f'Bridge weight tensor must have 1 or B={batch_sz} elements, got {t.numel()}',
                 )
             return t.reshape(batch_sz, 1)
-        return _t.full((batch_sz, 1), float(w), device=dev, dtype=dtype)
+        return torch.full((batch_sz, 1), float(w), device=device, dtype=dtype)
     o3p = prev_atoms["O3'"]
     c3p = prev_atoms["C3'"]
     c4p = prev_atoms["C4'"]
@@ -1177,11 +870,11 @@ def close_phosphate_bridge_multi_torch(
     if ri is None:
         ri = next_atoms.get('_ri')
     if ri is None:
-        raise ValueError('close_phosphate_bridge_multi_torch needs restype_indices (next) in geometry or _ri on next_atoms.')
+        raise ValueError('close_phosphate_bridge_multi needs restype_indices (next) in geometry or _ri on next_atoms.')
     ri = ri.long()
     tc = g.get('template_tensors')
     if tc is None:
-        tc = _get_template_tensors(dev_str)
+        tc = _get_template_tensors(device_str)
     r_o3p = _template_select(tc, 'bond_p_o3_inter', ri, dtype=dtype)
     l_po5 = _template_select(tc, 'bond_p_o5', ri, dtype=dtype)
 
@@ -1200,7 +893,7 @@ def close_phosphate_bridge_multi_torch(
     midpoint = o3p + a_coef.unsqueeze(-1) * axis
 
     n_grid = int(g.get('n_phi', _PHI_PHOS_GRID))
-    ts = _phi_grid_torch(dev_str, dtype, n_grid)
+    ts = _phi_grid(device_str, dtype, n_grid)
     if o3p.ndim >= 2:
         B = int(o3p.shape[0])
     else:
@@ -1243,28 +936,28 @@ def close_phosphate_bridge_multi_torch(
     o5n_g = o5n.unsqueeze(1).expand(-1, n_grid, -1)
     c5n_g = c5n.unsqueeze(1).expand(-1, n_grid, -1)
     c4n_g = c4n.unsqueeze(1).expand(-1, n_grid, -1)
-    eps_m = dihedral_rad_torch(
+    eps_m = dihedral_rad(
         c4p_g.reshape(-1, 3),
         c3p_g.reshape(-1, 3),
         o3p_g.reshape(-1, 3),
         p_cands.reshape(-1, 3),
     ).reshape(B, n_grid)
 
-    ze_m = dihedral_rad_torch(
+    ze_m = dihedral_rad(
         c3p_g.reshape(-1, 3),
         o3p_g.reshape(-1, 3),
         p_cands.reshape(-1, 3),
         o5n_g.reshape(-1, 3),
     ).reshape(B, n_grid)
 
-    al_m = dihedral_rad_torch(
+    al_m = dihedral_rad(
         o3p_g.reshape(-1, 3),
         p_cands.reshape(-1, 3),
         o5n_g.reshape(-1, 3),
         c5n_g.reshape(-1, 3),
     ).reshape(B, n_grid)
 
-    be_m = dihedral_rad_torch(
+    be_m = dihedral_rad(
         p_cands.reshape(-1, 3),
         o5n_g.reshape(-1, 3),
         c5n_g.reshape(-1, 3),
@@ -1277,14 +970,14 @@ def close_phosphate_bridge_multi_torch(
     wb = _broadcast_bridge_weight(weight_beta, B)
 
     loss = (
-        we * wrap_dihedral_diff_torch(eps_m, epsilon_prev.unsqueeze(-1)) ** 2
-        + wz * wrap_dihedral_diff_torch(ze_m, zeta_prev.unsqueeze(-1)) ** 2
-        + wa * wrap_dihedral_diff_torch(al_m, alpha_next.unsqueeze(-1)) ** 2
-        + wb * wrap_dihedral_diff_torch(be_m, beta_next.unsqueeze(-1)) ** 2
+        we * wrap_dihedral_diff(eps_m, epsilon_prev.unsqueeze(-1)) ** 2
+        + wz * wrap_dihedral_diff(ze_m, zeta_prev.unsqueeze(-1)) ** 2
+        + wa * wrap_dihedral_diff(al_m, alpha_next.unsqueeze(-1)) ** 2
+        + wb * wrap_dihedral_diff(be_m, beta_next.unsqueeze(-1)) ** 2
     )
 
     best = loss.argmin(dim=-1)
-    idx = torch.arange(B, device=dev, dtype=torch.long)
+    idx = torch.arange(B, device=device, dtype=torch.long)
     p_pick = p_cands[idx, best]
 
     # Infeasible: midpoint along axis (deterministic fallback)
@@ -1294,7 +987,7 @@ def close_phosphate_bridge_multi_torch(
         fb = o3p + (o5n - o3p) * (r_o3p.unsqueeze(-1) / sum_l)
         p_pick = torch.where(not_feas.unsqueeze(-1), fb, p_pick)
 
-    half_pi = _scalar_constant_torch(_HALF_PI, dev_str, dtype)
+    half_pi = _scalar_constant(_HALF_PI, device_str, dtype)
     bl_op1 = _template_select(tc, 'bl_op1', ri, dtype=dtype)
     bl_op2 = _template_select(tc, 'bl_op2', ri, dtype=dtype)
     ang_op1 = _template_select(tc, 'ang_op1', ri, dtype=dtype)
@@ -1302,184 +995,12 @@ def close_phosphate_bridge_multi_torch(
     psi_op1 = _template_select(tc, 'psi_op1', ri, dtype=dtype)
     psi_op2 = _template_select(tc, 'psi_op2', ri, dtype=dtype)
 
-    op1 = nerf_place_torch(o3p, o5n, p_pick, bl_op1, ang_op1, psi_op1 - half_pi)
-    op2 = nerf_place_torch(o3p, o5n, p_pick, bl_op2, ang_op2, psi_op2 - half_pi)
+    op1 = nerf_place(o3p, o5n, p_pick, bl_op1, ang_op1, psi_op1 - half_pi)
+    op2 = nerf_place(o3p, o5n, p_pick, bl_op2, ang_op2, psi_op2 - half_pi)
 
     out = {'P': p_pick, 'OP1': op1, 'OP2': op2}
     if B == 1 and epsilon_prev.ndim == 0:
         out = {k: v.squeeze(0) for k, v in out.items()}
-    return out
-
-
-def build_backbone_from_torsions(
-    torsions: np.ndarray,
-    restype: str,
-    o3_prev_local: Optional[np.ndarray] = None,
-    tau_m: Optional[float] = None,
-) -> dict[str, np.ndarray]:
-    """Build backbone atom positions in the local nucleotide frame from seven torsion angles.
-
-    Parameters
-    ----------
-    torsions : np.ndarray, shape [N_TORSIONS]
-        Order: [α, β, γ, ε, ζ, χ, P], radians.
-    restype : str
-        One-letter nucleotide code: 'A' | 'C' | 'G' | 'T'.
-    o3_prev_local : optional (3,)
-        Previous nucleotide's O3' in this residue's local frame; enables α-based P placement.
-    tau_m : optional float
-        Predicted puckering amplitude (rad); fallback: template amplitude.
-
-    Returns
-    -------
-    dict[str, np.ndarray]
-        atom_name -> xyz (Å) in the local nucleotide frame.
-    """
-    tpl = _get_template(restype)
-    ri = {'A': 0, 'C': 1, 'G': 2, 'T': 3}[restype]
-    tc = _get_template_tensors('cpu')
-
-    # Extract relevant torsion angles
-    alpha = float(torsions[TOR_ALPHA])
-    beta = float(torsions[TOR_BETA])
-    gamma = float(torsions[TOR_GAMMA])
-    P_rad = float(torsions[TOR_PUCKER_P])
-    if tau_m is not None:
-        _TAU_DNA = float(tau_m)
-    else:
-        _TAU_DNA = float(_template_tau_m.get(restype, 0.611))
-
-    nus = _pseudorotation_nus_numpy(P_rad, _TAU_DNA)
-    nu0, _nu1, _nu2, nu3, nu4 = nus
-
-    # Anchor atoms — fixed in local frame from canonical template
-    c1 = tpl["C1'"].copy()
-    o4 = tpl["O4'"].copy()
-    c4_ref = tpl["C4'"].copy()
-
-    # nerf_place(A, B, C, r, θ, ψ) satisfies dihedral(A,B,C,D) = ψ + π/2
-    _HP = _HALF_PI
-
-    # ── Sugar ring ──────────────────────────────────────────────────────────
-    c2 = nerf_place(
-        c4_ref, o4, c1,
-        float(tc['bl_c2_c1'][ri].item()),
-        _bond_angle_np(o4, c1, tpl["C2'"]),
-        nu3 - _HP,
-    )
-    c3 = nerf_place(
-        o4, c1, c2,
-        float(tc['bl_c3_c2'][ri].item()),
-        float(tc['ba_c1_c2_c3'][ri].item()),
-        nu4 - _HP,
-    )
-    c4 = nerf_place(
-        c1, c2, c3,
-        float(tc['bl_c4_c3'][ri].item()),
-        float(tc['ba_c2_c3_c4'][ri].item()),
-        nu0 - _HP,
-    )
-
-    chi_tgt = float(torsions[TOR_CHI])
-    _o4n, _c1n, n_nm, c_nm = _chi_quads(restype)
-    _ = _o4n, _c1n
-    n_xyz = np.asarray(tpl[n_nm], dtype=np.float64).reshape(3)
-    c_xyz = np.asarray(tpl[c_nm], dtype=np.float64).reshape(3)
-    chi_meas = dihedral_rad(o4, c1, n_xyz, c_xyz)
-    dchi = float(wrap_angle_rad(chi_tgt - chi_meas))
-    ax = n_xyz - c1
-    la = float(np.linalg.norm(ax))
-    if la > 1e-10:
-        u_ax = ax / la
-
-        def _rot_vec(v: np.ndarray) -> np.ndarray:
-            vv = np.asarray(v, dtype=np.float64).reshape(3) - c1
-            co = np.cos(dchi)
-            si = np.sin(dchi)
-            vc = np.cross(u_ax, vv)
-            dp = float(np.dot(u_ax, vv))
-            return (vv * co + vc * si + u_ax * dp * (1.0 - co)) + c1
-
-        o4 = _rot_vec(o4)
-        c2 = _rot_vec(c2)
-        c3 = _rot_vec(c3)
-        c4 = _rot_vec(c4)
-
-    psi_c5 = float(tc['psi_c5'][ri].item())
-    c5 = nerf_place(
-        o4, c3, c4,
-        float(tc['bl_c5_c4'][ri].item()),
-        float(tc['ba_c3_c4_c5'][ri].item()),
-        psi_c5 - _HP,
-    )
-
-    o5_gamma = nerf_place(
-        c3, c4, c5,
-        float(tc['bl_o5_c5'][ri].item()),
-        float(tc['ba_c4_c5_o5'][ri].item()),
-        gamma - _HP,
-    )
-
-    psi_o3 = float(tc['psi_o3_ring'][ri].item())
-    o3 = nerf_place(
-        o4, c4, c3,
-        float(tc['bl_o3_c3'][ri].item()),
-        float(tc['ba_c4_c3_o3'][ri].item()),
-        psi_o3 - _HP,
-    )
-
-    out: dict[str, np.ndarray] = {
-        "C1'": c1.copy(),
-        "C2'": c2,
-        "C3'": c3,
-        "C4'": c4,
-        "C5'": c5,
-        "O4'": o4.copy(),
-        "O3'": o3,
-    }
-
-    p_built: Optional[np.ndarray] = None
-    o3p: Optional[np.ndarray] = None
-    o5 = o5_gamma.copy()
-
-    if o3_prev_local is not None:
-        o3p = np.asarray(o3_prev_local, dtype=np.float64).reshape(3)
-        # O3'_i–P_{i+1}: use phosphodiester target (Å), same canonical value as `_get_template_tensors` ``bond_p_o3_inter``.
-        l_po5 = float(tc['bond_p_o5'][ri].item())
-        r_o3p_bridge = float(tc['bond_p_o3_inter'][ri].item())
-        theta_po3 = np.deg2rad(119.0)
-        d_o3_o5 = float(np.linalg.norm(o3p - o5_gamma))
-        if abs(r_o3p_bridge - l_po5) <= d_o3_o5 <= r_o3p_bridge + l_po5:
-            p_built = close_phosphate_bridge(
-                o3p, o5_gamma, c5, r_o3p_bridge, l_po5, alpha,
-            )
-        else:
-            # ψ = −α aligns dihedral(O3′, P, O5′, C5′) with α given nerf_place's +π/2 offset.
-            p_built = nerf_place(
-                c5, o5_gamma, o3p, r_o3p_bridge, theta_po3, -alpha - _HP,
-            )
-        o5 = o5_gamma
-
-    out["O5'"] = o5
-
-    if p_built is not None and o3p is not None:
-        o5_f = out["O5'"]
-        r_p_op1 = float(tc['bl_op1'][ri].item())
-        r_p_op2 = float(tc['bl_op2'][ri].item())
-        ang_op1 = float(tc['ang_op1'][ri].item())
-        ang_op2 = float(tc['ang_op2'][ri].item())
-        psi_op1 = float(tc['psi_op1'][ri].item())
-        psi_op2 = float(tc['psi_op2'][ri].item())
-        op1 = nerf_place(o3p, o5_f, p_built, r_p_op1, ang_op1, psi_op1 - _HP)
-        op2 = nerf_place(o3p, o5_f, p_built, r_p_op2, ang_op2, psi_op2 - _HP)
-        out['P'] = p_built
-        out['OP1'] = op1
-        out['OP2'] = op2
-    else:
-        for nm in ('P', 'OP1', 'OP2'):
-            if nm in tpl:
-                out[nm] = tpl[nm].copy()
-
     return out
 
 
@@ -1494,8 +1015,17 @@ _BRIDGE_NEXT_ATOM_ORDER = ("O5'", "C5'", "C4'")
 _PHOSPHATE_ATOM_ORDER = ('P', 'OP1', 'OP2')
 _PHOSPHATE_ATOM_INDEX = tuple(_BACKBONE_NAME_TO_INDEX[nm] for nm in _PHOSPHATE_ATOM_ORDER)
 
+BACKBONE_ATOM_ORDER = _BACKBONE_ATOM_ORDER
+BACKBONE_NAME_TO_INDEX = _BACKBONE_NAME_TO_INDEX
+LOCAL_BACKBONE_ATOM_ORDER = _LOCAL_BACKBONE_ATOM_ORDER
+LOCAL_BACKBONE_INDEX = _LOCAL_BACKBONE_INDEX
+BRIDGE_PREV_ATOM_ORDER = _BRIDGE_PREV_ATOM_ORDER
+BRIDGE_NEXT_ATOM_ORDER = _BRIDGE_NEXT_ATOM_ORDER
+PHOSPHATE_ATOM_ORDER = _PHOSPHATE_ATOM_ORDER
+PHOSPHATE_ATOM_INDEX = _PHOSPHATE_ATOM_INDEX
 
-def build_backbone_from_torsions_torch(
+
+def build_backbone_from_torsions(
     torsions: 'torch.Tensor',
     tau_m: 'torch.Tensor',
     restype_indices: 'torch.Tensor',
@@ -1503,23 +1033,21 @@ def build_backbone_from_torsions_torch(
 ) -> dict[str, torch.Tensor]:
     """Batched decoder: deterministic sugar ring closure, stereo exocyclic O3′/C5′, γ→O5′.
 
-    Phosphate uses ``close_phosphate_bridge_multi_torch``; without prior-nucleotide ε/ζ in this API,
+    Phosphate uses ``close_phosphate_bridge_multi``; without prior-nucleotide ε/ζ in this API,
     only α and β targets are weighted (incoming bridge from o3_prev in target frame).
     """
-    import torch
-
     ri = restype_indices.long()
     geometry = {'template_tensors': _get_template_tensors(str(torsions.device))}
     chi = torsions[:, TOR_CHI]
-    P = torsions[:, TOR_PUCKER_P]
+    P = torsions[:, TOR_PSEUDOROTATION_PHASE]
     gamma = torsions[:, TOR_GAMMA]
     alpha = torsions[:, TOR_ALPHA]
     beta = torsions[:, TOR_BETA]
     eps_lat = torsions[:, TOR_EPS]
     zet_lat = torsions[:, TOR_ZETA]
-    ring = build_sugar_ring_closed_form_torch(chi, P, tau_m, ri, geometry=geometry)
-    atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=ri, geometry=geometry)
-    atoms = add_o5_from_gamma_torch(atoms, gamma, restype_indices=ri, geometry=geometry)
+    ring = build_sugar_ring_closed_form(chi, P, tau_m, ri, geometry=geometry)
+    atoms = add_exocyclic_sugar_atoms(ring, restype_indices=ri, geometry=geometry)
+    atoms = add_o5_from_gamma(atoms, gamma, restype_indices=ri, geometry=geometry)
 
     out = {
         "C1'": atoms["C1'"],
@@ -1546,7 +1074,7 @@ def build_backbone_from_torsions_torch(
         "C4'": out["C4'"],
         "_ri": ri,
     }
-    phosph = close_phosphate_bridge_multi_torch(
+    phosph = close_phosphate_bridge_multi(
         prev_atoms,
         next_atoms,
         eps_lat,
@@ -1568,7 +1096,7 @@ def build_backbone_from_torsions_torch(
     return out
 
 
-def build_batch_window_backbone_from_torsions_torch(
+def build_batch_window_backbone_from_torsions(
     torsions: torch.Tensor,
     tau_m: torch.Tensor,
     restype_indices: torch.Tensor,
@@ -1581,38 +1109,36 @@ def build_batch_window_backbone_from_torsions_torch(
     For each window position ``k>=1`` and batch row ``b``, place ``P_k``/``OP*`` using ε,ζ from
     residue ``k−1`` and α,β from ``k`` (per-sample mask when ``torsion_mask`` is set).
     """
-    import torch
-
     if torsions.dim() != 3 or torsions.shape[-1] != N_TORSIONS:
         raise ValueError(
             f'Expected torsions [B,W,{N_TORSIONS}], got {tuple(torsions.shape)}',
         )
     B, W, _ = torsions.shape
-    dev = torsions.device
+    device = torsions.device
     dtype = torsions.dtype
     n_bb = len(_BACKBONE_ATOM_ORDER)
     BW = B * W
-    phosphate_index = torch.tensor(_PHOSPHATE_ATOM_INDEX, device=dev, dtype=torch.long)
+    phosphate_index = torch.tensor(_PHOSPHATE_ATOM_INDEX, device=device, dtype=torch.long)
 
     flat_t = torsions.reshape(BW, N_TORSIONS)
     flat_tm = tau_m.reshape(BW)
     flat_ri = restype_indices.reshape(BW).long()
     geometry = {
-        'template_tensors': _get_template_tensors(str(dev)),
-        'planar_spec_tensors': _planar_sugar_spec_tensors(str(dev), dtype),
+        'template_tensors': _get_template_tensors(str(device)),
+        'planar_spec_tensors': _planar_sugar_spec_tensors(str(device), dtype),
     }
     chi = flat_t[:, TOR_CHI]
-    P_rad = flat_t[:, TOR_PUCKER_P]
-    ring = build_sugar_ring_closed_form_torch(chi, P_rad, flat_tm, flat_ri, geometry=geometry)
-    atoms = add_exocyclic_sugar_atoms_torch(ring, restype_indices=flat_ri, geometry=geometry)
-    atoms = add_o5_from_gamma_torch(
+    P_rad = flat_t[:, TOR_PSEUDOROTATION_PHASE]
+    ring = build_sugar_ring_closed_form(chi, P_rad, flat_tm, flat_ri, geometry=geometry)
+    atoms = add_exocyclic_sugar_atoms(ring, restype_indices=flat_ri, geometry=geometry)
+    atoms = add_o5_from_gamma(
         atoms, flat_t[:, TOR_GAMMA], restype_indices=flat_ri, geometry=geometry,
     )
 
     Ri_flat = nt_frames_world.reshape(BW, 3, 3)
     ok_flat = nt_origins_world.reshape(BW, 3)
 
-    bb_flat = torch.full((BW, n_bb, 3), float('nan'), device=dev, dtype=dtype)
+    bb_flat = torch.full((BW, n_bb, 3), float('nan'), device=device, dtype=dtype)
     local_atoms = torch.stack([atoms[nm] for nm in _LOCAL_BACKBONE_ATOM_ORDER], dim=1)
     bb_flat[:, _LOCAL_BACKBONE_INDEX] = local_to_world_points(local_atoms, ok_flat, Ri_flat)
 
@@ -1655,17 +1181,17 @@ def build_batch_window_backbone_from_torsions_torch(
 
         nv = int(idx.shape[0])
         if torsion_mask is None:
-            we = torch.ones(nv, device=dev, dtype=dtype)
-            wz = torch.ones(nv, device=dev, dtype=dtype)
-            wa = torch.ones(nv, device=dev, dtype=dtype)
-            wb = torch.ones(nv, device=dev, dtype=dtype)
+            we = torch.ones(nv, device=device, dtype=dtype)
+            wz = torch.ones(nv, device=device, dtype=dtype)
+            wa = torch.ones(nv, device=device, dtype=dtype)
+            wb = torch.ones(nv, device=device, dtype=dtype)
         else:
             we = torsion_mask[idx, k - 1, TOR_EPS].to(dtype=dtype)
             wz = torsion_mask[idx, k - 1, TOR_ZETA].to(dtype=dtype)
             wa = torsion_mask[idx, k, TOR_ALPHA].to(dtype=dtype)
             wb = torsion_mask[idx, k, TOR_BETA].to(dtype=dtype)
 
-        phosph = close_phosphate_bridge_multi_torch(
+        phosph = close_phosphate_bridge_multi(
             prev_loc,
             next_loc,
             torsions[idx, k - 1, TOR_EPS],
@@ -1687,7 +1213,7 @@ def build_batch_window_backbone_from_torsions_torch(
     return bb
 
 
-def build_window_backbone_from_torsions_torch(
+def build_window_backbone_from_torsions(
     torsions: torch.Tensor,
     tau_m: torch.Tensor,
     restype_indices: torch.Tensor,
@@ -1695,7 +1221,7 @@ def build_window_backbone_from_torsions_torch(
     nt_frames_world: torch.Tensor,
     torsion_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """World backbone [W, n_bb, 3] with the same atom order as ``bbregen.schema.BACKBONE_ATOMS``.
+    """World backbone [W, n_bb, 3] with the same atom order as ``base2backbone.schema.BACKBONE_ATOMS``.
 
     For each k>=1, place P_k / OP1 / OP2 using ε,ζ from residue k−1 and α,β from k (masked).
     Bridge geometry uses k−1 world O3′,C3′,C4′ expressed in nucleotide k local frame.
@@ -1704,7 +1230,7 @@ def build_window_backbone_from_torsions_torch(
     Ri = nt_frames_world
     if Ri.dim() == 2:
         Ri = Ri.view(W, 3, 3)
-    bb_b = build_batch_window_backbone_from_torsions_torch(
+    bb_b = build_batch_window_backbone_from_torsions(
         torsions.unsqueeze(0),
         tau_m.unsqueeze(0),
         restype_indices.unsqueeze(0),
@@ -1727,8 +1253,8 @@ def build_chain_backbone_from_predictions(
 
     Shapes: ``theta`` is ``[N, N_TORSIONS]`` or ``[1, N, N_TORSIONS]``; ``tau_m`` matches the
     leading structure (``[N]`` or ``[1, N]``). Returns ``[N, n_bb, 3]`` (atom order =
-    ``bbregen.schema.BACKBONE_ATOMS`` / ``_BACKBONE_ATOM_ORDER``). For B>1 batches use
-    ``build_batch_window_backbone_from_torsions_torch`` directly.
+    ``base2backbone.schema.BACKBONE_ATOMS`` / ``_BACKBONE_ATOM_ORDER``). For B>1 batches use
+    ``build_batch_window_backbone_from_torsions`` directly.
     """
     if theta.dim() == 2:
         if tau_m.dim() != 1 or restype_indices.dim() != 1:
@@ -1738,7 +1264,7 @@ def build_chain_backbone_from_predictions(
             )
         if nt_origins_world.shape[0] != theta.shape[0] or nt_frames_world.shape[0] != theta.shape[0]:
             raise ValueError('nt_origins_world / nt_frames_world must have length N matching theta')
-        return build_window_backbone_from_torsions_torch(
+        return build_window_backbone_from_torsions(
             theta,
             tau_m,
             restype_indices,
@@ -1750,14 +1276,37 @@ def build_chain_backbone_from_predictions(
         if theta.shape[0] != 1:
             raise ValueError(
                 'build_chain_backbone_from_predictions supports batch size 1 only; '
-                'use build_batch_window_backbone_from_torsions_torch for B>1',
+                'use build_batch_window_backbone_from_torsions for B>1',
             )
         tm = tau_m.squeeze(0) if tau_m.dim() == 2 else tau_m
         ri = restype_indices.squeeze(0) if restype_indices.dim() == 2 else restype_indices
         oo = nt_origins_world.squeeze(0) if nt_origins_world.dim() == 3 else nt_origins_world
         rr = nt_frames_world.squeeze(0) if nt_frames_world.dim() == 4 else nt_frames_world
         m = torsion_mask.squeeze(0) if torsion_mask is not None and torsion_mask.dim() == 3 else torsion_mask
-        return build_window_backbone_from_torsions_torch(
+        return build_window_backbone_from_torsions(
             theta.squeeze(0), tm, ri, oo, rr, m,
         )
     raise ValueError(f'theta must be [N, {N_TORSIONS}] or [1, N, {N_TORSIONS}], got {tuple(theta.shape)}')
+
+
+def build_backbone_local(
+    torsions: np.ndarray,
+    restype: str,
+    *,
+    o3_prev_local: Optional[np.ndarray] = None,
+    tau_m: Optional[float] = None,
+) -> dict[str, np.ndarray]:
+    """Single residue on CPU: numpy torsion vector → numpy atom dict (scripts / tests)."""
+    from base2backbone.geometry.templates import get_template_tau_m
+
+    ri = torch.tensor([{'A': 0, 'C': 1, 'G': 2, 'T': 3}[restype]], dtype=torch.long)
+    tm_val = float(tau_m) if tau_m is not None else float(get_template_tau_m(restype))
+    theta = torch.from_numpy(np.asarray(torsions, dtype=np.float64)).unsqueeze(0).float()
+    tm = torch.tensor([tm_val], dtype=torch.float32)
+    o3_t = None
+    if o3_prev_local is not None:
+        o3_t = torch.from_numpy(
+            np.asarray(o3_prev_local, dtype=np.float64).reshape(1, 3),
+        ).float()
+    bb_t = build_backbone_from_torsions(theta, tm, ri, o3_prev_local=o3_t)
+    return {k: v.squeeze(0).detach().cpu().numpy() for k, v in bb_t.items()}

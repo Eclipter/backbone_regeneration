@@ -129,7 +129,8 @@ class BackboneLightningModule(pl.LightningModule):
         )
 
     def load_state_dict(self, state_dict, strict=True):  # type: ignore[no-untyped-def]
-        # Support checkpoints saved before the `score_network` rename and before torch.compile wrapping.
+        # Align checkpoint keys with eager vs torch.compile-wrapped `score_network` (OptimizedModule uses `_orig_mod`).
+        compiled_score = getattr(self.score_network, '_orig_mod', None) is not None
         renamed_state_dict = {}
         for key, value in state_dict.items():
             key_str = str(key)
@@ -137,8 +138,14 @@ class BackboneLightningModule(pl.LightningModule):
                 key_str = 'score_network.' + key_str[len('denoiser._orig_mod.'):]
             elif key_str.startswith('denoiser.'):
                 key_str = 'score_network.' + key_str[len('denoiser.'):]
-            elif key_str.startswith('score_network._orig_mod.'):
+            elif key_str.startswith('score_network._orig_mod.') and not compiled_score:
                 key_str = 'score_network.' + key_str[len('score_network._orig_mod.'):]
+            elif (
+                compiled_score
+                and key_str.startswith('score_network.')
+                and not key_str[len('score_network.'):].startswith('_orig_mod.')
+            ):
+                key_str = 'score_network._orig_mod.' + key_str[len('score_network.'):]
             renamed_state_dict[key_str] = value
         state_dict = renamed_state_dict
         return super().load_state_dict(state_dict, strict=strict)
@@ -329,7 +336,8 @@ class BackboneLightningModule(pl.LightningModule):
         )
         clo_metrics = self._bridge_closure_metrics(pred_x0_cl, batch)
         cl = clo_metrics['closure_loss']
-        loss = mse + float(self.hparams.get('closure_loss_weight', 0.0)) * cl
+        cw = float(self.hparams.get('closure_loss_weight', 0.0))
+        loss = mse if cw == 0.0 else mse + cw * cl
         self.log(
             'train/loss', mse,
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,

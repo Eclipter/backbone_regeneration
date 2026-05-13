@@ -17,7 +17,7 @@ BASE = dict(
     SWA=True,
     SWA_LR=0.1,
     SWA_EPOCH_START=80,
-    NUM_EPOCHS=100,
+    NUM_EPOCHS=110,
     ANGULAR_SIGMA_MIN=0.01*pi,
     ANGULAR_SIGMA_MAX=pi,
     TAU_SIGMA_MIN=0.01*pi,
@@ -38,7 +38,7 @@ EXPERIMENTS = [
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'torsions/2'
+RUN_NAME = 'torsions/3'
 
 SEED = 42
 

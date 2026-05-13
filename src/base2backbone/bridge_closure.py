@@ -8,20 +8,10 @@ import numpy as np
 import torch
 
 from .data import BACKBONE_ATOMS
-from .geometry import (
-    bond_angle,
-    dihedral_rad,
-    get_template,
-    get_template_tensors,
-    wrap_dihedral_diff,
-)
+from .geometry import (bond_angle, dihedral_rad, get_template,
+                       get_template_tensors, wrap_dihedral_diff)
 from .geometry.primitives import _bond_angle
-from .torsion_constants import (
-    TOR_ALPHA,
-    TOR_BETA,
-    TOR_EPS,
-    TOR_ZETA,
-)
+from .torsion_constants import TOR_ALPHA, TOR_BETA, TOR_EPS, TOR_ZETA
 
 _BASE_LETTERS = ('A', 'C', 'G', 'T')
 
@@ -199,12 +189,12 @@ def compute_bridge_closure_loss(
 
     def _zero() -> torch.Tensor:
         if grad_prop_tensor is not None:
-            return grad_prop_tensor.sum() * 0.0
+            return torch.nan_to_num(grad_prop_tensor, nan=0.0, posinf=0.0, neginf=0.0).sum() * 0.0
         return torch.zeros((), device=device, dtype=dtype)
 
     if bb_xyz_world.dim() != 4:
         raise ValueError(f'Expected bb_xyz_world [B,W,n_bb,3], got {tuple(bb_xyz_world.shape)}')
-    B, W, n_bb, _ = bb_xyz_world.shape
+    B, W, _, _ = bb_xyz_world.shape
     if W < 2:
         z = _zero()
         zf = torch.zeros((), device=device, dtype=dtype)

@@ -42,11 +42,9 @@ def pseudorotation_phase_rad_from_nus(nu_deg):
 def pucker_amplitude_rad(nu_deg, P_rad):
     """Return τ_m in radians with pseudorotation phase held fixed."""
     nu = np.deg2rad(np.asarray(nu_deg, dtype=np.float64))
-    idx = np.arange(5, dtype=np.float64)
-    phases = P_rad + (2.0 * math.pi * idx / 5.0)
-    cos_phase = np.cos(phases)
+    cos_phase = np.cos(P_rad + _PSEUDOROTATION_OFFSETS)
     denom = float(np.dot(cos_phase, cos_phase)) + 1e-12
-    tau = float(np.dot(nu, cos_phase) / np.sqrt(denom))
+    tau = float(np.dot(nu, cos_phase) / denom)
     return abs(tau)
 
 

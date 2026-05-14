@@ -13,14 +13,14 @@ from typing_extensions import override
 
 
 def _with_slash_lr_prefix(names: list[list[str]]) -> tuple[list[list[str]], bool]:
-    """Map default Lightning tags `lr-<Class>` to `optimizer/<Class>`. Returns (names, any_changed)."""
+    """Map default Lightning tags `lr-<Class>` to `optimizer/LR-<Class>`. Returns (names, any_changed)."""
     out: list[list[str]] = []
     changed = False
     for group in names:
         row: list[str] = []
         for n in group:
             if n.startswith('lr-'):
-                row.append('optimizer/' + n[3:])
+                row.append('optimizer/LR-' + n[3:])
                 changed = True
             else:
                 row.append(n)

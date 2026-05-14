@@ -28,54 +28,20 @@ from .primitives import (
     wrap_angle_rad,
     wrap_dihedral_diff,
 )
-from .torsions import nucleotide_torsions
+from .torsions import (
+    RING_TORSION_DEFS as _RING_TORSION_DEFS,
+    _PSEUDOROTATION_OFFSETS,
+    nucleotide_torsions,
+    nus_rad_from_phase_and_amplitude,
+    phase_and_amplitude_to_nus,
+    pseudorotation_phase_rad_from_nus,
+    pucker_amplitude_rad,
+    sugar_ring_torsions,
+)
 
 _GEO_EPS = 1e-8
 _PHI_PHOS_GRID = 128
 _HALF_PI = math.pi / 2.0
-_TWO_PI = 2.0 * math.pi
-_C2_AZIMUTH_SAMPLES = 24
-_C2_AZIMUTH_REFINE_STEPS = 10
-_PSEUDOROTATION_OFFSETS = (
-    np.array([0.0, 4.0, 8.0, 2.0, 6.0], dtype=np.float64) * (math.pi / 5.0)
-)
-
-
-
-
-
-
-
-
-_RING_TORSION_DEFS = [
-    ("C1'", "C2'", "C3'", "C4'"),
-    ("C2'", "C3'", "C4'", "O4'"),
-    ("C3'", "C4'", "O4'", "C1'"),
-    ("C4'", "O4'", "C1'", "C2'"),
-    ("O4'", "C1'", "C2'", "C3'"),
-]
-_RING_ANGLES = 2.0 * 2.0 * math.pi * np.arange(5, dtype=np.float64) / 5.0
-
-
-def pseudorotation_phase_rad_from_nus(nu_deg):
-    """MDAnalysis `phase_as` phase angle in radians from five endocyclic torsions (degrees)."""
-    nu = np.asarray(nu_deg, dtype=np.float64)
-    B = np.dot(nu, np.sin(_RING_ANGLES)) * (-2.0 / 5.0)
-    A = np.dot(nu, np.cos(_RING_ANGLES)) * (2.0 / 5.0)
-    return float(np.arctan2(B, A))
-
-
-def pucker_amplitude_rad(nu_deg, P_rad):
-    """Amplitude τ_m (rad): LS fit minimising Σ(νᵢ − τ cos(P + offset_i))².
-
-    Uses the same _PSEUDOROTATION_OFFSETS as nus_rad_from_phase_and_amplitude so that
-    the (P, τ) → ν → (P, τ) round-trip is exact: τ = dot(ν, c) / dot(c, c).
-    """
-    nu = np.deg2rad(np.asarray(nu_deg, dtype=np.float64))
-    c = np.cos(P_rad + _PSEUDOROTATION_OFFSETS)
-    den = float(np.dot(c, c)) + 1e-12  # dot(c,c) ≈ 5/2 for equidistant offsets
-    tau = float(np.dot(nu, c) / den)
-    return abs(tau)
 
 
 # Cache template atom dicts per restype to avoid repeated pynamod calls.
@@ -230,24 +196,6 @@ def _orthonormal_basis_from_axis(
     e1 = _safe_normalize(e1, eps=eps)
     e2 = torch.linalg.cross(u, e1, dim=-1)
     return u, e1, e2
-
-
-
-
-def nus_rad_from_phase_and_amplitude(
-    P_rad: torch.Tensor,
-    tau_m: torch.Tensor,
-) -> torch.Tensor:
-    """Five endocyclic ν (rad) in the same order as _RING_TORSION_DEFS (ν₂…ν₁ cycle)."""
-    p = P_rad.reshape(-1, 1)
-    t = tau_m.reshape(-1, 1)
-    offs = _pseudorotation_offsets(str(P_rad.device), P_rad.dtype)
-    return t * torch.cos(p + offs.unsqueeze(0))
-
-
-phase_and_amplitude_to_nus = nus_rad_from_phase_and_amplitude
-
-
 def _ring_dihedrals_from_coords(
     ring_atoms: dict[str, torch.Tensor],
 ) -> torch.Tensor:
@@ -262,11 +210,6 @@ def _ring_dihedrals_from_coords(
             ).unsqueeze(-1),
         )
     return torch.cat(out, dim=-1)
-
-
-def sugar_ring_torsions(atoms: dict[str, torch.Tensor]) -> torch.Tensor:
-    """Endocyclic ν₀…ν₄ (rad) in ``_RING_TORSION_DEFS`` order; same convention as ``phase_and_amplitude_to_nus``."""
-    return _ring_dihedrals_from_coords(atoms)
 
 
 def signed_tetra_volume(
@@ -663,134 +606,32 @@ def _map_sugar_ring_local_to_output(
     return out
 
 
-def _build_sugar_local_ring_for_c2_azimuth(
-    phi_c2: torch.Tensor,
-    P_f: torch.Tensor,
-    tm_f: torch.Tensor,
-    ri: torch.Tensor,
-    tc: dict[str, torch.Tensor],
-    *,
-    dtype: torch.dtype,
-) -> tuple[dict[str, torch.Tensor], torch.Tensor, torch.Tensor]:
-    """Build a sugar-local ring for a fixed C2' azimuth and pick the best C4' branch."""
-    device_str = str(phi_c2.device)
-    half_pi = _scalar_constant(_HALF_PI, device_str, dtype)
-
-    def _g1(key: str) -> torch.Tensor:
-        return _template_select(tc, key, ri, dtype=dtype)
-
-    nus = nus_rad_from_phase_and_amplitude(P_f, tm_f)
-    bl_o4_c1 = (_g1('o4') - _g1('c1')).norm(dim=-1)
-    bl_c2_c1 = _g1('bl_c2_c1')
-    ba_o4_c1_c2 = _g1('ba_o4_c1_c2')
-    bl_c3_c2 = _g1('bl_c3_c2')
-    ba_c1_c2_c3 = _g1('ba_c1_c2_c3')
-    bl_c4_c3 = _g1('bl_c4_c3')
-    bl_o4_c4 = _g1('bl_o4_c4')
-
-    zero = torch.zeros_like(bl_o4_c1)
-    c1_local = torch.stack([zero, zero, zero], dim=-1)
-    o4_local = torch.stack([bl_o4_c1, zero, zero], dim=-1)
-    axis = _safe_normalize(o4_local - c1_local)
-    _, e1_axis, e2_axis = _orthonormal_basis_from_axis(axis, eps=_GEO_EPS)
-    x2 = bl_c2_c1 * torch.cos(ba_o4_c1_c2)
-    y2 = bl_c2_c1 * torch.sin(ba_o4_c1_c2)
-    radial = (
-        torch.cos(phi_c2).unsqueeze(-1) * e1_axis
-        + torch.sin(phi_c2).unsqueeze(-1) * e2_axis
-    )
-    c2_local = c1_local + x2.unsqueeze(-1) * axis + y2.unsqueeze(-1) * radial
-    c3_local = nerf_place(
-        o4_local,
-        c1_local,
-        c2_local,
-        bl_c3_c2,
-        ba_c1_c2_c3,
-        nus[:, 4] - half_pi,
-    )
-
-    d_vec = o4_local - c3_local
-    d_sq = (d_vec * d_vec).sum(dim=-1)
-    d = d_sq.clamp(min=1e-8).sqrt()
-    d_hat = d_vec / d.unsqueeze(-1)
-    h = (d_sq + bl_c4_c3 ** 2 - bl_o4_c4 ** 2) / (2.0 * d)
-    r_c = (bl_c4_c3 ** 2 - h ** 2).clamp(min=0.0).sqrt()
-    circle_center = c3_local + h.unsqueeze(-1) * d_hat
-    _, e1, e2 = _orthonormal_basis_from_axis(d_vec, eps=_GEO_EPS)
-
-    bc32 = c3_local - c2_local
-    cross_a = torch.linalg.cross(bc32, d_hat, dim=-1)
-    cross_b = torch.linalg.cross(bc32, e1, dim=-1)
-    cross_c = torch.linalg.cross(bc32, e2, dim=-1)
-    n12 = _safe_normalize(torch.linalg.cross(c1_local - c2_local, bc32, dim=-1))
-    m12 = torch.linalg.cross(n12, _safe_normalize(bc32), dim=-1)
-    a0 = h * (n12 * cross_a).sum(dim=-1)
-    a1 = h * (m12 * cross_a).sum(dim=-1)
-    b0 = r_c * (n12 * cross_b).sum(dim=-1)
-    b1 = r_c * (m12 * cross_b).sum(dim=-1)
-    g0 = r_c * (n12 * cross_c).sum(dim=-1)
-    g1 = r_c * (m12 * cross_c).sum(dim=-1)
-    nu0_tgt = nus[:, 0]
-    ct = torch.cos(nu0_tgt)
-    st = torch.sin(nu0_tgt)
-    pc = ct * b1 - st * b0
-    qc = ct * g1 - st * g0
-    rc = ct * a1 - st * a0
-    pq = (pc ** 2 + qc ** 2).clamp(min=1e-8).sqrt()
-    phi = torch.stack([
-        torch.atan2(qc, pc) + torch.acos((-rc / pq).clamp(-1.0, 1.0)),
-        torch.atan2(qc, pc) - torch.acos((-rc / pq).clamp(-1.0, 1.0)),
-    ], dim=1)
-    c4_candidates = (
-        circle_center.unsqueeze(1)
-        + r_c.unsqueeze(-1).unsqueeze(-1)
-        * (
-            torch.cos(phi).unsqueeze(-1) * e1.unsqueeze(1)
-            + torch.sin(phi).unsqueeze(-1) * e2.unsqueeze(1)
-        )
-    )
-    ring_candidates = {
-        "C1'": c1_local.unsqueeze(1).expand(-1, 2, -1),
-        "O4'": o4_local.unsqueeze(1).expand(-1, 2, -1),
-        "C2'": c2_local.unsqueeze(1).expand(-1, 2, -1),
-        "C3'": c3_local.unsqueeze(1).expand(-1, 2, -1),
-        "C4'": c4_candidates,
-    }
-    flat_candidates = {name: coords.reshape(-1, 3) for name, coords in ring_candidates.items()}
-    nu_act = sugar_ring_torsions(flat_candidates).reshape(-1, 2, 5)
-    residual = wrap_dihedral_diff(nu_act, nus.unsqueeze(1))
-    score = (residual * residual).sum(dim=-1)
-    chirality = signed_tetra_volume(
-        flat_candidates["O4'"],
-        flat_candidates["C2'"],
-        flat_candidates["C3'"],
-        flat_candidates["C4'"],
-    ).reshape(-1, 2)
-    chirality_ok = chirality * _g1('ring_chiral_triple').unsqueeze(-1) > 0.0
-    inf_score = torch.full_like(score, float('inf'))
-    best_valid = torch.where(chirality_ok, score, inf_score).argmin(dim=-1)
-    best_any = score.argmin(dim=-1)
-    best_idx = torch.where(chirality_ok.any(dim=-1), best_valid, best_any)
-    gather_xyz = best_idx.view(-1, 1, 1).expand(-1, 1, 3)
-    gather_nu = best_idx.view(-1, 1, 1).expand(-1, 1, 5)
-    ring_local = {
-        name: coords.gather(1, gather_xyz).squeeze(1)
-        for name, coords in ring_candidates.items()
-    }
-    best_score = score.gather(1, best_idx.unsqueeze(-1)).squeeze(-1)
-    best_residual = residual.gather(1, gather_nu).squeeze(1)
-    return ring_local, best_score, best_residual
-
-
-def _build_sugar_ring_finite_branch_debug(
+def build_sugar_ring_closed_form(
     chi: torch.Tensor,
     P: torch.Tensor,
     tau_m: torch.Tensor,
     restype_indices: torch.Tensor,
     *,
     geometry: Optional[dict] = None,
+    bond_lengths: Optional[dict] = None,
+    bond_angles: Optional[dict] = None,
 ) -> dict[str, torch.Tensor]:
-    """Legacy four-candidate builder kept only for regression tests."""
+    """Analytic finite-branch cyclic sugar builder.
+
+    Exact constraints:
+      - all five ring bond lengths;
+      - ring closure;
+      - ν₀ = dihedral(C1',C2',C3',C4');
+      - ν₄ = dihedral(O4',C1',C2',C3');
+      - ring chirality;
+      - χ after the final rigid rotation around the glycosidic axis.
+
+    Residual constraints:
+      - ν₁, ν₂, ν₃ are evaluated after construction and used only for branch
+        selection. With fixed template lengths and angles, enforcing all five ν
+        exactly is generally overconstrained.
+    """
+    _ = bond_lengths, bond_angles
     g = geometry or {}
     chi_f, P_f, tm_f, ri, orig, squeeze_batch = _flatten_sugar_builder_inputs(
         chi,
@@ -816,41 +657,40 @@ def _build_sugar_ring_finite_branch_debug(
     ba_c1_c2_c3 = _g1('ba_c1_c2_c3')
     bl_c4_c3 = _g1('bl_c4_c3')
     bl_o4_c4 = _g1('bl_o4_c4')
+
     zero = torch.zeros_like(bl_o4_c1)
     c1_local = torch.stack([zero, zero, zero], dim=-1)
     o4_local = torch.stack([bl_o4_c1, zero, zero], dim=-1)
     x2 = bl_c2_c1 * torch.cos(ba_o4_c1_c2)
     y2 = bl_c2_c1 * torch.sin(ba_o4_c1_c2)
-    c2_branches = torch.stack([
-        torch.stack([x2, y2, zero], dim=-1),
-        torch.stack([x2, -y2, zero], dim=-1),
-    ], dim=1)
-    c1_b = c1_local.unsqueeze(1).expand(-1, 2, -1).reshape(-1, 3)
-    o4_b = o4_local.unsqueeze(1).expand(-1, 2, -1).reshape(-1, 3)
-    c2_b = c2_branches.reshape(-1, 3)
-    c3_b = nerf_place(
-        o4_b,
-        c1_b,
-        c2_b,
+    c2_a = torch.stack([x2, y2, zero], dim=-1)
+    c2_b = torch.stack([x2, -y2, zero], dim=-1)
+    c1_pair = c1_local.unsqueeze(1).expand(-1, 2, -1).reshape(-1, 3)
+    o4_pair = o4_local.unsqueeze(1).expand(-1, 2, -1).reshape(-1, 3)
+    c2_pair = torch.stack([c2_a, c2_b], dim=1).reshape(-1, 3)
+    c3_pair = nerf_place(
+        o4_pair,
+        c1_pair,
+        c2_pair,
         bl_c3_c2.unsqueeze(1).expand(-1, 2).reshape(-1),
         ba_c1_c2_c3.unsqueeze(1).expand(-1, 2).reshape(-1),
         nus[:, 4].unsqueeze(1).expand(-1, 2).reshape(-1) - half_pi,
     )
-    d_vec = o4_b - c3_b
+    d_vec = o4_pair - c3_pair
     d_sq = (d_vec * d_vec).sum(dim=-1)
     d = d_sq.clamp(min=1e-8).sqrt()
     d_hat = d_vec / d.unsqueeze(-1)
-    bl_c4_c3_b = bl_c4_c3.unsqueeze(1).expand(-1, 2).reshape(-1)
-    bl_o4_c4_b = bl_o4_c4.unsqueeze(1).expand(-1, 2).reshape(-1)
-    h = (d_sq + bl_c4_c3_b ** 2 - bl_o4_c4_b ** 2) / (2.0 * d)
-    r_c = (bl_c4_c3_b ** 2 - h ** 2).clamp(min=0.0).sqrt()
-    circle_center = c3_b + h.unsqueeze(-1) * d_hat
+    c4_len = bl_c4_c3.unsqueeze(1).expand(-1, 2).reshape(-1)
+    o4_len = bl_o4_c4.unsqueeze(1).expand(-1, 2).reshape(-1)
+    h = (d_sq + c4_len ** 2 - o4_len ** 2) / (2.0 * d)
+    r_c = (c4_len ** 2 - h ** 2).clamp(min=0.0).sqrt()
+    circle_center = c3_pair + h.unsqueeze(-1) * d_hat
     _, e1, e2 = _orthonormal_basis_from_axis(d_vec, eps=_GEO_EPS)
-    bc32 = c3_b - c2_b
+    bc32 = c3_pair - c2_pair
     cross_a = torch.linalg.cross(bc32, d_hat, dim=-1)
     cross_b = torch.linalg.cross(bc32, e1, dim=-1)
     cross_c = torch.linalg.cross(bc32, e2, dim=-1)
-    n12 = _safe_normalize(torch.linalg.cross(c1_b - c2_b, bc32, dim=-1))
+    n12 = _safe_normalize(torch.linalg.cross(c1_pair - c2_pair, bc32, dim=-1))
     m12 = torch.linalg.cross(n12, _safe_normalize(bc32), dim=-1)
     a0 = h * (n12 * cross_a).sum(dim=-1)
     a1 = h * (m12 * cross_a).sum(dim=-1)
@@ -865,24 +705,26 @@ def _build_sugar_ring_finite_branch_debug(
     qc = ct * g1 - st * g0
     rc = ct * a1 - st * a0
     pq = (pc ** 2 + qc ** 2).clamp(min=1e-8).sqrt()
-    phi = torch.stack([
-        torch.atan2(qc, pc) + torch.acos((-rc / pq).clamp(-1.0, 1.0)),
-        torch.atan2(qc, pc) - torch.acos((-rc / pq).clamp(-1.0, 1.0)),
-    ], dim=1)
-    c4_candidates = (
-        circle_center.unsqueeze(1)
-        + r_c.unsqueeze(-1).unsqueeze(-1)
-        * (
-            torch.cos(phi).unsqueeze(-1) * e1.unsqueeze(1)
-            + torch.sin(phi).unsqueeze(-1) * e2.unsqueeze(1)
-        )
-    ).reshape(-1, 4, 3)
+    phi_a = torch.atan2(qc, pc) + torch.acos((-rc / pq).clamp(-1.0, 1.0))
+    phi_b = torch.atan2(qc, pc) - torch.acos((-rc / pq).clamp(-1.0, 1.0))
+    c4_pair_a = circle_center + r_c.unsqueeze(-1) * (
+        torch.cos(phi_a).unsqueeze(-1) * e1 + torch.sin(phi_a).unsqueeze(-1) * e2
+    )
+    c4_pair_b = circle_center + r_c.unsqueeze(-1) * (
+        torch.cos(phi_b).unsqueeze(-1) * e1 + torch.sin(phi_b).unsqueeze(-1) * e2
+    )
+
     ring_candidates = {
-        "C1'": c1_local.unsqueeze(1).expand(-1, 4, -1),
-        "O4'": o4_local.unsqueeze(1).expand(-1, 4, -1),
-        "C2'": c2_branches.unsqueeze(2).expand(-1, 2, 2, -1).reshape(-1, 4, 3),
-        "C3'": c3_b.reshape(-1, 2, 3).unsqueeze(2).expand(-1, 2, 2, -1).reshape(-1, 4, 3),
-        "C4'": c4_candidates,
+        "C1'": torch.stack([c1_local, c1_local, c1_local, c1_local], dim=1),
+        "O4'": torch.stack([o4_local, o4_local, o4_local, o4_local], dim=1),
+        "C2'": torch.stack([c2_a, c2_a, c2_b, c2_b], dim=1),
+        "C3'": c3_pair.reshape(-1, 2, 3).repeat_interleave(2, dim=1),
+        "C4'": torch.stack([
+            c4_pair_a.reshape(-1, 2, 3)[:, 0],
+            c4_pair_b.reshape(-1, 2, 3)[:, 0],
+            c4_pair_a.reshape(-1, 2, 3)[:, 1],
+            c4_pair_b.reshape(-1, 2, 3)[:, 1],
+        ], dim=1),
     }
     flat_candidates = {name: coords.reshape(-1, 3) for name, coords in ring_candidates.items()}
     nu_act = sugar_ring_torsions(flat_candidates).reshape(-1, 4, 5)
@@ -896,9 +738,23 @@ def _build_sugar_ring_finite_branch_debug(
     ).reshape(-1, 4)
     chirality_ok = chirality * _g1('ring_chiral_triple').unsqueeze(-1) > 0.0
     inf_score = torch.full_like(score, float('inf'))
-    best_valid = torch.where(chirality_ok, score, inf_score).argmin(dim=-1)
-    best_any = score.argmin(dim=-1)
-    best_idx = torch.where(chirality_ok.any(dim=-1), best_valid, best_any)
+    score_valid = torch.where(chirality_ok, score, inf_score)
+    score0 = score_valid[:, 0]
+    score1 = torch.where(score_valid[:, 1] < score0, score_valid[:, 1], score0)
+    idx1 = torch.where(score_valid[:, 1] < score0, 1, 0)
+    score2 = torch.where(score_valid[:, 2] < score1, score_valid[:, 2], score1)
+    idx2 = torch.where(score_valid[:, 2] < score1, 2, idx1)
+    best_score = torch.where(score_valid[:, 3] < score2, score_valid[:, 3], score2)
+    best_idx = torch.where(score_valid[:, 3] < score2, 3, idx2)
+
+    any_valid = chirality_ok.any(dim=-1)
+    raw0 = score[:, 0]
+    raw1 = torch.where(score[:, 1] < raw0, score[:, 1], raw0)
+    raw_idx1 = torch.where(score[:, 1] < raw0, 1, 0)
+    raw2 = torch.where(score[:, 2] < raw1, score[:, 2], raw1)
+    raw_idx2 = torch.where(score[:, 2] < raw1, 2, raw_idx1)
+    raw_best_idx = torch.where(score[:, 3] < raw2, 3, raw_idx2)
+    best_idx = torch.where(any_valid, best_idx, raw_best_idx)
     gather_idx = best_idx.view(-1, 1, 1).expand(-1, 1, 3)
     ring_local = {
         name: coords.gather(1, gather_idx).squeeze(1)
@@ -912,196 +768,6 @@ def _build_sugar_ring_finite_branch_debug(
         dtype=dtype,
         orig=orig,
         squeeze_batch=squeeze_batch,
-    )
-
-
-def _solve_c2_azimuth(
-    P_f: torch.Tensor,
-    tm_f: torch.Tensor,
-    ri: torch.Tensor,
-    tc: dict[str, torch.Tensor],
-    *,
-    dtype: torch.dtype,
-    geometry: dict[str, Any],
-) -> torch.Tensor:
-    """Bounded deterministic 1D solve for the continuous C2' azimuth."""
-    n_samples = int(geometry.get('c2_azimuth_samples', _C2_AZIMUTH_SAMPLES))
-    refine_steps = int(geometry.get('c2_azimuth_refine_steps', _C2_AZIMUTH_REFINE_STEPS))
-    if n_samples < 4:
-        raise ValueError('c2_azimuth_samples must be at least 4.')
-    device = P_f.device
-    device_str = str(device)
-    step = _TWO_PI / float(n_samples)
-    phi_grid = torch.arange(n_samples, device=device, dtype=dtype) * _scalar_constant(step, device_str, dtype)
-    n_items = int(P_f.numel())
-    phi_flat = phi_grid.unsqueeze(0).expand(n_items, n_samples).reshape(-1)
-    P_rep = P_f.unsqueeze(1).expand(n_items, n_samples).reshape(-1)
-    tm_rep = tm_f.unsqueeze(1).expand(n_items, n_samples).reshape(-1)
-    ri_rep = ri.unsqueeze(1).expand(n_items, n_samples).reshape(-1)
-    _, coarse_score, _ = _build_sugar_local_ring_for_c2_azimuth(
-        phi_flat,
-        P_rep,
-        tm_rep,
-        ri_rep,
-        tc,
-        dtype=dtype,
-    )
-    coarse_score = coarse_score.reshape(n_items, n_samples)
-    best_idx = coarse_score.argmin(dim=-1)
-    center = phi_grid[best_idx]
-    half_width = _scalar_constant(step, device_str, dtype)
-    lo = center - half_width
-    hi = center + half_width
-    invphi = _scalar_constant((math.sqrt(5.0) - 1.0) / 2.0, device_str, dtype)
-    period = _scalar_constant(_TWO_PI, device_str, dtype)
-
-    def _objective(phi: torch.Tensor) -> torch.Tensor:
-        _, score, _ = _build_sugar_local_ring_for_c2_azimuth(
-            torch.remainder(phi, period),
-            P_f,
-            tm_f,
-            ri,
-            tc,
-            dtype=dtype,
-        )
-        return score
-
-    for _ in range(refine_steps):
-        c = hi - invphi * (hi - lo)
-        d = lo + invphi * (hi - lo)
-        fc = _objective(c)
-        fd = _objective(d)
-        choose_left = fc <= fd
-        hi = torch.where(choose_left, d, hi)
-        lo = torch.where(choose_left, lo, c)
-    return torch.remainder(0.5 * (lo + hi), period)
-
-
-def build_ring_for_c2_azimuth(
-    phi_c2: torch.Tensor,
-    chi: torch.Tensor,
-    P: torch.Tensor,
-    tau_m: torch.Tensor,
-    restype_indices: torch.Tensor,
-    *,
-    geometry: Optional[dict] = None,
-) -> dict[str, torch.Tensor]:
-    """Build a sugar ring for a fixed continuous C2' azimuth.
-
-    In the current sugar-local gauge this azimuth is a rigid rotation around the
-    O4'–C1' bond, so it is useful for diagnostics but not as an independent
-    pseudorotation control variable.
-    """
-    g = geometry or {}
-    chi_f, P_f, tm_f, ri, orig, squeeze_batch = _flatten_sugar_builder_inputs(
-        chi,
-        P,
-        tau_m,
-        restype_indices,
-    )
-    if phi_c2.shape != P.shape:
-        raise ValueError('phi_c2 must share the same leading shape as P.')
-    phi_f = phi_c2.reshape(-1).to(device=P_f.device, dtype=P_f.dtype)
-    tc = g.get('template_tensors')
-    if tc is None:
-        tc = _get_template_tensors(str(P_f.device))
-    ring_local, _, _ = _build_sugar_local_ring_for_c2_azimuth(
-        phi_f,
-        P_f,
-        tm_f,
-        ri,
-        tc,
-        dtype=P_f.dtype,
-    )
-    return _map_sugar_ring_local_to_output(
-        ring_local,
-        chi_f,
-        ri,
-        tc,
-        dtype=P_f.dtype,
-        orig=orig,
-        squeeze_batch=squeeze_batch,
-    )
-
-
-def build_sugar_ring_cyclic_deterministic(
-    chi: torch.Tensor,
-    P: torch.Tensor,
-    tau_m: torch.Tensor,
-    restype_indices: torch.Tensor,
-    *,
-    geometry: Optional[dict] = None,
-    bond_lengths: Optional[dict] = None,
-    bond_angles: Optional[dict] = None,
-) -> dict[str, torch.Tensor]:
-    """Deterministic cyclic sugar builder with a continuous C2' azimuth solve.
-
-    Exact constraints:
-      - all five ring bond lengths;
-      - ν₄ = dihedral(O4',C1',C2',C3');
-      - ν₀ = dihedral(C1',C2',C3',C4').
-
-    The remaining ν₁, ν₂, ν₃ residual is minimized over the continuous C2' azimuth
-    with a bounded deterministic scalar solve. This is not a literal closed-form
-    reconstruction for all five endocyclic torsions.
-    """
-    _ = bond_lengths, bond_angles
-    g = geometry or {}
-    chi_f, P_f, tm_f, ri, orig, squeeze_batch = _flatten_sugar_builder_inputs(
-        chi,
-        P,
-        tau_m,
-        restype_indices,
-    )
-    tc = g.get('template_tensors')
-    if tc is None:
-        tc = _get_template_tensors(str(P_f.device))
-    phi_c2 = _solve_c2_azimuth(
-        P_f,
-        tm_f,
-        ri,
-        tc,
-        dtype=P_f.dtype,
-        geometry=g,
-    )
-    ring_local, _, _ = _build_sugar_local_ring_for_c2_azimuth(
-        phi_c2,
-        P_f,
-        tm_f,
-        ri,
-        tc,
-        dtype=P_f.dtype,
-    )
-    return _map_sugar_ring_local_to_output(
-        ring_local,
-        chi_f,
-        ri,
-        tc,
-        dtype=P_f.dtype,
-        orig=orig,
-        squeeze_batch=squeeze_batch,
-    )
-
-
-def build_sugar_ring_closed_form(
-    chi: torch.Tensor,
-    P: torch.Tensor,
-    tau_m: torch.Tensor,
-    restype_indices: torch.Tensor,
-    *,
-    geometry: Optional[dict] = None,
-    bond_lengths: Optional[dict] = None,
-    bond_angles: Optional[dict] = None,
-) -> dict[str, torch.Tensor]:
-    """Legacy compatibility wrapper for the deterministic cyclic sugar builder."""
-    return build_sugar_ring_cyclic_deterministic(
-        chi,
-        P,
-        tau_m,
-        restype_indices,
-        geometry=geometry,
-        bond_lengths=bond_lengths,
-        bond_angles=bond_angles,
     )
 
 

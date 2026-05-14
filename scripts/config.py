@@ -6,7 +6,7 @@ BASE = dict(
     NUM_HEADS=8,
     NUM_LAYERS=3,
     NUM_TIMESTEPS=200,
-    BATCH_SIZE=3000,
+    BATCH_SIZE=80000,
     LR=1e-3,
     WEIGHT_DECAY=0.01,
     EDGE_WEIGHT=0.3,  # from 0 (for central-only), to 1 (for edge-only)
@@ -38,7 +38,7 @@ EXPERIMENTS = [
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'torsions/3'
+RUN_NAME = 'torsions/4'
 
 SEED = 42
 

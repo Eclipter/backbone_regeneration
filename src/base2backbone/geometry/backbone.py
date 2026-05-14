@@ -524,13 +524,22 @@ def _map_sugar_local_ring_to_base_frame(
     *,
     c1_base: torch.Tensor,
     o4_base: torch.Tensor,
-    n_atom: torch.Tensor,
+    c2_ref: torch.Tensor,
     c4_base: torch.Tensor,
 ) -> dict[str, torch.Tensor]:
-    """Map a sugar-local gauge to the nucleotide base frame with a rigid transform."""
+    """Map a sugar-local gauge to the nucleotide base frame with a rigid transform.
+
+    The ring-local convention pins C2' to ``(x2, -y2, 0)`` with ``z = 0`` by construction,
+    so the world-frame y-axis must point towards the template C2' (not towards N).
+    The legacy (C1', O4', N)-plane heuristic put C2' in that plane, which is geometrically
+    wrong for D-deoxyribose and produced a ring rotated ~50° around the C1'-O4' axis vs
+    the template (≈3.6 Å RMSD even on round-trip inputs).
+    """
     x_axis = _safe_normalize(o4_base - c1_base)
-    y_seed = n_atom - c1_base
+    y_seed = c2_ref - c1_base
     y_seed = y_seed - (y_seed * x_axis).sum(dim=-1, keepdim=True) * x_axis
+    # Flip sign because ring-local places C2' at y = -y2 (D-deoxyribose stereochemistry).
+    y_seed = -y_seed
     alt_seed = c4_base - c1_base
     alt_seed = alt_seed - (alt_seed * x_axis).sum(dim=-1, keepdim=True) * x_axis
     _, basis_y, _ = _orthonormal_basis_from_axis(x_axis, eps=_GEO_EPS)
@@ -541,7 +550,10 @@ def _map_sugar_local_ring_to_base_frame(
     y_axis = _safe_normalize(y_axis)
     z_axis = _safe_normalize(torch.linalg.cross(x_axis, y_axis, dim=-1))
     y_axis = torch.linalg.cross(z_axis, x_axis, dim=-1)
-    frame = torch.stack([x_axis, y_axis, z_axis], dim=-2)
+    # Column-stacked basis: frame[..., :, j] is the j-th basis vector in world coords.
+    # `local_to_world_points` does `local @ frame.T + origin`, which expects this convention
+    # (the same one used by `nt_frames_world` across the dataset).
+    frame = torch.stack([x_axis, y_axis, z_axis], dim=-1)
     return {
         name: local_to_world_points(coords, c1_base, frame)
         for name, coords in ring_local.items()
@@ -590,12 +602,13 @@ def _map_sugar_ring_local_to_output(
     o4_base = _template_select(tc, 'o4', ri, dtype=dtype).reshape(-1, 3)
     n_atom = _template_select(tc, 'chi_n', ri, dtype=dtype).reshape(-1, 3)
     c_atom = _template_select(tc, 'chi_c', ri, dtype=dtype).reshape(-1, 3)
+    c2_ref = _template_select(tc, 'c2_ref', ri, dtype=dtype).reshape(-1, 3)
     c4_base = _template_select(tc, 'c4_ref', ri, dtype=dtype).reshape(-1, 3)
     ring_pre = _map_sugar_local_ring_to_base_frame(
         ring_local,
         c1_base=c1_base,
         o4_base=o4_base,
-        n_atom=n_atom,
+        c2_ref=c2_ref,
         c4_base=c4_base,
     )
     out = _apply_chi_rotation_to_sugar_ring(ring_pre, chi_f, n_atom, c_atom)
@@ -663,34 +676,32 @@ def build_sugar_ring_closed_form(
     o4_local = torch.stack([bl_o4_c1, zero, zero], dim=-1)
     x2 = bl_c2_c1 * torch.cos(ba_o4_c1_c2)
     y2 = bl_c2_c1 * torch.sin(ba_o4_c1_c2)
-    c2_a = torch.stack([x2, y2, zero], dim=-1)
-    c2_b = torch.stack([x2, -y2, zero], dim=-1)
-    c1_pair = c1_local.unsqueeze(1).expand(-1, 2, -1).reshape(-1, 3)
-    o4_pair = o4_local.unsqueeze(1).expand(-1, 2, -1).reshape(-1, 3)
-    c2_pair = torch.stack([c2_a, c2_b], dim=1).reshape(-1, 3)
-    c3_pair = nerf_place(
-        o4_pair,
-        c1_pair,
-        c2_pair,
-        bl_c3_c2.unsqueeze(1).expand(-1, 2).reshape(-1),
-        ba_c1_c2_c3.unsqueeze(1).expand(-1, 2).reshape(-1),
-        nus[:, 4].unsqueeze(1).expand(-1, 2).reshape(-1) - half_pi,
+    # D-deoxyribose stereochemistry pins C2' to the negative-y half of the (C1', O4', N) plane:
+    # the two mirror-twin sugar rings (related by 180° rotation around the C1'-O4' axis) share
+    # identical endocyclic ν dihedrals, so the legacy 4-candidate scheme picked either by chance.
+    # See `_TEMPLATE_C2_Y_SIGN` for the empirical verification across A/C/G/T.
+    c2_local = torch.stack([x2, -y2, zero], dim=-1)
+    c3_local = nerf_place(
+        o4_local,
+        c1_local,
+        c2_local,
+        bl_c3_c2,
+        ba_c1_c2_c3,
+        nus[:, 4] - half_pi,
     )
-    d_vec = o4_pair - c3_pair
+    d_vec = o4_local - c3_local
     d_sq = (d_vec * d_vec).sum(dim=-1)
     d = d_sq.clamp(min=1e-8).sqrt()
     d_hat = d_vec / d.unsqueeze(-1)
-    c4_len = bl_c4_c3.unsqueeze(1).expand(-1, 2).reshape(-1)
-    o4_len = bl_o4_c4.unsqueeze(1).expand(-1, 2).reshape(-1)
-    h = (d_sq + c4_len ** 2 - o4_len ** 2) / (2.0 * d)
-    r_c = (c4_len ** 2 - h ** 2).clamp(min=0.0).sqrt()
-    circle_center = c3_pair + h.unsqueeze(-1) * d_hat
+    h = (d_sq + bl_c4_c3 ** 2 - bl_o4_c4 ** 2) / (2.0 * d)
+    r_c = (bl_c4_c3 ** 2 - h ** 2).clamp(min=0.0).sqrt()
+    circle_center = c3_local + h.unsqueeze(-1) * d_hat
     _, e1, e2 = _orthonormal_basis_from_axis(d_vec, eps=_GEO_EPS)
-    bc32 = c3_pair - c2_pair
+    bc32 = c3_local - c2_local
     cross_a = torch.linalg.cross(bc32, d_hat, dim=-1)
     cross_b = torch.linalg.cross(bc32, e1, dim=-1)
     cross_c = torch.linalg.cross(bc32, e2, dim=-1)
-    n12 = _safe_normalize(torch.linalg.cross(c1_pair - c2_pair, bc32, dim=-1))
+    n12 = _safe_normalize(torch.linalg.cross(c1_local - c2_local, bc32, dim=-1))
     m12 = torch.linalg.cross(n12, _safe_normalize(bc32), dim=-1)
     a0 = h * (n12 * cross_a).sum(dim=-1)
     a1 = h * (m12 * cross_a).sum(dim=-1)
@@ -698,36 +709,32 @@ def build_sugar_ring_closed_form(
     b1 = r_c * (m12 * cross_b).sum(dim=-1)
     g0 = r_c * (n12 * cross_c).sum(dim=-1)
     g1 = r_c * (m12 * cross_c).sum(dim=-1)
-    nu0_tgt = nus[:, 0].unsqueeze(1).expand(-1, 2).reshape(-1)
+    nu0_tgt = nus[:, 0]
     ct = torch.cos(nu0_tgt)
     st = torch.sin(nu0_tgt)
     pc = ct * b1 - st * b0
     qc = ct * g1 - st * g0
-    rc = ct * a1 - st * a0
+    rc_coef = ct * a1 - st * a0
     pq = (pc ** 2 + qc ** 2).clamp(min=1e-8).sqrt()
-    phi_a = torch.atan2(qc, pc) + torch.acos((-rc / pq).clamp(-1.0, 1.0))
-    phi_b = torch.atan2(qc, pc) - torch.acos((-rc / pq).clamp(-1.0, 1.0))
-    c4_pair_a = circle_center + r_c.unsqueeze(-1) * (
+    phi_a = torch.atan2(qc, pc) + torch.acos((-rc_coef / pq).clamp(-1.0, 1.0))
+    phi_b = torch.atan2(qc, pc) - torch.acos((-rc_coef / pq).clamp(-1.0, 1.0))
+    c4_a = circle_center + r_c.unsqueeze(-1) * (
         torch.cos(phi_a).unsqueeze(-1) * e1 + torch.sin(phi_a).unsqueeze(-1) * e2
     )
-    c4_pair_b = circle_center + r_c.unsqueeze(-1) * (
+    c4_b = circle_center + r_c.unsqueeze(-1) * (
         torch.cos(phi_b).unsqueeze(-1) * e1 + torch.sin(phi_b).unsqueeze(-1) * e2
     )
 
+    # Two ring-closure candidates only (a vs b for C4' on the intersection circle).
     ring_candidates = {
-        "C1'": torch.stack([c1_local, c1_local, c1_local, c1_local], dim=1),
-        "O4'": torch.stack([o4_local, o4_local, o4_local, o4_local], dim=1),
-        "C2'": torch.stack([c2_a, c2_a, c2_b, c2_b], dim=1),
-        "C3'": c3_pair.reshape(-1, 2, 3).repeat_interleave(2, dim=1),
-        "C4'": torch.stack([
-            c4_pair_a.reshape(-1, 2, 3)[:, 0],
-            c4_pair_b.reshape(-1, 2, 3)[:, 0],
-            c4_pair_a.reshape(-1, 2, 3)[:, 1],
-            c4_pair_b.reshape(-1, 2, 3)[:, 1],
-        ], dim=1),
+        "C1'": torch.stack([c1_local, c1_local], dim=1),
+        "O4'": torch.stack([o4_local, o4_local], dim=1),
+        "C2'": torch.stack([c2_local, c2_local], dim=1),
+        "C3'": torch.stack([c3_local, c3_local], dim=1),
+        "C4'": torch.stack([c4_a, c4_b], dim=1),
     }
     flat_candidates = {name: coords.reshape(-1, 3) for name, coords in ring_candidates.items()}
-    nu_act = sugar_ring_torsions(flat_candidates).reshape(-1, 4, 5)
+    nu_act = sugar_ring_torsions(flat_candidates).reshape(-1, 2, 5)
     residual = wrap_dihedral_diff(nu_act, nus.unsqueeze(1))
     score = (residual * residual).sum(dim=-1)
     chirality = signed_tetra_volume(
@@ -735,26 +742,14 @@ def build_sugar_ring_closed_form(
         flat_candidates["C2'"],
         flat_candidates["C3'"],
         flat_candidates["C4'"],
-    ).reshape(-1, 4)
+    ).reshape(-1, 2)
     chirality_ok = chirality * _g1('ring_chiral_triple').unsqueeze(-1) > 0.0
     inf_score = torch.full_like(score, float('inf'))
     score_valid = torch.where(chirality_ok, score, inf_score)
-    score0 = score_valid[:, 0]
-    score1 = torch.where(score_valid[:, 1] < score0, score_valid[:, 1], score0)
-    idx1 = torch.where(score_valid[:, 1] < score0, 1, 0)
-    score2 = torch.where(score_valid[:, 2] < score1, score_valid[:, 2], score1)
-    idx2 = torch.where(score_valid[:, 2] < score1, 2, idx1)
-    best_score = torch.where(score_valid[:, 3] < score2, score_valid[:, 3], score2)
-    best_idx = torch.where(score_valid[:, 3] < score2, 3, idx2)
-
     any_valid = chirality_ok.any(dim=-1)
-    raw0 = score[:, 0]
-    raw1 = torch.where(score[:, 1] < raw0, score[:, 1], raw0)
-    raw_idx1 = torch.where(score[:, 1] < raw0, 1, 0)
-    raw2 = torch.where(score[:, 2] < raw1, score[:, 2], raw1)
-    raw_idx2 = torch.where(score[:, 2] < raw1, 2, raw_idx1)
-    raw_best_idx = torch.where(score[:, 3] < raw2, 3, raw_idx2)
-    best_idx = torch.where(any_valid, best_idx, raw_best_idx)
+    best_idx_valid = torch.where(score_valid[:, 1] < score_valid[:, 0], 1, 0)
+    best_idx_raw = torch.where(score[:, 1] < score[:, 0], 1, 0)
+    best_idx = torch.where(any_valid, best_idx_valid, best_idx_raw)
     gather_idx = best_idx.view(-1, 1, 1).expand(-1, 1, 3)
     ring_local = {
         name: coords.gather(1, gather_idx).squeeze(1)

@@ -6,7 +6,7 @@ BASE = dict(
     NUM_HEADS=8,
     NUM_LAYERS=3,
     NUM_TIMESTEPS=200,
-    BATCH_SIZE=80000,
+    BATCH_SIZE=50000,
     LR=1e-3,
     WEIGHT_DECAY=0.01,
     EDGE_WEIGHT=0.3,  # from 0 (for central-only), to 1 (for edge-only)
@@ -18,16 +18,16 @@ BASE = dict(
     SWA_LR=0.1,
     SWA_EPOCH_START=80,
     NUM_EPOCHS=110,
-    ANGULAR_SIGMA_MIN=0.01*pi,
-    ANGULAR_SIGMA_MAX=pi,
-    TAU_SIGMA_MIN=0.01*pi,
-    TAU_SIGMA_MAX=pi,
-    SCORE_LOSS_WEIGHTING='sigma2',
-    TAU_LOSS_WEIGHT=1.0,
-    CLOSURE_LOSS_WEIGHT=0.0,
-    CLOSURE_BOND_WEIGHT=1.0,
-    CLOSURE_ANGLE_WEIGHT=1.0,
-    CLOSURE_TORSION_WEIGHT=1.0,
+    ANGULAR_SIGMA_MIN=0.01*pi,  # from 0 (no noise), to ANGULAR_SIGMA_MAX
+    ANGULAR_SIGMA_MAX=pi,  # from ANGULAR_SIGMA_MIN, to pi (wrapped angles ~ uniform)
+    TAU_SIGMA_MIN=0.01,  # from 0 (no noise), to TAU_SIGMA_MAX
+    TAU_SIGMA_MAX=1.5,  # from TAU_SIGMA_MIN, to ~3.4 (= log(TAU_M_MAX/TAU_M_MIN))
+    SCORE_LOSS_WEIGHTING='sigma2',  # 'sigma2' | 'none'
+    TAU_LOSS_WEIGHT=1,  # [0, +inf)
+    CLOSURE_LOSS_WEIGHT=0.3,  # [0, +inf)
+    CLOSURE_BOND_WEIGHT=1,  # [0, +inf)
+    CLOSURE_ANGLE_WEIGHT=1,  # [0, +inf)
+    CLOSURE_TORSION_WEIGHT=1,  # [0, +inf)
     TORCH_COMPILE=True,
     START_FROM_LAST_CKPT=False,
 )
@@ -38,7 +38,7 @@ EXPERIMENTS = [
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'torsions/4'
+RUN_NAME = 'torsions/returned_edge_nts'
 
 SEED = 42
 

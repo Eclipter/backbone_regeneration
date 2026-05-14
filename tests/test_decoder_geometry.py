@@ -359,7 +359,10 @@ def test_ground_truth_torsions_rmsd_loose(device):
         gt = torch.tensor(tpl[nm], dtype=torch.float32, device=device)
         diffs.append((v.squeeze(0) - gt).norm().item())
     rms = float(np.sqrt(np.mean(np.square(diffs)))) if diffs else 0.0
-    assert rms < 5.0
+    # Tight bound: with the column-stacked frame, the template-derived y-axis
+    # and the stereo-pinned C2' branch, the only residual is the Altona-Sundaralingam
+    # ν fit error (~0.03 rad) which propagates to ~0.05 Å per ring atom.
+    assert rms < 0.10, f'round-trip RMSD too high: {rms:.4f} A'
 
 
 def test_window_builder_batch_size_gt_one_finite(device):

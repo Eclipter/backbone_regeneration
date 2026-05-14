@@ -7,6 +7,11 @@ import torch
 
 GEO_EPS = 1e-8
 GEO_EPS_NP = 1e-12
+# Backward-stable epsilons used in safe-norm and acos-clamp tricks.
+# `GEO_EPS_SQ` keeps `((v*v).sum + eps2).sqrt()` differentiable at v=0;
+# `ACOS_CLAMP_EPS` must be >> FP32 epsilon (~1.19e-7) so `1 - eps != 1` in float32.
+GEO_EPS_SQ = 1e-12
+ACOS_CLAMP_EPS = 1e-6
 
 
 def _preferred_geometry_device() -> torch.device:
@@ -90,14 +95,18 @@ def dihedral_rad(
     b3 = p3 - p2
     n1 = torch.linalg.cross(b1, b2)
     n2 = torch.linalg.cross(b2, b3)
-    b2u = b2 / (b2.norm(dim=-1, keepdim=True) + GEO_EPS)
-    n1n = n1.norm(dim=-1, keepdim=True) + GEO_EPS
-    n2n = n2.norm(dim=-1, keepdim=True) + GEO_EPS
-    n1u = n1 / n1n
-    n2u = n2 / n2n
+    # `(v*v).sum + eps2`.sqrt() avoids NaN backward of `||v||` at v=0 (`v/||v||` -> 0/0).
+    b2u = b2 / ((b2 * b2).sum(dim=-1, keepdim=True) + GEO_EPS_SQ).sqrt()
+    n1u = n1 / ((n1 * n1).sum(dim=-1, keepdim=True) + GEO_EPS_SQ).sqrt()
+    n2u = n2 / ((n2 * n2).sum(dim=-1, keepdim=True) + GEO_EPS_SQ).sqrt()
     m1 = torch.linalg.cross(n1u, b2u)
     x = (n1u * n2u).sum(dim=-1)
     y = (m1 * n2u).sum(dim=-1)
+    # Substitute (x, y) -> (1, 0) where both vanish: avoids `atan2(0, 0)` backward = 0/0 = NaN
+    # for collinear-bond samples; gradient on degenerate rows then flows only into the constant.
+    ok = (x * x + y * y) > GEO_EPS_SQ
+    y = torch.where(ok, y, torch.zeros_like(y))
+    x = torch.where(ok, x, torch.ones_like(x))
     return torch.atan2(y, x)
 
 
@@ -163,9 +172,14 @@ def bond_angle(
     """Interior angle ``∠(a-b-c)`` in radians; batched last dim 3."""
     ba = a - b
     bc = c - b
-    denom = ba.norm(dim=-1) * bc.norm(dim=-1) + eps
+    # `(v*v).sum + eps2`.sqrt() avoids NaN backward of `||v||` at v=0 (`v/||v||` -> 0/0).
+    ba_n = ((ba * ba).sum(dim=-1) + GEO_EPS_SQ).sqrt()
+    bc_n = ((bc * bc).sum(dim=-1) + GEO_EPS_SQ).sqrt()
+    denom = ba_n * bc_n + eps
     cos_t = (ba * bc).sum(dim=-1) / denom
-    cos_t = cos_t.clamp(-1.0 + eps, 1.0 - eps)
+    # `1 - 1e-8` collapses to 1.0 in float32 (FP32 eps ~1.19e-7) -> acos backward = -inf.
+    # Use `ACOS_CLAMP_EPS=1e-6` (float32-effective); on the boundary clamp zeroes the grad.
+    cos_t = cos_t.clamp(-1.0 + ACOS_CLAMP_EPS, 1.0 - ACOS_CLAMP_EPS)
     return torch.acos(cos_t)
 
 

@@ -694,7 +694,8 @@ def build_sugar_ring_closed_form(
     d = d_sq.clamp(min=1e-8).sqrt()
     d_hat = d_vec / d.unsqueeze(-1)
     h = (d_sq + bl_c4_c3 ** 2 - bl_o4_c4 ** 2) / (2.0 * d)
-    r_c = (bl_c4_c3 ** 2 - h ** 2).clamp(min=0.0).sqrt()
+    # `+1e-12` floor avoids `sqrt'(0) = +inf` on the boundary (infeasible C3'-C4'-O4' triangle).
+    r_c = ((bl_c4_c3 ** 2 - h ** 2).clamp(min=0.0) + 1e-12).sqrt()
     circle_center = c3_local + h.unsqueeze(-1) * d_hat
     _, e1, e2 = _orthonormal_basis_from_axis(d_vec, eps=_GEO_EPS)
     bc32 = c3_local - c2_local
@@ -716,8 +717,11 @@ def build_sugar_ring_closed_form(
     qc = ct * g1 - st * g0
     rc_coef = ct * a1 - st * a0
     pq = (pc ** 2 + qc ** 2).clamp(min=1e-8).sqrt()
-    phi_a = torch.atan2(qc, pc) + torch.acos((-rc_coef / pq).clamp(-1.0, 1.0))
-    phi_b = torch.atan2(qc, pc) - torch.acos((-rc_coef / pq).clamp(-1.0, 1.0))
+    # FP32-safe clamp eps: `1 - 1e-8 == 1.0` in float32, so the original (-1.0, 1.0) clamp let
+    # `acos(+/-1)` -> backward = -1/sqrt(1-x^2) = -inf. Use 1e-6 (>> FP32 eps ~1.19e-7).
+    acos_arg = (-rc_coef / pq).clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+    phi_a = torch.atan2(qc, pc) + torch.acos(acos_arg)
+    phi_b = torch.atan2(qc, pc) - torch.acos(acos_arg)
     c4_a = circle_center + r_c.unsqueeze(-1) * (
         torch.cos(phi_a).unsqueeze(-1) * e1 + torch.sin(phi_a).unsqueeze(-1) * e2
     )
@@ -929,7 +933,9 @@ def close_phosphate_bridge_multi(
 
     a_coef = (r_o3p * r_o3p - l_po5 * l_po5 + d_o3_o5 * d_o3_o5) / (2.0 * d_o3_o5)
     h_sq = (r_o3p * r_o3p - a_coef * a_coef).clamp(min=0.0)
-    h_val = torch.sqrt(h_sq)
+    # `sqrt(h_sq + eps^2)`: at degenerate (infeasible) triangles `h_sq=0` and `sqrt'(0) = +inf`,
+    # which then propagates to NaN in upstream grads. Tiny additive eps regularises backward.
+    h_val = torch.sqrt(h_sq + 1e-12)
 
     midpoint = o3p + a_coef.unsqueeze(-1) * axis
 

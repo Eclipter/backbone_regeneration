@@ -38,7 +38,7 @@ EXPERIMENTS = [
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'torsions/returned_edge_nts'
+RUN_NAME = 'torsions/5'
 
 SEED = 42
 

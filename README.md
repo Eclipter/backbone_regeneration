@@ -42,7 +42,7 @@ cd pynamod
 
 ## Training
 
-1. Make sure to set up the environment. See [Environment Setup](#environment-setup)
+1. Make sure to set up the environment. See [Setup](#setup)
 
 2. Train and test the model:
 
@@ -64,7 +64,7 @@ python scripts/export.py --run-id torsions/1/baseline
 
 ## Usage
 
-1. Make sure to set up the environment. See [Environment Setup](#environment-setup)
+1. Make sure to set up the environment. See [Setup](#setup)
 
 2. Predict the backbone. Input and output may be PDB or mmCIF independently (e.g. PDB in, mmCIF out). By default **5'-terminal phosphate atoms** (`P`, `OP1`, `OP2`) are **not** predicted. Pass `--generate-5-prime-phosphate` to include them.
 

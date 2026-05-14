@@ -645,7 +645,7 @@ class BackboneLightningModule(pl.LightningModule):
         clo = self._bridge_closure_metrics(pred_x0, batch)
         for key, val in clo.items():
             self.log(
-                f'val/{key}',
+                f'diagnostics/val/{key}',
                 val,
                 on_epoch=True,
                 on_step=False,

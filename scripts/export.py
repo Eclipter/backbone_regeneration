@@ -1,15 +1,16 @@
 """Export the score network from a Lightning checkpoint to ONNX."""
 
-from argparse import ArgumentParser
 import json
 import os
 import os.path as osp
+from argparse import ArgumentParser
 
 import torch
 
 from base2backbone.data import BASE_TO_INDEX
 from base2backbone.model import N_TORSIONS_LATENT, BackboneLightningModule
-from base2backbone.runtime import MODEL_DIR, find_best_checkpoint, resolve_run_dir
+from base2backbone.runtime import (MODEL_DIR, find_best_checkpoint,
+                                   resolve_run_dir)
 
 # Keys describing score-network I/O and sigma endpoints at inference time.
 HPARAM_KEYS = (
@@ -37,7 +38,7 @@ def export_to_onnx(ckpt_path: str, opset: int = EXPORT_OPSET):
 
     pl_module = (
         BackboneLightningModule
-        .load_from_checkpoint(ckpt_path, map_location='cpu')
+        .load_from_checkpoint(ckpt_path, map_location='cpu', weights_only=False)
         .float()
         .eval()
     )

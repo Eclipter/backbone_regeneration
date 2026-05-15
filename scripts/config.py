@@ -30,8 +30,8 @@ BASE = dict(
     CLOSURE_ANGLE_WEIGHT=1,  # [0, +inf)
     CLOSURE_TORSION_WEIGHT=1,  # [0, +inf)
     # Closure σ (normalization for squared deviations); fail thresholds in bridge_closure.py are in σ-units.
-    CLOSURE_SIGMA_BOND_A=0.035,  # (0, +inf) Å
-    CLOSURE_SIGMA_ANGLE_DEG=4.0,  # (0, +inf) deg
+    CLOSURE_SIGMA_BOND_A=0.05,  # (0, +inf) Å
+    CLOSURE_SIGMA_ANGLE_DEG=10,  # (0, +inf) deg
     CLOSURE_SIGMA_TORSION_RAD=0.35,  # (0, +inf) rad
     TORCH_COMPILE=True,
     START_FROM_LAST_CKPT=True,
@@ -40,28 +40,12 @@ BASE = dict(
 # One entry = one experiment. Put ONLY the overrides from BASE here
 EXPERIMENTS = [
     # {},  # baseline (matches BASE)
-    # {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.25},  # ~σ_angle=8°
-    # {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.11}  # ~σ_angle=12°
-    # A: нужен ли angle вообще? Если результат ≈ angle_w=0.25 — выкинуть.
-    # {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0},
-    # # B: с убранным "вредным" angle можно ли давить closure сильнее?
-    # {'CLOSURE_LOSS_WEIGHT': 5e-3, 'CLOSURE_ANGLE_WEIGHT': 0.25},
-    # # C: edge всё ещё 1.34 vs central 1.00. Текущий EDGE_WEIGHT=0.3 — попробовать 0.5.
-    # {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.25, 'EDGE_WEIGHT': 0.5},
-    # 1. Контроль: closure не нужен вообще?
-    # {'CLOSURE_LOSS_WEIGHT': 0},
-    # # 2. Edge всё ещё узкое место (1.33 vs central 1.00).
-    # {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0, 'EDGE_WEIGHT': 0.5},
-    # # 3. train≈val=1.04 → нет переобучения, есть запас по capacity.
-    # {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0, 'NUM_LAYERS': 5, 'BATCH_SIZE': 30000},
-    # Реалистичная σ_angle. Эффективный градиент по angle снизится в 4×.
-    # {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_SIGMA_ANGLE_DEG': 8.0},
     {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.1, 'SAMPLER': 'ODE'},
     {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.1, 'SAMPLER': 'SDE'}
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'torsions/5'
+RUN_NAME = 'torsions/6'
 
 SEED = 42
 

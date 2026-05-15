@@ -10,7 +10,7 @@ import torch
 from .data import BACKBONE_ATOMS
 from .geometry import (bond_angle, dihedral_rad, get_template,
                        get_template_tensors, wrap_dihedral_diff)
-from .geometry.primitives import _bond_angle
+from .geometry.primitives import _bond_angle, nerf_place_coords
 from .torsion_constants import TOR_ALPHA, TOR_BETA, TOR_EPS, TOR_ZETA
 
 _BASE_LETTERS = ('A', 'C', 'G', 'T')
@@ -26,16 +26,48 @@ CLOSURE_FAIL_THRESHOLD_TORSION_SIGMA = 3.0
 _PAIR_BRIDGE_ANGLE_CACHE: Optional[np.ndarray] = None
 
 
-def canonical_two_residue_bridge_positions(rest_prev: str, rest_next: str) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
-    """Prev / next backbone for a contiguous pair (prev O3' at origin).
+# Standard B-DNA backbone bridge stereochemistry (well-established;
+# essentially base-independent — variation across A/C/G/T is < 1°).
+# Used as both the closure-loss angle targets and the reference geometry
+# of ``canonical_two_residue_bridge_positions``.
+_BRIDGE_ANGLE_C3_O3_P = math.radians(119.7)   # ∠C3'_prev – O3'_prev – P_next
+_BRIDGE_ANGLE_O3_P_O5 = math.radians(104.0)   # ∠O3'_prev – P_next – O5'_next
 
-    Next residue is placed as a rigid translate of ``rest_next`` aligned so ``P_next``
-    sits on the ``O3'_{prev}-P_bridge`` chord at template ``bond_p_o3_inter[rest_next]``.
-    This preserves intra-residue P– O5′ and sugar bond lengths unlike rescaling ``P``
-    alone, which inflated ``bond_p_o5`` mismatch in closure loss fixtures.
+# Canonical B-DNA bridge torsions. Picked so the reference geometry is
+# chemically plausible. Self-consistency of the corner-angle LUT does *not*
+# depend on these values; only the reference-geometry tests rely on them.
+_BRIDGE_TORSION_EPS_CANON  = math.radians(-150.0)  # C4'–C3'–O3'–P (ε)
+_BRIDGE_TORSION_ZETA_CANON = math.radians(-75.0)   # C3'–O3'–P–O5'  (ζ)
+_BRIDGE_TORSION_ALPHA_CANON = math.radians(-65.0)  # O3'–P–O5'–C5'  (α)
+
+
+def _kabsch_rigid_align(src: np.ndarray, dst: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(R, t)`` such that ``src @ R.T + t`` ≈ ``dst`` (least squares, rigid)."""
+    src_c = src.mean(axis=0); dst_c = dst.mean(axis=0)
+    H = (src - src_c).T @ (dst - dst_c)
+    U, _, Vt = np.linalg.svd(H)
+    d = np.sign(np.linalg.det(Vt.T @ U.T))
+    D = np.diag([1.0, 1.0, d])
+    R = Vt.T @ D @ U.T
+    t = dst_c - R @ src_c
+    return R, t
+
+
+def canonical_two_residue_bridge_positions(rest_prev: str, rest_next: str) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
+    """Prev / next backbone for a contiguous pair (prev ``O3'`` at origin).
+
+    Builds a chemically realistic B-DNA bridge:
+    - prev residue is the raw template, translated so ``O3'_prev`` = origin;
+    - ``P_next`` placed via NeRF with bond ``O3'–P`` = ``bond_p_o3_inter``,
+      bond angle ``∠C3'–O3'–P`` = 119.7°, dihedral ε = -150° (canonical B-DNA);
+    - ``O5'_next``, ``C5'_next`` placed via NeRF using next-residue template
+      intra bond lengths / angles and canonical bridge torsions (ζ, α);
+    - the rest of the next residue (including ``C4'_next``, sugar, intra
+      ``O3'_next``) is rigid-aligned (Kabsch on ``P, O5', C5'``) from the
+      raw template, preserving all intra-residue bond lengths and angles.
     """
     tp = get_template(rest_prev)
-    tn_raw = get_template(rest_next)
+    tn_raw_dict = get_template(rest_next)
     o3_prev = np.asarray(tp["O3'"], dtype=np.float64)
     prev = {k: np.asarray(tp[k], dtype=np.float64) - o3_prev for k in BACKBONE_ATOMS if k in tp}
 
@@ -44,16 +76,34 @@ def canonical_two_residue_bridge_positions(rest_prev: str, rest_next: str) -> tu
     tt = get_template_tensors('cpu')
     bond_o3_p = float(tt['bond_p_o3_inter'][inc].numpy())
 
-    vp = np.asarray(tp['P'], dtype=np.float64) - o3_prev
-    vn = vp / (np.linalg.norm(vp) + 1e-12)
-    p_tgt = prev["O3'"] + vn * bond_o3_p
+    # Intra-residue bond lengths / angles for next residue — directly from its template.
+    tp_next = {nm: np.asarray(tn_raw_dict[nm], dtype=np.float64) for nm in BACKBONE_ATOMS if nm in tn_raw_dict}
+    bond_p_o5  = float(np.linalg.norm(tp_next['P']   - tp_next["O5'"]))
+    bond_o5_c5 = float(np.linalg.norm(tp_next["O5'"] - tp_next["C5'"]))
+    a_p_o5_c5  = _bond_angle(tp_next['P'], tp_next["O5'"], tp_next["C5'"])
 
-    p_tpl_next = np.asarray(tn_raw['P'], dtype=np.float64)
-    nxt = {
-        nm: np.asarray(tn_raw[nm], dtype=np.float64) - p_tpl_next + p_tgt
-        for nm in BACKBONE_ATOMS
-        if nm in tn_raw
-    }
+    # Place bridge atoms via NeRF (each step: A,B,C → D given bond, angle, torsion).
+    def _np(t: torch.Tensor) -> np.ndarray:
+        return t.detach().cpu().double().numpy().reshape(3)
+
+    p_next = _np(nerf_place_coords(
+        prev["C4'"], prev["C3'"], prev["O3'"], bond_o3_p, _BRIDGE_ANGLE_C3_O3_P, _BRIDGE_TORSION_EPS_CANON,
+    ))
+    o5_next = _np(nerf_place_coords(
+        prev["C3'"], prev["O3'"], p_next, bond_p_o5, _BRIDGE_ANGLE_O3_P_O5, _BRIDGE_TORSION_ZETA_CANON,
+    ))
+    c5_next = _np(nerf_place_coords(
+        prev["O3'"], p_next, o5_next, bond_o5_c5, a_p_o5_c5, _BRIDGE_TORSION_ALPHA_CANON,
+    ))
+
+    # Rigid-align the next-residue template onto (P, O5', C5'); these three
+    # atoms (and the triangle they form) match exactly by construction, so
+    # Kabsch is exact and preserves all next-residue intra geometry, including
+    # C4'_next, O3'_next, sugar atoms, and OP1/OP2.
+    src = np.stack([tp_next['P'], tp_next["O5'"], tp_next["C5'"]])
+    dst = np.stack([p_next,       o5_next,        c5_next])
+    R, t = _kabsch_rigid_align(src, dst)
+    nxt = {nm: tp_next[nm] @ R.T + t for nm in tp_next}
     return prev, nxt
 
 

@@ -9,6 +9,7 @@ dependencies:
   - gemmi
   - tensorboard
   - plotly
+  - py3Dmol
   - onnx
 
   - pip:

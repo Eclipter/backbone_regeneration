@@ -7,8 +7,9 @@ import sys
 import tempfile
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from copy import copy
 from pathlib import Path
-from typing import Optional, cast
+from typing import Any, Optional, cast
 
 import lightning.pytorch as pl
 import numpy as np
@@ -16,6 +17,7 @@ import requests
 import torch
 from torch.utils.data import Sampler
 from torch_geometric.data import Dataset
+from torch_geometric.data.data import BaseData
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
@@ -29,9 +31,39 @@ from .runtime import PROGRESS_BAR_COLOR
 EDGE_CACHE_NAME = 'edge_windows.txt'
 
 
+def _edge_target_idx(data) -> int:
+    return int(data.is_chain_edge_nt.nonzero(as_tuple=True)[0][0].item())
+
+
+def _build_target_payload(data, tidx: int) -> dict[str, torch.Tensor]:
+    ws = int(data.nt_origins_world.size(0))
+    target_nt_idx = torch.tensor(tidx, dtype=torch.long)
+
+    is_target = torch.zeros(ws, dtype=torch.float32)
+    is_target[tidx] = 1.0
+
+    o_t = data.nt_origins_world[tidx]
+    r_t = data.nt_frames_world[tidx]
+    rel_o = (data.nt_origins_world - o_t) @ r_t
+    rel_r = torch.einsum('ji,njk->nik', r_t, data.nt_frames_world)
+    pair_rel_o = (data.pair_origins_world - o_t) @ r_t
+    pair_rel_r = torch.einsum('ji,njk->nik', r_t, data.pair_frames_world)
+
+    return {
+        'target_nt_idx': target_nt_idx,
+        'is_target_nt': is_target,
+        'rel_origins': rel_o.float(),
+        'rel_frames': rel_r.float(),
+        'pair_rel_origins': pair_rel_o.float(),
+        'pair_rel_frames': pair_rel_r.float(),
+    }
+
+
 class PyGDataset(Dataset):
-    def __init__(self):
+    def __init__(self, cache_in_ram: bool = True):
         self.window_size = 3
+        self.cache_in_ram = cache_in_ram
+        self._cache: dict[int, BaseData] | None = {} if cache_in_ram else None
 
         self.pdb_ids = get_pdb_ids()
 
@@ -48,8 +80,12 @@ class PyGDataset(Dataset):
     def len(self):
         return len(self.data_list)
 
-    def get(self, idx):
-        return torch.load(self.data_list[idx], weights_only=False)
+    def get(self, idx) -> BaseData:
+        if self._cache is None:
+            return torch.load(self.data_list[idx], weights_only=False)
+        if idx not in self._cache:
+            self._cache[idx] = torch.load(self.data_list[idx], weights_only=False)
+        return self._cache[idx]
 
     @property
     def raw_file_names(self):
@@ -212,6 +248,11 @@ class PyGDataset(Dataset):
         data_idx = 0
         for _, _, windows in chain_records:
             for _, _, data in windows:
+                # Precompute target-conditioned geometry once during processing.
+                payloads = {'central': _build_target_payload(data, self.window_size // 2)}
+                if bool(data.touches_chain_edge.item()):
+                    payloads['edge'] = _build_target_payload(data, _edge_target_idx(data))
+                data._precomputed_target_payloads = payloads
                 save_path = osp.join(pdb_id_processed_dir, f'{data_idx}.pt')
                 torch.save(data, save_path)
                 if bool(data.touches_chain_edge.item()):
@@ -258,32 +299,17 @@ class WindowTargetDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         w_idx, target_type = self.virtual_entries[i]
-        data = self.base.get(w_idx).clone()
-        ws = self.base.window_size
-        if target_type == self.CENTRAL:
-            tidx = ws // 2
-        else:
-            edge_idx = int(data.is_chain_edge_nt.nonzero(as_tuple=True)[0][0].item())
-            tidx = edge_idx
-        data.target_nt_idx = torch.tensor(tidx, dtype=torch.long)
-
-        # per-atom flag: 1.0 for the target nucleotide, 0.0 for context
-        is_target = torch.zeros(ws, dtype=torch.float)
-        is_target[tidx] = 1.0
-        data.is_target_nt = is_target
-
-        o_t = data.nt_origins_world[tidx]
-        R_t = data.nt_frames_world[tidx]
-        rel_o = (data.nt_origins_world - o_t) @ R_t
-        rel_R = torch.einsum('ji,njk->nik', R_t, data.nt_frames_world)
-        data.rel_origins = rel_o.float()
-        data.rel_frames = rel_R.float()
-
-        # Partner nucleotide positions/frames in the target nucleotide's local frame
-        pair_rel_o = (data.pair_origins_world - o_t) @ R_t
-        pair_rel_R = torch.einsum('ji,njk->nik', R_t, data.pair_frames_world)
-        data.pair_rel_origins = pair_rel_o.float()
-        data.pair_rel_frames = pair_rel_R.float()
+        base_data = self.base.get(w_idx)
+        data = copy(base_data)
+        payload_key = 'central' if target_type == self.CENTRAL else 'edge'
+        payloads = cast(
+            dict[str, dict[str, torch.Tensor]],
+            getattr(base_data, '_precomputed_target_payloads'),
+        )
+        payload = payloads[payload_key]
+        cast(Any, data)._store.pop('_precomputed_target_payloads', None)
+        for name, value in payload.items():
+            setattr(data, name, value)
         return data
 
 
@@ -344,6 +370,20 @@ class DNADataModule(pl.LightningDataModule):
 
         self.num_workers = min(len(os.sched_getaffinity(0)), 16)
         self.train_generator = torch.Generator().manual_seed(seed)
+
+    def _loader_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            'num_workers': self.num_workers,
+            'pin_memory': torch.cuda.is_available(),
+        }
+        if self.num_workers > 0:
+            kwargs.update(
+                batch_size=self.batch_size,
+                persistent_workers=True,
+                multiprocessing_context='spawn',
+                prefetch_factor=4,
+            )
+        return kwargs
 
     def prepare_data(self):
         PyGDataset()
@@ -430,29 +470,20 @@ class DNADataModule(pl.LightningDataModule):
         )
         return DataLoader(
             cast(Dataset, self.train_dataset),
-            batch_size=self.batch_size,
             sampler=sampler,
-            num_workers=self.num_workers,
-            persistent_workers=True,
-            multiprocessing_context='spawn'
+            **self._loader_kwargs(),
         )  # type: ignore
 
     def val_dataloader(self):
         return DataLoader(
             cast(Dataset, self.val_dataset),
-            batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
-            persistent_workers=True,
-            multiprocessing_context='spawn'
+            **self._loader_kwargs(),
         )  # type: ignore
 
     def test_dataloader(self):
         return DataLoader(
             cast(Dataset, self.test_dataset),
-            batch_size=self.batch_size,
             shuffle=False,
-            num_workers=self.num_workers,
-            persistent_workers=True,
-            multiprocessing_context='spawn'
+            **self._loader_kwargs(),
         )  # type: ignore

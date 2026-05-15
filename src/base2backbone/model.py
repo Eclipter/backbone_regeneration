@@ -124,6 +124,11 @@ class BackboneLightningModule(pl.LightningModule):
             num_heads=num_heads,
             num_layers=num_layers,
         )
+        self._sampling_sigma_cache: dict[
+            tuple[str, int | None, torch.dtype, int, float, float, float, float],
+            tuple[torch.Tensor, torch.Tensor],
+        ] = {}
+        self._rmsd_keep_cache: dict[tuple[str, int | None], torch.Tensor] = {}
 
     def load_state_dict(self, state_dict, strict=True):  # type: ignore[no-untyped-def]
         # Align checkpoint keys with eager vs torch.compile-wrapped `score_network` (OptimizedModule uses `_orig_mod`).
@@ -232,7 +237,7 @@ class BackboneLightningModule(pl.LightningModule):
     def _closure_loss(self, pred_x0: torch.Tensor, batch) -> torch.Tensor:
         return self._bridge_closure_metrics(pred_x0, batch)['closure_loss']
 
-    def _build_x(self, batch, x_t_latent, log_sigma_per_graph, sc):
+    def _build_static_x_prefix(self, batch):
         b, ws = self._b_ws(batch)
         rel_o = batch.rel_origins.view(b, ws, 3)
         rel_R = batch.rel_frames.view(b, ws, 9)
@@ -242,12 +247,16 @@ class BackboneLightningModule(pl.LightningModule):
         hp = batch.has_pair_nt.view(b, ws, 1).float()
         ce = batch.chain_end_class.view(b, ws, N_CHAIN_END_CLASSES)
         it = batch.is_target_nt.view(b, ws, 1)
+        return torch.cat([rel_o, rel_R, pair_o, pair_R, base, hp, ce, it], dim=-1)
+
+    def _build_x_from_prefix(self, prefix, batch, x_t_latent, log_sigma_per_graph, sc):
+        b, ws = self._b_ws(batch)
         tidx = batch.target_nt_idx.long()
-        bi = torch.arange(b, device=rel_o.device)
+        bi = torch.arange(b, device=prefix.device)
         pad = torch.zeros(
             b, ws,
             N_LATENT + self.time_emb_dim + N_TORSIONS + N_LATENT,
-            device=rel_o.device, dtype=rel_o.dtype,
+            device=prefix.device, dtype=prefix.dtype,
         )
         te_all = self.time_mlp(log_sigma_per_graph.float())
         o = 0
@@ -260,14 +269,67 @@ class BackboneLightningModule(pl.LightningModule):
         )
         o += N_TORSIONS
         pad[bi, tidx, o:o + N_LATENT] = sc
-        return torch.cat([rel_o, rel_R, pair_o, pair_R, base, hp, ce, it, pad], dim=-1)
+        return torch.cat([prefix, pad], dim=-1)
 
-    def forward_score_network(self, batch, x_t_latent, log_sigma_per_graph, sc):
+    def _build_x(self, batch, x_t_latent, log_sigma_per_graph, sc):
+        prefix = self._build_static_x_prefix(batch)
+        return self._build_x_from_prefix(prefix, batch, x_t_latent, log_sigma_per_graph, sc)
+
+    def forward_score_network_from_prefix(self, prefix, batch, x_t_latent, log_sigma_per_graph, sc):
         b, _ = self._b_ws(batch)
-        x = self._build_x(batch, x_t_latent, log_sigma_per_graph, sc)
+        x = self._build_x_from_prefix(prefix, batch, x_t_latent, log_sigma_per_graph, sc)
         score_all = self.score_network(x)
         bi = torch.arange(b, device=score_all.device)
         return score_all[bi, batch.target_nt_idx.long()]
+
+    def forward_score_network(self, batch, x_t_latent, log_sigma_per_graph, sc):
+        prefix = self._build_static_x_prefix(batch)
+        return self.forward_score_network_from_prefix(prefix, batch, x_t_latent, log_sigma_per_graph, sc)
+
+    def _get_sampling_sigmas(
+        self,
+        device: torch.device,
+        dtype: torch.dtype,
+        num_steps: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (
+            device.type,
+            device.index,
+            dtype,
+            num_steps,
+            float(self.hparams['angular_sigma_max']),
+            float(self.hparams['angular_sigma_min']),
+            float(self.hparams['tau_sigma_max']),
+            float(self.hparams['tau_sigma_min']),
+        )
+        if key not in self._sampling_sigma_cache:
+            self._sampling_sigma_cache[key] = (
+                ve_sigma_grid(
+                    float(self.hparams['angular_sigma_max']),
+                    float(self.hparams['angular_sigma_min']),
+                    num_steps,
+                    device=device,
+                    dtype=dtype,
+                ),
+                ve_sigma_grid(
+                    float(self.hparams['tau_sigma_max']),
+                    float(self.hparams['tau_sigma_min']),
+                    num_steps,
+                    device=device,
+                    dtype=dtype,
+                ),
+            )
+        return self._sampling_sigma_cache[key]
+
+    def _get_rmsd_keep_indices(self, device: torch.device) -> torch.Tensor:
+        key = (device.type, device.index)
+        if key not in self._rmsd_keep_cache:
+            self._rmsd_keep_cache[key] = torch.tensor(
+                [j for j, nm in enumerate(BACKBONE_ATOMS) if nm not in ('OP1', 'OP2')],
+                device=device,
+                dtype=torch.long,
+            )
+        return self._rmsd_keep_cache[key]
 
     def training_step(self, batch, batch_idx):
         theta0, m, tau0, tau_mk, _ = self._theta_mask_target(batch)
@@ -472,20 +534,9 @@ class BackboneLightningModule(pl.LightningModule):
         dev = self.device
         dtype = torch.float32
         num_steps = int(self.hparams['num_timesteps'])
-        sig_theta = ve_sigma_grid(
-            float(self.hparams['angular_sigma_max']),
-            float(self.hparams['angular_sigma_min']),
-            num_steps,
-            device=torch.device(dev),
-            dtype=dtype,
-        )
-        sig_tau = ve_sigma_grid(
-            float(self.hparams['tau_sigma_max']),
-            float(self.hparams['tau_sigma_min']),
-            num_steps,
-            device=torch.device(dev),
-            dtype=dtype,
-        )
+        device = torch.device(dev)
+        sig_theta, sig_tau = self._get_sampling_sigmas(device, dtype, num_steps)
+        prefix = self._build_static_x_prefix(batch)
         theta = wrap_angle(
             torch.rand(b, N_TORSIONS, device=dev, dtype=dtype) * (2.0 * math.pi) - math.pi,
         )
@@ -509,7 +560,7 @@ class BackboneLightningModule(pl.LightningModule):
                 device=dev,
                 dtype=dtype,
             )
-            pred = self.forward_score_network(batch, x_t, log_s, sc)
+            pred = self.forward_score_network_from_prefix(prefix, batch, x_t, log_s, sc)
             theta, logt = reverse_ve_score_step(
                 x_t[..., :N_TORSIONS],
                 x_t[..., N_TORSIONS:N_LATENT],
@@ -579,19 +630,14 @@ class BackboneLightningModule(pl.LightningModule):
         j2 = BACKBONE_ATOMS.index('OP2')
         contrib = torch.zeros(b, device=dev, dtype=torch.float64)
         count = torch.zeros(b, device=dev, dtype=torch.float64)
-
-        for j, nm in enumerate(BACKBONE_ATOMS):
-            if nm in ('OP1', 'OP2'):
-                continue
-            pred_xyz = pred_local[:, j, :].to(dtype=torch.float64)
-            gt_xyz = gt_local[:, j, :].to(dtype=torch.float64)
-            valid = torch.isfinite(pred_xyz).all(dim=-1) & torch.isfinite(gt_xyz).all(
-                dim=-1,
-            )
-            diff = pred_xyz - gt_xyz
-            sq = torch.einsum('bi,bi->b', diff, diff)
-            contrib = contrib + sq * valid.to(dtype=torch.float64)
-            count = count + valid.to(dtype=torch.float64)
+        keep = self._get_rmsd_keep_indices(torch.device(dev))
+        pred_keep = pred_local.index_select(1, keep).to(dtype=torch.float64)
+        gt_keep = gt_local.index_select(1, keep).to(dtype=torch.float64)
+        valid_keep = torch.isfinite(pred_keep).all(dim=-1) & torch.isfinite(gt_keep).all(dim=-1)
+        sq_keep = ((pred_keep - gt_keep) ** 2).sum(dim=-1)
+        sq_keep = torch.where(valid_keep, sq_keep, torch.zeros_like(sq_keep))
+        contrib = contrib + sq_keep.sum(dim=-1)
+        count = count + valid_keep.to(dtype=torch.float64).sum(dim=-1)
 
         p1 = pred_local[:, j1, :].to(dtype=torch.float64)
         p2 = pred_local[:, j2, :].to(dtype=torch.float64)
@@ -608,7 +654,8 @@ class BackboneLightningModule(pl.LightningModule):
         d_str = torch.einsum('bi,bi->b', d1s, d1s) + torch.einsum('bi,bi->b', d2s, d2s)
         d_swp = torch.einsum('bi,bi->b', d1w, d1w) + torch.einsum('bi,bi->b', d2w, d2w)
         op_sq = torch.minimum(d_str, d_swp) * 0.5
-        contrib = contrib + op_sq * v_op.to(dtype=torch.float64)
+        op_sq = torch.where(v_op, op_sq, torch.zeros_like(op_sq))
+        contrib = contrib + op_sq
         count = count + v_op.to(dtype=torch.float64)
 
         out = torch.full((b,), float('nan'), device=dev, dtype=torch.float64)

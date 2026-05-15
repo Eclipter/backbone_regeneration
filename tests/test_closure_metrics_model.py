@@ -134,7 +134,7 @@ def test_p_sample_loop_finite_shapes_with_stub_scores(monkeypatch):
     )
     mod = BackboneLightningModule(**cast(Any, hp)).eval()
 
-    def _stub_fwd(self, batch, x_tl, lg, sc):  # noqa: ARG001
+    def _stub_fwd(self, prefix, batch, x_tl, lg, sc):  # noqa: ARG001
         return torch.zeros(
             batch.num_graphs,
             N_LATENT,
@@ -142,7 +142,7 @@ def test_p_sample_loop_finite_shapes_with_stub_scores(monkeypatch):
             dtype=torch.float32,
         )
 
-    monkeypatch.setattr(BackboneLightningModule, 'forward_score_network', _stub_fwd)
+    monkeypatch.setattr(BackboneLightningModule, 'forward_score_network_from_prefix', _stub_fwd)
     batch = _minimal_train_batch()
     theta0, (pred_theta, pred_tau_m) = mod.p_sample_loop(batch)
     b = batch.num_graphs
@@ -151,6 +151,107 @@ def test_p_sample_loop_finite_shapes_with_stub_scores(monkeypatch):
     assert pred_tau_m.shape == (b,)
     assert torch.isfinite(pred_theta).all() and torch.isfinite(pred_tau_m).all()
     assert torch.all(pred_tau_m > 0)
+
+
+def test_p_sample_loop_reuses_cached_sigma_grids(monkeypatch):
+    hp = dict(
+        hidden_dim=32,
+        num_heads=4,
+        num_layers=1,
+        num_timesteps=4,
+        batch_size=1,
+        lr=1e-3,
+        lr_scheduler=None,
+        lr_scheduler_patience=1,
+        lr_scheduler_threshold=0.1,
+        lr_scheduler_cooldown=0,
+        angular_sigma_min=0.05,
+        angular_sigma_max=0.15,
+        tau_sigma_min=0.05,
+        tau_sigma_max=0.15,
+        tau_loss_weight=1.0,
+        score_loss_weighting='sigma2',
+        weight_decay=0.01,
+        closure_loss_weight=0.0,
+        closure_bond_weight=1.0,
+        closure_angle_weight=1.0,
+        closure_torsion_weight=1.0,
+    )
+    mod = BackboneLightningModule(**cast(Any, hp)).eval()
+    grid_calls: list[tuple[float, float, int]] = []
+    orig_grid = __import__('base2backbone.model', fromlist=['ve_sigma_grid']).ve_sigma_grid
+
+    def _counting_grid(sigma_max, sigma_min, num_steps, *, device, dtype):
+        grid_calls.append((sigma_max, sigma_min, num_steps))
+        return orig_grid(sigma_max, sigma_min, num_steps, device=device, dtype=dtype)
+
+    def _stub_fwd(self, prefix, batch, x_tl, lg, sc):  # noqa: ARG001
+        return torch.zeros(
+            batch.num_graphs,
+            N_LATENT,
+            device=batch.torsions.device,
+            dtype=torch.float32,
+        )
+
+    monkeypatch.setattr('base2backbone.model.ve_sigma_grid', _counting_grid)
+    monkeypatch.setattr(BackboneLightningModule, 'forward_score_network_from_prefix', _stub_fwd)
+    batch = _minimal_train_batch()
+
+    mod.p_sample_loop(batch)
+    mod.p_sample_loop(batch)
+
+    assert len(grid_calls) == 2
+
+
+def test_rmsd_ignores_invalid_non_op_atoms(monkeypatch):
+    hp = dict(
+        hidden_dim=32,
+        num_heads=4,
+        num_layers=1,
+        num_timesteps=2,
+        batch_size=1,
+        lr=1e-3,
+        lr_scheduler=None,
+        lr_scheduler_patience=1,
+        lr_scheduler_threshold=0.1,
+        lr_scheduler_cooldown=0,
+        angular_sigma_min=0.05,
+        angular_sigma_max=0.15,
+        tau_sigma_min=0.05,
+        tau_sigma_max=0.15,
+        tau_loss_weight=1.0,
+        score_loss_weighting='sigma2',
+        weight_decay=0.01,
+        closure_loss_weight=0.0,
+        closure_bond_weight=1.0,
+        closure_angle_weight=1.0,
+        closure_torsion_weight=1.0,
+    )
+    mod = BackboneLightningModule(**cast(Any, hp)).eval()
+    batch = _minimal_train_batch()
+    b, ws = batch.num_graphs, batch.torsions.size(0) // batch.num_graphs
+    target_idx = int(batch.target_nt_idx.item())
+    keep_atom = BACKBONE_ATOMS.index('P')
+
+    def _stub_builder(theta_w, tau_w, restype, origins_w, frames_w, mask):  # noqa: ARG001
+        coords = batch.bb_xyz_world.view(b, ws, len(BACKBONE_ATOMS), 3).clone()
+        coords[0, target_idx, keep_atom] = torch.tensor(
+            [float('nan'), 0.0, 0.0],
+            dtype=coords.dtype,
+            device=coords.device,
+        )
+        return coords
+
+    monkeypatch.setattr('base2backbone.model.build_batch_window_backbone_from_torsions', _stub_builder)
+
+    rmsd = mod._compute_rmsd_per_graph_local(
+        torch.zeros((1, N_TORSIONS), dtype=torch.float32),
+        torch.ones((1,), dtype=torch.float32) * 0.45,
+        batch,
+    )
+
+    assert torch.isfinite(rmsd).all()
+    assert torch.allclose(rmsd, torch.zeros_like(rmsd))
 
 
 test_sampler_shapes_finite = test_p_sample_loop_finite_shapes_with_stub_scores

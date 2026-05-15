@@ -29,12 +29,13 @@ BASE = dict(
     CLOSURE_ANGLE_WEIGHT=1,  # [0, +inf)
     CLOSURE_TORSION_WEIGHT=1,  # [0, +inf)
     TORCH_COMPILE=True,
-    START_FROM_LAST_CKPT=False,
+    START_FROM_LAST_CKPT=True,
 )
 
 # One entry = one experiment. Put ONLY the overrides from BASE here
 EXPERIMENTS = [
-    {},  # baseline (matches BASE)
+    # {},  # baseline (matches BASE)
+    {'CLOSURE_LOSS_WEIGHT': 1e-3},
 ]
 
 # Run path under `logs/`

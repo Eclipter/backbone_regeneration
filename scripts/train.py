@@ -1,4 +1,5 @@
 import logging
+import math
 import os
 import os.path as osp
 import shutil
@@ -82,6 +83,9 @@ def train_one(cfg):
         closure_bond_weight=cfg['CLOSURE_BOND_WEIGHT'],
         closure_angle_weight=cfg['CLOSURE_ANGLE_WEIGHT'],
         closure_torsion_weight=cfg['CLOSURE_TORSION_WEIGHT'],
+        closure_sigma_bond_a=cfg['CLOSURE_SIGMA_BOND_A'],
+        closure_sigma_angle_rad=math.radians(cfg['CLOSURE_SIGMA_ANGLE_DEG']),
+        closure_sigma_torsion_rad=cfg['CLOSURE_SIGMA_TORSION_RAD'],
     )
 
     log_dir, run_name, run_version, ckpt_path = _get_run_paths(cfg)

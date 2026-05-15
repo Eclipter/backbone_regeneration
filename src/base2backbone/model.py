@@ -8,7 +8,9 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
-from .bridge_closure import compute_bridge_closure_loss
+from .bridge_closure import (CLOSURE_SIGMA_ANGLE_RAD, CLOSURE_SIGMA_BOND_A,
+                             CLOSURE_SIGMA_TORSION_RAD,
+                             compute_bridge_closure_loss)
 from .data import BACKBONE_ATOMS, BASE_TO_INDEX, N_CHAIN_END_CLASSES
 from .geometry import build_batch_window_backbone_from_torsions
 from .score_diffusion import (decode_torsions, encode_torsions,
@@ -95,6 +97,11 @@ class BackboneLightningModule(pl.LightningModule):
         closure_bond_weight: float = 1.0,
         closure_angle_weight: float = 1.0,
         closure_torsion_weight: float = 1.0,
+        # Per-component σ for closure-loss normalization (squared deviations are divided by σ²).
+        # Defaults mirror the module constants in bridge_closure.py for backwards compatibility.
+        closure_sigma_bond_a: float = CLOSURE_SIGMA_BOND_A,
+        closure_sigma_angle_rad: float = CLOSURE_SIGMA_ANGLE_RAD,
+        closure_sigma_torsion_rad: float = CLOSURE_SIGMA_TORSION_RAD,
         log_tau_init_noise_scale: float | None = None,
     ):
         super().__init__()
@@ -222,6 +229,11 @@ class BackboneLightningModule(pl.LightningModule):
             'angle': float(self.hparams.get('closure_angle_weight', 1.0)),
             'torsion': float(self.hparams.get('closure_torsion_weight', 1.0)),
         }
+        geometry = {
+            'sigma_bond': float(self.hparams.get('closure_sigma_bond_a', CLOSURE_SIGMA_BOND_A)),
+            'sigma_angle_rad': float(self.hparams.get('closure_sigma_angle_rad', CLOSURE_SIGMA_ANGLE_RAD)),
+            'sigma_torsion_rad': float(self.hparams.get('closure_sigma_torsion_rad', CLOSURE_SIGMA_TORSION_RAD)),
+        }
 
         return compute_bridge_closure_loss(
             bb,
@@ -230,6 +242,7 @@ class BackboneLightningModule(pl.LightningModule):
             restype.long(),
             same_chain_mask=same_chain_mask,
             valid_pair_mask=pair_mask,
+            geometry=geometry,
             weights=weights,
             grad_prop_tensor=pred_theta,
         )

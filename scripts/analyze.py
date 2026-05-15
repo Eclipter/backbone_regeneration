@@ -9,7 +9,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
 
-import matplotlib.path as mpath
 import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
@@ -18,7 +17,6 @@ import requests
 import seaborn as sns
 import torch
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
-from matplotlib.patches import FancyArrowPatch, FancyBboxPatch
 from sklearn.neighbors import NearestNeighbors
 from torch_geometric.data import Batch, Data
 from tqdm import tqdm
@@ -39,7 +37,6 @@ from base2backbone.io import default_atoms_provider
 from base2backbone.runtime import (MODEL_DIR, PROGRESS_BAR_COLOR,
                                    collect_scalar_history,
                                    load_analysis_run_artifacts)
-from base2backbone.torsion_constants import N_LATENT
 
 # Angle channel order in tensors: α, β, γ, ε, ζ, χ, pseudorotation phase
 # (no backbone δ; τ_m is separate / log τ in latent).
@@ -47,7 +44,7 @@ TOR_NAMES = ['α', 'β', 'γ', 'ε', 'ζ', 'χ', 'phase']
 
 # %%
 # Load model and dataset
-run_id = osp.join('torsions', 'baseline')
+run_id = 'torsions/5/CLOSURE_LOSS_WEIGHT=0.001'
 run_artifacts = load_analysis_run_artifacts(run_id)
 run_dir = run_artifacts.run_dir
 ckpt_path = run_artifacts.ckpt_path
@@ -310,250 +307,6 @@ fig.update_layout(
 fig.show()
 
 # %%
-# Model
-plt.rcParams['font.family'] = 'DejaVu Sans'
-hp = model.hparams
-
-MAX_X = 15
-MAX_Y = MAX_X * 1.5
-fig, ax = plt.subplots(figsize=(15, 15))
-ax.set_xlim(0, MAX_X)
-ax.set_ylim(0, MAX_Y)
-ax.axis('off')
-
-palette = {
-    'input': '#E8F4F8',
-    'pre': '#FDF5E6',
-    'embed': '#FFE8C1',
-    'graph': '#EAE3F5',
-    'output': '#D8F0DF',
-    'detail': '#FFF8D6',
-}
-
-hidden_dim = int(hp['hidden_dim'])
-num_layers = int(hp['num_layers'])
-time_emb_dim = 32
-node_dim = int(model.node_dim)
-torsion_latent_dim = N_LATENT
-
-
-def draw_box(x, y, width, height, title, desc, color):
-    ax.add_patch(FancyBboxPatch(
-        (x, y),
-        width,
-        height,
-        boxstyle='round,pad=0.15',
-        facecolor=color,
-        linewidth=2.2,
-    ))
-    ax.text(
-        x + width / 2,
-        y + height,
-        title,
-        ha='center',
-        va='top',
-        fontsize=13,
-        fontweight='bold',
-    )
-    ax.text(
-        x + width * 0.03,
-        y + height - 0.4,
-        desc,
-        ha='left',
-        va='top',
-        linespacing=1.6,
-    )
-
-
-def draw_arrow(x1, y1, x2, y2):
-    ax.add_patch(FancyArrowPatch(
-        (x1, y1),
-        (x2, y2),
-        arrowstyle='-|>',
-        linewidth=2,
-        mutation_scale=25,
-        color='black',
-    ))
-
-
-main_x = MAX_X * 0.18
-main_y = MAX_Y * 0.86
-main_width = MAX_X * 0.28
-main_height = MAX_Y * 0.11
-arrow_length = MAX_Y * 0.05
-detail_x = MAX_X * 0.66
-detail_width = MAX_X * 0.25
-step_stride = main_height + arrow_length
-
-input_y = main_y
-prep_y = main_y - step_stride
-embed_y = main_y - 2 * step_stride
-transformer_y = main_y - 3 * step_stride
-output_y = main_y - 4 * step_stride
-decode_y = main_y - 5 * step_stride
-
-draw_box(
-    main_x,
-    input_y,
-    main_width,
-    main_height,
-    r'Входное окно ($x_t$)',
-    '• rel_origins, rel_frames\n'
-    '• base_type, has_pair, chain_end_class, is_target\n'
-    f'• зашумлённый латент [θ (7), log τ_m] ({N_LATENT})\n'
-    f'• embedding log σ ({time_emb_dim}), маска торсионов (без self-conditioning)',
-    palette['input'],
-)
-draw_arrow(main_x + main_width / 2, input_y - MAX_Y * 0.01, main_x + main_width / 2, input_y - MAX_Y * 0.04)
-
-draw_box(
-    main_x,
-    prep_y,
-    main_width,
-    main_height,
-    'Подготовка входа',
-    f'• вектор признаков нуклеотида ({node_dim})\n'
-    '• целевой нуклеотид получает шумный латент и маску\n'
-    '• остальные нуклеотиды дают только контекст',
-    palette['pre'],
-)
-draw_arrow(main_x + main_width / 2, prep_y - MAX_Y * 0.01, main_x + main_width / 2, prep_y - MAX_Y * 0.04)
-
-draw_box(
-    detail_x,
-    prep_y,
-    detail_width,
-    main_height,
-    'Собираемые признаки',
-    '• rel_origin (3) + rel_frame (9)\n'
-    '• тип основания (4) + has pair (1)\n'
-    '• chain-end class (3) + is_target (1)\n'
-    f'• торсионный латент ({torsion_latent_dim}) + log σ ({time_emb_dim})',
-    palette['detail'],
-)
-draw_arrow(detail_x, prep_y + main_height * 0.55, main_x + main_width * 1.04, prep_y + main_height * 0.55)
-
-draw_box(
-    main_x,
-    embed_y,
-    main_width,
-    main_height,
-    'Входной MLP',
-    f'Linear({node_dim} → {hidden_dim})\n'
-    'SiLU\n'
-    f'Linear({hidden_dim} → {hidden_dim})',
-    palette['embed'],
-)
-draw_arrow(main_x + main_width / 2, embed_y - MAX_Y * 0.01, main_x + main_width / 2, embed_y - MAX_Y * 0.04)
-
-draw_box(
-    main_x,
-    transformer_y,
-    main_width,
-    main_height,
-    'Трансформерный энкодер',
-    f'• {num_layers} слоев\n'
-    f'• скрытое пространство {hidden_dim}\n'
-    f'• {int(hp["num_heads"])} голов внимания\n'
-    '• обмен контекстом внутри окна',
-    palette['graph'],
-)
-draw_arrow(main_x + main_width / 2, transformer_y - MAX_Y * 0.01, main_x + main_width / 2, transformer_y - MAX_Y * 0.04)
-
-draw_box(
-    main_x,
-    output_y,
-    main_width,
-    main_height,
-    'Голова предсказания',
-    f'Linear({hidden_dim} → {N_LATENT})\n'
-    '• predicted score (∇ log noisy density) для 7 углов и log τ_m',
-    palette['output'],
-)
-draw_arrow(main_x + main_width / 2, output_y - MAX_Y * 0.01, main_x + main_width / 2, output_y - MAX_Y * 0.04)
-
-draw_box(
-    main_x,
-    decode_y,
-    main_width,
-    main_height,
-    'Обратная диффузия',
-    f'• {int(hp["num_timesteps"])} шагов reverse VE score\n'
-    f'• θ: σ∈[{hp.get("angular_sigma_min", "?")}, {hp.get("angular_sigma_max", "?")}], '
-    f'log τ: σ∈[{hp.get("tau_sigma_min", "?")}, {hp.get("tau_sigma_max", "?")}]\n'
-    '• ancestral sampler по углам с wrap + канал log τ_m',
-    palette['detail'],
-)
-
-loop_x = 1.3
-input_top_y = input_y + main_height
-decode_bottom_y = decode_y
-loop_path = mpath.Path(
-    [
-        (main_x + main_width / 2, decode_bottom_y),
-        (main_x + main_width / 2, decode_bottom_y - 0.6),
-        (loop_x, decode_bottom_y - 0.6),
-        (loop_x, input_top_y + 0.6),
-        (main_x + main_width / 2, input_top_y + 0.6),
-        (main_x + main_width / 2, input_top_y),
-    ],
-    [
-        mpath.Path.MOVETO,
-        mpath.Path.LINETO,
-        mpath.Path.LINETO,
-        mpath.Path.LINETO,
-        mpath.Path.LINETO,
-        mpath.Path.LINETO,
-    ],
-)
-ax.add_patch(FancyArrowPatch(
-    path=loop_path,
-    arrowstyle='-|>',
-    linewidth=2,
-    mutation_scale=25,
-    color='black',
-    linestyle='--',
-))
-ax.text(
-    loop_x - 0.2,
-    MAX_Y / 2,
-    r'$x_t \rightarrow x_{t-\Delta}$' + '\n' + r'$(T \text{ шагов reverse VE score})$',
-    fontsize=15,
-    rotation=90,
-    ha='center',
-    va='center',
-)
-
-fig.tight_layout()
-fig.savefig(osp.join(run_dir, 'model_arch.png'), dpi=200, bbox_inches='tight')
-plt.show()
-
-# %%
-# Check optimizer state
-_ck = torch.load(ckpt_path, map_location='cpu', weights_only=False)
-print('epoch:', _ck.get('epoch'), '| global_step:', _ck.get('global_step'))
-print('hyper_parameters lr:', (_ck.get('hyper_parameters') or {}).get('lr'))
-for i, _opt in enumerate(_ck.get('optimizer_states', [])):
-    print(f'\noptimizer_states[{i}]')
-    for gi, g in enumerate(_opt['param_groups']):
-        _pg = {k: v for k, v in g.items() if k != 'params'}
-        _pg['n_param_ids'] = len(g['params'])
-        print(f'  param_group[{gi}]:', _pg)
-    _st = _opt.get('state', {})
-    print(f'  state: {len(_st)} tensors with buffers')
-    if _st:
-        _pid0 = next(iter(_st))
-        print('  example buffers for param', _pid0, ':', {
-            k: tuple(v.shape) if hasattr(v, 'shape') else v
-            for k, v in _st[_pid0].items()
-        })
-for i, sch in enumerate(_ck.get('lr_schedulers') or []):
-    print(f'\nlr_schedulers[{i}]:', {
-        k: v for k, v in sch.items()
-        if k in ('_last_lr', 'last_epoch', 'best', 'num_bad_epochs', 'cooldown_counter', 'factor', 'patience')
-    })
-
-# %%
 # Training
 plt.rcParams['font.family'] = 'Nunito'
 
@@ -602,21 +355,19 @@ fig, ax = plt.subplots(figsize=(7, 4))
 ax.tick_params(axis='both', labelsize=15)
 if 'train_noise_rmse' in wide.columns:
     _plot_metric(ax, wide, 'train_noise_rmse', 'indigo', 'train_rmse')
-if getattr(model, 'hparams', None) and 'swa_epoch_start' in model.hparams:
-    swa_epoch = int(model.hparams['swa_epoch_start'])
-    ax.axvline(swa_epoch, color='red', linewidth=3, linestyle='--')
-    ax.text(
-        swa_epoch + 0.5,
-        0.95,
-        'Старт стохастического\nусреднения весов',
-        transform=ax.get_xaxis_transform(),
-        color='red',
-        fontsize=14,
-        va='top',
-        ha='left',
-    )
+swa_epoch = 80
+ax.axvline(swa_epoch, color='red', linewidth=3, linestyle='--')
+ax.text(
+    swa_epoch + 0.5,
+    0.95,
+    'Старт стохастического\nусреднения весов',
+    transform=ax.get_xaxis_transform(),
+    color='red',
+    fontsize=14,
+    va='top',
+    ha='left',
+)
 ax.set_xlabel('Эпоха', fontsize=18)
-ax.set_ylabel('RMSE шума за 1 шаг (Å)', fontsize=18)
 sns.despine(ax=ax, top=True, right=True)
 fig.tight_layout()
 fig.savefig(osp.join(run_dir, 'train.png'), bbox_inches='tight', dpi=300)
@@ -638,7 +389,7 @@ for mode in target_modes:
         )
 ax.set_yscale('log')
 ax.set_xlabel('Эпоха', fontsize=18)
-ax.set_ylabel('Медианный RMSD остова по окнам (Å)', fontsize=18)
+ax.set_ylabel('RMSD остова (Å)', fontsize=18)
 ax.legend(fontsize=14)
 sns.despine(ax=ax, top=True, right=True)
 fig.tight_layout()
@@ -1200,34 +951,31 @@ with ThreadPoolExecutor(max_workers=8) as executor:
             rmsd_values.extend(wv)
             print(f'{pdb_id} vs {pid}: median={np.median(wv):.2f} Å  n={len(wv)}')
 
-if rmsd_values:
-    print(f'\nЭкспериментальный порог  median={np.median(rmsd_values):.2f}  '
-          f'mean={np.mean(rmsd_values):.2f}  n={len(rmsd_values)}')
-
-    fig, ax = plt.subplots(figsize=(7, 4))
-    ax.hist(rmsd_values, bins=50, color='skyblue', edgecolor='white')
-    for mode, color in mode_colors.items():
-        val = float(wide_per_mode[mode]['val/rmsd'].dropna().iloc[-1])
-        ax.axvline(
-            val,
-            color=color,
-            linewidth=2,
-            label=f'валидационный RMSD, {validation_labels[mode]} ({val:.2f} Å)',
-        )
+# %%
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.hist(rmsd_values, bins=50, color='skyblue', edgecolor='white')
+for mode, color in mode_colors.items():
+    val = float(wide_per_mode[mode]['val/rmsd'].dropna().iloc[-1])
     ax.axvline(
-        np.median(rmsd_values),
-        color='black',
-        linestyle='--',
-        linewidth=1.5,
-        label=f'медиана по экспериментальным структурам ({np.median(rmsd_values):.2f} Å)',
+        val,
+        color=color,
+        linewidth=2,
+        label=f'валидационный RMSD, {validation_labels[mode]} ({val:.2f} Å)',
     )
-    ax.set_xlim(0, 3)
-    ax.set_xlabel('RMSD (Å)', fontsize=13)
-    ax.set_ylabel('Количество структур', fontsize=13)
-    ax.legend(fontsize=11)
-    sns.despine(ax=ax)
-    fig.tight_layout()
-    plt.show()
+ax.axvline(
+    np.median(rmsd_values),
+    color='red',
+    linestyle='--',
+    linewidth=2,
+    label=f'медиана по экспериментальным структурам ({np.median(rmsd_values):.2f} Å)',
+)
+ax.set_xlim(0, 3)
+ax.set_xlabel('RMSD (Å)', fontsize=13)
+ax.set_ylabel('Количество структур', fontsize=13)
+ax.legend(fontsize=11)
+sns.despine(ax=ax)
+fig.tight_layout()
+plt.show()
 
 # %%
 # Measure stochastic spread across independent diffusion runs on the same input
@@ -1293,6 +1041,8 @@ with torch.no_grad():
         inter_run_rmsds.extend(pair_rmsds)
         per_sample_medians.append(float(np.median(pair_rmsds)))
 
+# %%
+
 _med = float(np.median(inter_run_rmsds))
 _mean = float(np.mean(inter_run_rmsds))
 _p25, _p75 = np.percentile(inter_run_rmsds, [25, 75])
@@ -1301,20 +1051,19 @@ print(f'Inter-run RMSD  K={K}  N={len(per_sample_medians)} samples  '
 print(f'  median={_med:.3f}  mean={_mean:.3f}  p25={_p25:.3f}  p75={_p75:.3f} Å')
 
 fig, ax = plt.subplots(figsize=(7, 4))
-ax.hist(inter_run_rmsds, bins=50, color='mediumpurple', edgecolor='white',
-        label='попарный RMSD между независимыми прогонами')
-ax.axvline(_med, color='black', linestyle='--', linewidth=1.8,
-           label=f'медиана: {_med:.3f} Å')
+ax.hist(inter_run_rmsds, color='mediumpurple', edgecolor='white')
+ax.axvline(_med, color='black', linestyle='--', linewidth=2,
+           label=f'медиана: {_med:.1f} Å')
 if rmsd_values:
     _noise_med = float(np.median(rmsd_values))
-    ax.axvline(_noise_med, color='steelblue', linestyle=':', linewidth=1.8,
-               label=f'экспериментальный порог: {_noise_med:.3f} Å')
-ax.set_xlabel('RMSD остова между прогонами (Å)', fontsize=13)
+    ax.axvline(_noise_med, color='red', linestyle='--', linewidth=2,
+               label=f'экспериментальный порог: {_noise_med:.1f} Å')
+ax.set_xlabel('RMSD (Å)', fontsize=13)
 ax.set_ylabel('Количество структур', fontsize=13)
 ax.legend(fontsize=11)
 sns.despine(ax=ax)
 fig.tight_layout()
-fig.savefig(osp.join(run_dir, 'inter_run_rmsd.png'), dpi=200, bbox_inches='tight')
+fig.savefig(osp.join(run_dir, 'inter_run_rmsd.png'), dpi=300, bbox_inches='tight')
 plt.show()
 
 # %%
@@ -1376,6 +1125,8 @@ for _i in tqdm(
 _knn_rmsds_arr = np.array(_knn_rmsds, dtype=np.float64)
 _knn_is_edge_arr = np.array(_knn_is_edge)
 
+# %%
+
 print('kNN backbone RMSD (local frame):')
 for _label, _mask in [
     ('avg',     np.ones(len(_knn_rmsds_arr), dtype=bool)),
@@ -1387,8 +1138,8 @@ for _label, _mask in [
         print(f'  {_label:>7}:  median={np.median(_vals):.3f}  mean={np.mean(_vals):.3f}'
               f'  n={len(_vals)}')
 
-print('\nModel val RMSD (last epoch):')
+print('\nModel test RMSD:')
 for _label, _w in [('avg', wide)] + [(m, wide_per_mode[m]) for m in ('central', 'edge')]:
-    if 'val/rmsd' in _w.columns:
-        _v = float(_w['val/rmsd'].dropna().iloc[-1])
+    if 'test/rmsd' in _w.columns:
+        _v = float(_w['test/rmsd'].dropna().iloc[-1])
         print(f'  {_label:>7}: {_v:.3f} Å')

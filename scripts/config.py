@@ -6,6 +6,7 @@ BASE = dict(
     NUM_HEADS=8,
     NUM_LAYERS=3,
     NUM_TIMESTEPS=200,
+    SAMPLER='ODE',  # 'SDE' | 'ODE'
     BATCH_SIZE=50000,
     LR=1e-3,
     WEIGHT_DECAY=0.01,
@@ -52,7 +53,11 @@ EXPERIMENTS = [
     # # 2. Edge всё ещё узкое место (1.33 vs central 1.00).
     # {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0, 'EDGE_WEIGHT': 0.5},
     # # 3. train≈val=1.04 → нет переобучения, есть запас по capacity.
-    {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0, 'NUM_LAYERS': 5, 'BATCH_SIZE': 30000},
+    # {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0, 'NUM_LAYERS': 5, 'BATCH_SIZE': 30000},
+    # Реалистичная σ_angle. Эффективный градиент по angle снизится в 4×.
+    # {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_SIGMA_ANGLE_DEG': 8.0},
+    {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.1, 'SAMPLER': 'ODE'},
+    {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.1, 'SAMPLER': 'SDE'}
 ]
 
 # Run path under `logs/`

@@ -12,6 +12,7 @@ from base2backbone.bridge_closure import compute_bridge_closure_loss
 from base2backbone.model import BackboneLightningModule
 from base2backbone.torsion_constants import (
     LOG_TAU_M_MAX,
+    LOG_TAU_M_MIN,
     N_LATENT,
     N_TORSIONS,
     TAU_M_MAX,
@@ -23,6 +24,7 @@ from base2backbone.score_diffusion import (
     decode_torsions,
     gaussian_score,
     perturb_torsions,
+    reverse_ve_score_ode_step,
     reverse_ve_score_step,
     sigma_schedule,
     ve_sigma_grid,
@@ -192,6 +194,36 @@ def test_score_sampler_reverse_step_shapes_and_finite():
     th2, lt2 = reverse_ve_score_step(theta, log_tau, score, sc, sn, st, stn)
     assert th2.shape == theta.shape and lt2.shape == log_tau.shape
     assert torch.isfinite(th2).all() and torch.isfinite(lt2).all()
+
+
+def test_score_sampler_reverse_ode_step_uses_half_drift_without_noise():
+    theta = torch.tensor([[0.2] * N_TORSIONS], dtype=torch.float32)
+    log_tau = torch.tensor([[0.1]], dtype=torch.float32)
+    score = torch.ones((1, N_LATENT), dtype=torch.float32)
+    sigma_cur = torch.tensor(1.5, dtype=torch.float32)
+    sigma_next = torch.tensor(0.5, dtype=torch.float32)
+    sigma_tau_cur = torch.tensor(1.2, dtype=torch.float32)
+    sigma_tau_next = torch.tensor(0.2, dtype=torch.float32)
+
+    th2, lt2 = reverse_ve_score_ode_step(
+        theta,
+        log_tau,
+        score,
+        sigma_cur,
+        sigma_next,
+        sigma_tau_cur,
+        sigma_tau_next,
+    )
+
+    d2_theta = sigma_cur ** 2 - sigma_next ** 2
+    d2_tau = sigma_tau_cur ** 2 - sigma_tau_next ** 2
+    expected_theta = wrap_angle(theta + 0.5 * d2_theta * score[..., :N_TORSIONS])
+    expected_log_tau = (log_tau + 0.5 * d2_tau * score[..., N_TORSIONS:N_LATENT]).clamp(
+        LOG_TAU_M_MIN,
+        LOG_TAU_M_MAX,
+    )
+    assert torch.allclose(th2, expected_theta)
+    assert torch.allclose(lt2, expected_log_tau)
 
 
 def test_ve_sigma_grid_monotonic():

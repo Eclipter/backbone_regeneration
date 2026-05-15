@@ -6,6 +6,7 @@ from typing import Any, cast
 import torch
 from torch_geometric.data import Batch, Data
 
+import base2backbone.model as model_module
 from base2backbone.data import BACKBONE_ATOMS
 from base2backbone.model import BackboneLightningModule
 from base2backbone.torsion_constants import N_LATENT, N_TORSIONS
@@ -201,6 +202,110 @@ def test_p_sample_loop_reuses_cached_sigma_grids(monkeypatch):
     mod.p_sample_loop(batch)
 
     assert len(grid_calls) == 2
+
+
+def test_p_sample_loop_selects_ode_sampler_case_insensitive(monkeypatch):
+    hp = dict(
+        hidden_dim=32,
+        num_heads=4,
+        num_layers=1,
+        num_timesteps=2,
+        batch_size=1,
+        lr=1e-3,
+        lr_scheduler=None,
+        lr_scheduler_patience=1,
+        lr_scheduler_threshold=0.1,
+        lr_scheduler_cooldown=0,
+        angular_sigma_min=0.05,
+        angular_sigma_max=0.15,
+        tau_sigma_min=0.05,
+        tau_sigma_max=0.15,
+        tau_loss_weight=1.0,
+        score_loss_weighting='sigma2',
+        weight_decay=0.01,
+        closure_loss_weight=0.0,
+        closure_bond_weight=1.0,
+        closure_angle_weight=1.0,
+        closure_torsion_weight=1.0,
+        sampler='ODE',
+    )
+    mod = BackboneLightningModule(**cast(Any, hp)).eval()
+    calls = {'sde': 0, 'ode': 0}
+
+    def _stub_fwd(self, prefix, batch, x_tl, lg, sc):  # noqa: ARG001
+        return torch.zeros(
+            batch.num_graphs,
+            N_LATENT,
+            device=batch.torsions.device,
+            dtype=torch.float32,
+        )
+
+    def _stub_sde(theta, log_tau, score_pred, sigma_cur, sigma_next, sigma_tau_cur, sigma_tau_next):
+        calls['sde'] += 1
+        return theta, log_tau
+
+    def _stub_ode(theta, log_tau, score_pred, sigma_cur, sigma_next, sigma_tau_cur, sigma_tau_next):
+        calls['ode'] += 1
+        return theta, log_tau
+
+    monkeypatch.setattr(BackboneLightningModule, 'forward_score_network_from_prefix', _stub_fwd)
+    monkeypatch.setattr(model_module, 'reverse_ve_score_step', _stub_sde)
+    monkeypatch.setattr(model_module, 'reverse_ve_score_ode_step', _stub_ode)
+
+    mod.p_sample_loop(_minimal_train_batch())
+
+    assert calls['sde'] == 0
+    assert calls['ode'] == 2
+
+
+def test_sample_forwards_num_steps_and_sampler(monkeypatch):
+    hp = dict(
+        hidden_dim=32,
+        num_heads=4,
+        num_layers=1,
+        num_timesteps=2,
+        batch_size=1,
+        lr=1e-3,
+        lr_scheduler=None,
+        lr_scheduler_patience=1,
+        lr_scheduler_threshold=0.1,
+        lr_scheduler_cooldown=0,
+        angular_sigma_min=0.05,
+        angular_sigma_max=0.15,
+        tau_sigma_min=0.05,
+        tau_sigma_max=0.15,
+        tau_loss_weight=1.0,
+        score_loss_weighting='sigma2',
+        weight_decay=0.01,
+        closure_loss_weight=0.0,
+        closure_bond_weight=1.0,
+        closure_angle_weight=1.0,
+        closure_torsion_weight=1.0,
+    )
+    mod = BackboneLightningModule(**cast(Any, hp)).eval()
+    seen: dict[str, Any] = {}
+
+    def _stub_loop(self, batch, num_steps=None, sampler=None):
+        seen['batch'] = batch
+        seen['num_steps'] = num_steps
+        seen['sampler'] = sampler
+        b = batch.num_graphs
+        return (
+            torch.zeros((b, N_TORSIONS), dtype=torch.float32),
+            (
+                torch.zeros((b, N_TORSIONS), dtype=torch.float32),
+                torch.ones((b,), dtype=torch.float32),
+            ),
+        )
+
+    monkeypatch.setattr(BackboneLightningModule, 'p_sample_loop', _stub_loop)
+
+    batch = _minimal_train_batch()
+    pred_theta, pred_tau_m = mod.sample(batch, num_steps=50, sampler='ode')
+
+    assert seen == {'batch': batch, 'num_steps': 50, 'sampler': 'ode'}
+    assert pred_theta.shape == (batch.num_graphs, N_TORSIONS)
+    assert pred_tau_m.shape == (batch.num_graphs,)
 
 
 def test_rmsd_ignores_invalid_non_op_atoms(monkeypatch):

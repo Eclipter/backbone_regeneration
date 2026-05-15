@@ -248,3 +248,28 @@ def reverse_ve_score_step(
         log_tau + d2_tau * score_pred[..., N_TORSIONS:N_LATENT] + step_noise_tau
     ).clamp(LOG_TAU_M_MIN, LOG_TAU_M_MAX)
     return theta_next, log_next
+
+
+def reverse_ve_score_ode_step(
+    theta: torch.Tensor,
+    log_tau: torch.Tensor,
+    score_pred: torch.Tensor,
+    sigma_cur: torch.Tensor,
+    sigma_next: torch.Tensor,
+    sigma_tau_cur: torch.Tensor,
+    sigma_tau_next: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    d2_theta = (sigma_cur ** 2 - sigma_next ** 2).clamp(min=0.0)
+    d2_tau = (sigma_tau_cur ** 2 - sigma_tau_next ** 2).clamp(min=0.0)
+
+    while d2_theta.ndim < theta.ndim:
+        d2_theta = d2_theta.unsqueeze(-1)
+    while d2_tau.ndim < log_tau.ndim:
+        d2_tau = d2_tau.unsqueeze(-1)
+
+    theta_next = wrap_angle(theta + 0.5 * d2_theta * score_pred[..., :N_TORSIONS])
+    log_next = (
+        log_tau + 0.5 * d2_tau * score_pred[..., N_TORSIONS:N_LATENT]
+    ).clamp(LOG_TAU_M_MIN, LOG_TAU_M_MAX)
+
+    return theta_next, log_next

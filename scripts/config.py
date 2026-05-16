@@ -40,7 +40,7 @@ BASE = dict(
 # One entry = one experiment. Put ONLY the overrides from BASE here
 EXPERIMENTS = [
     # {},  # baseline (matches BASE)
-    {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.1, 'SAMPLER': 'ODE'},
+    {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.1},
     {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.1, 'SAMPLER': 'SDE'}
 ]
 

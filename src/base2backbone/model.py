@@ -543,13 +543,13 @@ class BackboneLightningModule(pl.LightningModule):
         self._write_rmsd_scalars('test')
 
     @torch.no_grad()
-    def p_sample_loop(self, batch, num_steps: int | None = None, sampler: str | None = None):
+    def p_sample_loop(self, batch, num_timesteps: int | None = None, sampler: str | None = None):
         theta0, _, _, _, _ = self._theta_mask_target(batch)
         b = batch.num_graphs
         dev = self.device
         dtype = torch.float32
-        if num_steps is None:
-            num_steps = int(self.hparams['num_timesteps'])
+        if num_timesteps is None:
+            num_timesteps = int(self.hparams['num_timesteps'])
         if sampler is None:
             sampler = str(self.hparams.get('sampler', 'sde'))
         sampler = sampler.lower()
@@ -560,7 +560,7 @@ class BackboneLightningModule(pl.LightningModule):
         else:
             raise ValueError(f'unknown sampler: {sampler!r}')
         device = torch.device(dev)
-        sig_theta, sig_tau = self._get_sampling_sigmas(device, dtype, num_steps)
+        sig_theta, sig_tau = self._get_sampling_sigmas(device, dtype, num_timesteps)
         prefix = self._build_static_x_prefix(batch)
         theta = wrap_angle(
             torch.rand(b, N_TORSIONS, device=dev, dtype=dtype) * (2.0 * math.pi) - math.pi,
@@ -731,10 +731,10 @@ class BackboneLightningModule(pl.LightningModule):
         self._log_rmsd('test', pred_theta, pred_tau_m, batch)
 
     @torch.no_grad()
-    def sample(self, batch, num_steps: int | None = None, sampler: str | None = None):
+    def sample(self, batch, num_timesteps: int | None = None, sampler: str | None = None):
         _, (pred_theta, pred_tau_m) = self.p_sample_loop(
             batch,
-            num_steps=num_steps,
+            num_timesteps=num_timesteps,
             sampler=sampler,
         )
         return pred_theta, pred_tau_m

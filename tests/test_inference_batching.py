@@ -1,6 +1,10 @@
+import os.path as osp
+from pathlib import Path
+
 import MDAnalysis as mda
 import numpy as np
 import torch
+import pytest
 from Bio.PDB.MMCIFParser import MMCIFParser
 from torch_geometric.data import Data
 
@@ -103,7 +107,11 @@ def _stub_output_universe(chain_records, predictions, generate_5prime_phosphate=
     universe.add_TopologyAttr('resnames', ['DA'] * n_atoms)
     universe.add_TopologyAttr('resids', list(range(1, n_atoms + 1)))
     universe.add_TopologyAttr('segids', ['A'])
-    universe.atoms.positions = np.zeros((n_atoms, 3), dtype=np.float32)
+    xyz = np.zeros((n_atoms, 3), dtype=np.float32)
+    if predictions:
+        ref = np.asarray(next(iter(predictions.values())), dtype=np.float32)
+        xyz[:] = ref
+    universe.atoms.positions = xyz
     return universe
 
 
@@ -149,6 +157,42 @@ def test_predict_backbone_trajectory_batches_frames(monkeypatch):
     assert model.batch_sizes == [12]
     assert output_universe.atoms.n_atoms == 4 * len(BACKBONE_ATOMS)
     assert len(output_universe.trajectory) == 2
+
+
+def test_inference_cli_output_dir_requires_trajectory():
+    with pytest.raises(SystemExit):
+        pred_mod._parse_args(['--input', 'dummy.pdb', '--output-dir', 'frames'])
+
+
+def test_inference_cli_output_format_rejected_with_output():
+    with pytest.raises(SystemExit):
+        pred_mod._parse_args([
+            '--input', 'dummy.pdb',
+            '--output', 'out.pdb',
+            '--output-format', '.cif',
+        ])
+
+
+def test_write_trajectory_frames_directory_writes_one_file_per_timestep(tmp_path):
+    frame0 = _stub_output_universe([], {(0, 0, i): np.zeros(3, dtype=np.float32) for i in range(3)})
+    frame1 = _stub_output_universe([], {(0, 0, i): np.ones(3, dtype=np.float32) for i in range(3)})
+    trajectory = pred_mod._build_output_trajectory([frame0, frame1])
+
+    pdb_dir = tmp_path / 'pdbf'
+    pdb_paths = pred_mod.write_trajectory_frames_directory(trajectory, str(pdb_dir))
+    assert len(pdb_paths) == 2
+    assert osp.basename(pdb_paths[0]) == 'frame_000000.pdb'
+    pdb0_txt = Path(pdb_paths[0]).read_text()
+    pdb1_txt = Path(pdb_paths[1]).read_text()
+    assert pdb0_txt != pdb1_txt
+
+    cif_dir = tmp_path / 'cifdir'
+    cif_paths = pred_mod.write_trajectory_frames_directory(
+        trajectory, str(cif_dir), output_format='.cif',
+    )
+    assert len(cif_paths) == 2 and all(p.endswith('.cif') for p in cif_paths)
+    mmcif_parser = MMCIFParser(QUIET=True)
+    assert len(list(mmcif_parser.get_structure('f0', cif_paths[0]).get_models())) == 1
 
 
 def test_write_structure_writes_multimodel_pdb_and_cif(tmp_path):

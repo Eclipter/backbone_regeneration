@@ -515,22 +515,79 @@ def write_structure(universe, output_path, output_format: str | None = None):
     return output_path
 
 
-def _parse_args():
+def _write_trajectory_frame(universe, output_path: str, ext: str, frame_idx: int):
+    """Write one trajectory frame by index without relying on the reader's timestep state."""
+    assert universe.atoms is not None
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', category=UserWarning)
+        if ext == '.pdb':
+            universe.atoms.write(output_path, frames=[frame_idx])
+            return
+        fd, tmp_pdb = tempfile.mkstemp(suffix='.pdb')
+        os.close(fd)
+        try:
+            universe.atoms.write(tmp_pdb, frames=[frame_idx])
+            parser = PDBParser(QUIET=True)
+            bio_structure = parser.get_structure('regen', tmp_pdb)
+            io = MMCIFIO()
+            io.set_structure(bio_structure)
+            io.save(output_path)
+        finally:
+            if osp.exists(tmp_pdb):
+                os.remove(tmp_pdb)
+
+
+def write_trajectory_frames_directory(
+    universe,
+    output_dir: str,
+    output_format: str | None = None,
+) -> list[str]:
+    """Write each trajectory timestep to ``output_dir`` as ``frame_<index>.<ext>``."""
+    od = osp.abspath(osp.expanduser(output_dir))
+    _, ext = _normalize_output_path(osp.join(od, 'placeholder.pdb'), output_format)
+    os.makedirs(od, exist_ok=True)
+
+    paths: list[str] = []
+    for frame_idx in range(len(universe.trajectory)):
+        frame_path = osp.join(od, f'frame_{frame_idx:06d}{ext}')
+        _write_trajectory_frame(universe, frame_path, ext, frame_idx)
+        paths.append(frame_path)
+    return paths
+
+
+def _parse_args(argv=None):
     p = ArgumentParser(description='Regenerate DNA backbone atoms from a base-only PDB/mmCIF.')
     p.add_argument('--input', required=True, help='Path to input topology .pdb/.cif/.mmcif (DNA without backbone).')
     p.add_argument('--trajectory', help='Optional trajectory path (for example .xtc/.dcd); writes a multi-model output.')
-    p.add_argument('--output', required=True, help='Output path; format from extension or --output-format.')
+    out_group = p.add_mutually_exclusive_group(required=True)
+    out_group.add_argument(
+        '--output',
+        help='Output path (single structure or multi-model trajectory); format inferred from filename extension (.pdb or .cif/.mmcif).',
+    )
+    out_group.add_argument(
+        '--output-dir',
+        metavar='DIR',
+        help=(
+            'Write one PDB/mmCIF file per trajectory frame under DIR '
+            '(requires --trajectory; mutually exclusive with --output). Extension from --output-format or default .pdb.'
+        ),
+    )
     p.add_argument(
         '--output-format',
         choices=['.pdb', '.cif'],
-        help='Override output format. .cif writes mmCIF.',
+        help='Only with --output-dir: file extension per frame (.pdb default otherwise).',
     )
     p.add_argument(
         '--generate-5-prime-phosphate',
         action='store_true',
         help="Include 5'-terminal P, OP1, OP2 atoms in the output (omitted by default).",
     )
-    return p.parse_args()
+    args = p.parse_args(argv)
+    if args.output_dir and not args.trajectory:
+        p.error('--output-dir requires --trajectory')
+    if args.output and args.output_format is not None:
+        p.error('--output-format cannot be combined with --output (use the extension on --output: .pdb or .cif/.mmcif).')
+    return args
 
 
 def main():
@@ -543,20 +600,35 @@ def main():
             device=device,
             generate_5prime_phosphate=args.generate_5_prime_phosphate,
         )
+        if args.output_dir:
+            paths = write_trajectory_frames_directory(
+                output_universe,
+                args.output_dir,
+                output_format=args.output_format,
+            )
+            assert output_universe.atoms is not None
+            n_frames = len(paths)
+            print(
+                f'Wrote {n_frames} file(s) under {osp.abspath(args.output_dir)} '
+                f'({output_universe.atoms.n_atoms} atoms per frame).',
+            )
+        else:
+            assert args.output is not None
+            output_path = write_structure(output_universe, args.output)
+            assert output_universe.atoms is not None
+            n_frames = len(output_universe.trajectory)
+            print(f'Wrote {output_path} ({output_universe.atoms.n_atoms} atoms, {n_frames} frame(s)).')
     else:
+        assert args.output is not None
         output_universe = predict_backbone(
             args.input,
             device=device,
             generate_5prime_phosphate=args.generate_5_prime_phosphate,
         )
-    output_path = write_structure(
-        output_universe,
-        args.output,
-        output_format=args.output_format,
-    )
-    assert output_universe.atoms is not None
-    n_frames = len(output_universe.trajectory)
-    print(f'Wrote {output_path} ({output_universe.atoms.n_atoms} atoms, {n_frames} frame(s)).')
+        output_path = write_structure(output_universe, args.output)
+        assert output_universe.atoms is not None
+        n_frames = len(output_universe.trajectory)
+        print(f'Wrote {output_path} ({output_universe.atoms.n_atoms} atoms, {n_frames} frame(s)).')
 
 
 if __name__ == '__main__':

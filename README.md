@@ -63,8 +63,9 @@ python scripts/export.py --run-id torsions/1/baseline
 ## Usage
 
 1. Make sure to set up the environment. See [Setup](#setup)
-2. Predict the backbone (CLI):
-  3. For a single structure:
+2. Predict the backbone (alternatives are listed below):
+
+  - CLI (for a single structure):
 
     ```bash
     base2backbone \
@@ -72,35 +73,42 @@ python scripts/export.py --run-id torsions/1/baseline
       --output output.pdb
     ```
 
-    Input topology may be PDB or mmCIF. Output may be PDB or mmCIF independently.
+    Input format may be PDB or mmCIF. Output may be PDB or mmCIF independently. Both are inferred from the filename extension.
 
-  4. For a trajectory:
+    By default 5'-terminal phosphate atoms (`P`, `OP1`, `OP2`) are not predicted. Pass `--generate-5-prime-phosphate` to include them.
 
-    ```bash
-    base2backbone \
-      --input topology.pdb \
-      --trajectory traj.xtc \
-      --output output_traj.pdb
-    ```
+  - CLI (for a trajectory):
+    - Single multi-model file output:
 
-    When `--trajectory` is provided, the CLI writes a **multi-model** output file.
+      ```bash
+      base2backbone \
+        --input topology.pdb \
+        --trajectory traj.xtc \
+        --output output_traj.pdb
+      ```
 
-  5. Supported output formats:
-    - `.pdb` for PDB / multi-model PDB
-    - `.cif` for mmCIF / multi-model mmCIF
-      The output format is inferred from `--output`, or can be overridden explicitly:
-      The CLI currently writes to a single output file, not to an output directory.
-      If you need one file per frame, this is not exposed in the CLI at the moment.
-      By default **5'-terminal phosphate atoms** (`P`, `OP1`, `OP2`) are **not** predicted. Pass `--generate-5-prime-phosphate` to include them.
+      Input format may be PDB or mmCIF. Output may be PDB or mmCIF independently. Both are inferred from the filename extension.
 
-3. Predict the backbone (Python API):
-   The library always returns an `MDAnalysis.Universe`.
+    - Example (one PDB per frame):
 
-```python
-import MDAnalysis as mda
-from base2backbone import predict_backbone, predict_backbone_trajectory
+      ```bash
+      base2backbone \
+        --input topology.pdb \
+        --trajectory traj.xtc \
+        --output-dir frames \
+        --output-format .cif
+      ```
 
-single = predict_backbone('input.cif', device='cuda')
-traj_in = mda.Universe('topology.pdb', 'traj.xtc')
-traj_out = predict_backbone_trajectory(traj_in, device='cuda')
-```
+      Input format may be PDB or mmCIF. Output may be PDB or mmCIF independently. Output format is set by the `--output-format` argument.
+
+  - Python API:
+    The library always returns an `MDAnalysis.Universe`.
+
+      ```python
+      import MDAnalysis as mda
+      from base2backbone import predict_backbone, predict_backbone_trajectory
+
+      single = predict_backbone('input.cif')
+      traj_in = mda.Universe('topology.pdb', 'traj.xtc')
+      traj_out = predict_backbone_trajectory(traj_in)
+      ```

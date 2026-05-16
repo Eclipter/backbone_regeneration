@@ -1,0 +1,27 @@
+{
+  "hyperparameters": {
+    "hidden_dim": 256,
+    "num_heads": 8,
+    "num_layers": 3,
+    "num_timesteps": 200,
+    "angular_sigma_min": 0.031415926535897934,
+    "angular_sigma_max": 3.141592653589793,
+    "tau_sigma_min": 0.01,
+    "tau_sigma_max": 1.5,
+    "tau_loss_weight": 1,
+    "score_loss_weighting": "sigma2",
+    "log_tau_init_noise_scale": null
+  },
+  "N_TORSIONS_LATENT": 8,
+  "base_to_idx": {
+    "A": 0,
+    "C": 1,
+    "G": 2,
+    "T": 3
+  },
+  "node_dim": 88,
+  "time_emb_dim": 32,
+  "window_size": 3,
+  "opset_version": 17,
+  "source_checkpoint": "epoch=199.ckpt"
+}

@@ -1,10 +1,15 @@
-# %%
-# Imports
+# %% Imports
 import os.path as osp
 import random
+import shlex
+import shutil
+import subprocess
+import tempfile
+import time
 import warnings
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
+                                as_completed)
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
@@ -16,8 +21,10 @@ import py3Dmol
 import requests
 import seaborn as sns
 import torch
+from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
 from sklearn.neighbors import NearestNeighbors
+from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import Batch, Data
 from tqdm import tqdm
 
@@ -31,38 +38,46 @@ from base2backbone.eval import (backbone_local_in_target_frame,
                                 local_backbone_rmsd, ordered_backbone_segments,
                                 phosphodiester_segments_local,
                                 world_to_local_np)
-from base2backbone.geometry.backbone import build_backbone_local
+from base2backbone.geometry.backbone import (build_backbone_local,
+                                             nucleotide_torsions)
+from base2backbone.inference import \
+    _build_output_universe as build_output_universe
+from base2backbone.inference import \
+    _predict_backbone_from_chain_records as predict_backbone_from_chain_records
 from base2backbone.inference import predict_backbone, write_structure
 from base2backbone.io import default_atoms_provider
 from base2backbone.runtime import (MODEL_DIR, PROGRESS_BAR_COLOR,
                                    collect_scalar_history,
                                    load_analysis_run_artifacts)
+from base2backbone.torsion_constants import (TOR_CHI, TOR_GAMMA,
+                                             TOR_PSEUDOROTATION_PHASE)
+
+IDX_TO_BASE = {v: k for k, v in BASE_TO_INDEX.items()}
 
 # Angle channel order in tensors: α, β, γ, ε, ζ, χ, pseudorotation phase
 # (no backbone δ; τ_m is separate / log τ in latent).
 TOR_NAMES = ['α', 'β', 'γ', 'ε', 'ζ', 'χ', 'phase']
 
-# %%
-# Load model and dataset
-run_id = 'torsions/5/CLOSURE_LOSS_WEIGHT=0.001'
-run_artifacts = load_analysis_run_artifacts(run_id)
-run_dir = run_artifacts.run_dir
-ckpt_path = run_artifacts.ckpt_path
-event_files = run_artifacts.event_files
-test_dataset = run_artifacts.test_dataset
-target_modes = run_artifacts.target_modes
+# %% Load model and dataset
+run_id = 'torsions/6/CLOSURE_LOSS_WEIGHT=0.001_CLOSURE_ANGLE_WEIGHT=0.1'
+
+artifacts = load_analysis_run_artifacts(run_id)
+run_dir = artifacts.run_dir
+ckpt_path = artifacts.ckpt_path
+event_files = artifacts.event_files
+test_dataset = artifacts.test_dataset
+target_modes = artifacts.target_modes
 mode_colors = {
     'avg': 'indigo',
     'central': PROGRESS_BAR_COLOR,
     'edge': 'violet',
 }
 mode_linestyles = {'avg': '-', 'central': '--', 'edge': '--'}
-model = run_artifacts.model
-device = run_artifacts.device
+model = artifacts.model
+device = artifacts.device
 print(f'device: {device}')
 
-# %%
-# Load dataset
+# %% Show samples from dataset
 dataset = PyGDataset()
 rng = np.random.default_rng()
 raw_idx = rng.integers(len(dataset))
@@ -77,18 +92,18 @@ axis_len = 2.5
 axis_tip_scale = 0.25
 
 
-def _to_target_local(points_world):
+def to_target_local(points_world):
     # Express world-space points in the target nucleotide frame.
     return world_to_local_np(points_world, o_t_raw, R_t_raw)
 
 
-def _format_nt_label(nucleotide_idx, target_idx):
+def format_nt_label(nucleotide_idx, target_idx):
     if nucleotide_idx == target_idx:
         return f'Нуклеотид {nucleotide_idx} (целевой)'
     return f'Нуклеотид {nucleotide_idx} (контекстный)'
 
 
-def _add_local_axes(
+def add_local_axes(
     fig,
     origin_world,
     frame_world,
@@ -134,21 +149,61 @@ def _add_local_axes(
         ))
 
 
-bb_local_per_nt = []
-for i in range(ws):
-    bb_world = raw_data.bb_xyz_world[i].numpy()
-    valid = ~np.any(np.isnan(bb_world), axis=1)
-    bb_local = _to_target_local(bb_world[valid])
-    bb_local_per_nt.append((i, bb_local, valid))
+def segments_to_xyz(segments):
+    """Convert (p1, p2) segment pairs to flat xyz lists with None separators."""
+    x, y, z = [], [], []
+    for p1, p2 in segments:
+        x.extend([p1[0], p2[0], None])
+        y.extend([p1[1], p2[1], None])
+        z.extend([p1[2], p2[2], None])
+    return x, y, z
+
+
+def add_xyz_gizmo(fig, axis_len, tip_scale, label_z=0.15, unit_cones=False):
+    """Add X/Y/Z axis lines, cones, and labels to a 3D plotly figure."""
+    for ax_i, color in enumerate(['red', 'green', 'blue']):
+        end = [0.0, 0.0, 0.0]
+        end[ax_i] = axis_len
+        tip = [0.0, 0.0, 0.0]
+        tip[ax_i] = 1.0 if unit_cones else axis_len
+        fig.add_trace(go.Scatter3d(
+            x=[0, end[0]], y=[0, end[1]], z=[0, end[2]],
+            mode='lines', line=dict(color=color, width=5), showlegend=False,
+        ))
+        fig.add_trace(go.Cone(
+            x=[end[0]], y=[end[1]], z=[end[2]],
+            u=[tip[0]], v=[tip[1]], w=[tip[2]],
+            showscale=False, colorscale=[[0, color], [1, color]],
+            sizemode='absolute', sizeref=tip_scale, anchor='tail',
+            showlegend=False, hoverinfo='skip',
+        ))
+    fig.add_trace(go.Scatter3d(
+        x=[axis_len, 0.3, 0, 0],
+        y=[0.3, axis_len, 0.3, 0],
+        z=[0, 0, axis_len, label_z],
+        mode='text', text=['X', 'Y', 'Z', '(0, 0, 0)'],
+        textposition=['middle right', 'middle right', 'top center', 'top center'],
+        textfont=dict(size=14, color='black'), showlegend=False,
+    ))
+
 
 fig = go.Figure()
 
-source_lines_x, source_lines_y, source_lines_z = [], [], []
-for _i, pts, valid in bb_local_per_nt:
-    for p1, p2 in backbone_segments_from_local_coords(pts, valid):
-        source_lines_x.extend([p1[0], p2[0], None])
-        source_lines_y.extend([p1[1], p2[1], None])
-        source_lines_z.extend([p1[2], p2[2], None])
+# Single pass: build backbone segments, neighbor and target point sets.
+all_bb_segs = []
+neighbor_pts = []
+target_pts = np.empty((0, 3))
+for i in range(ws):
+    bb_world = raw_data.bb_xyz_world[i].numpy()
+    valid = ~np.any(np.isnan(bb_world), axis=1)
+    bb_local = to_target_local(bb_world[valid])
+    all_bb_segs.extend(backbone_segments_from_local_coords(bb_local, valid))
+    if i == tidx_raw:
+        target_pts = bb_local
+    elif len(bb_local) > 0:
+        neighbor_pts.append(bb_local)
+
+source_lines_x, source_lines_y, source_lines_z = segments_to_xyz(all_bb_segs)
 if source_lines_x:
     fig.add_trace(go.Scatter3d(
         x=source_lines_x,
@@ -170,7 +225,6 @@ if source_lines_x:
     ))
 
 # Neighbor backbone atoms
-neighbor_pts = [pts for i, pts, _valid in bb_local_per_nt if i != tidx_raw and len(pts) > 0]
 if neighbor_pts:
     neighbor_pts = np.concatenate(neighbor_pts, axis=0)
     fig.add_trace(go.Scatter3d(
@@ -189,7 +243,6 @@ if neighbor_pts:
     ))
 
 # Target backbone atoms
-target_pts = bb_local_per_nt[tidx_raw][1]
 fig.add_trace(go.Scatter3d(
     x=target_pts[:, 0],
     y=target_pts[:, 1],
@@ -207,9 +260,9 @@ fig.add_trace(go.Scatter3d(
 
 # Nucleotide origins and local axes
 origin_worlds = raw_data.nt_origins_world.numpy()
-origin_locals = _to_target_local(origin_worlds)
+origin_locals = to_target_local(origin_worlds)
 origin_labels = [
-    _format_nt_label(i, tidx_raw)
+    format_nt_label(i, tidx_raw)
     for i in range(ws)
 ]
 fig.add_trace(go.Scatter3d(
@@ -225,7 +278,7 @@ fig.add_trace(go.Scatter3d(
 
 for i in range(ws):
     frame_world = raw_data.nt_frames_world[i].numpy()
-    _add_local_axes(
+    add_local_axes(
         fig,
         origin_worlds[i],
         frame_world,
@@ -237,60 +290,7 @@ for i in range(ws):
         label_prefix=f'Нуклеотид {i}',
     )
 
-fig.add_trace(go.Scatter3d(
-    x=[0, axis_len], y=[0, 0], z=[0, 0],
-    mode='lines',
-    line=dict(color='red', width=5),
-    showlegend=False,
-))
-fig.add_trace(go.Scatter3d(
-    x=[0, 0], y=[0, axis_len], z=[0, 0],
-    mode='lines',
-    line=dict(color='green', width=5),
-    showlegend=False,
-))
-fig.add_trace(go.Scatter3d(
-    x=[0, 0], y=[0, 0], z=[0, axis_len],
-    mode='lines',
-    line=dict(color='blue', width=5),
-    showlegend=False,
-))
-
-fig.add_trace(go.Cone(
-    x=[axis_len], y=[0], z=[0],
-    u=[axis_len], v=[0], w=[0],
-    showscale=False, colorscale=[[0, 'red'], [1, 'red']],
-    sizemode='absolute', sizeref=axis_tip_scale, anchor='tail',
-    showlegend=False,
-    hoverinfo='skip',
-))
-fig.add_trace(go.Cone(
-    x=[0], y=[axis_len], z=[0],
-    u=[0], v=[axis_len], w=[0],
-    showscale=False, colorscale=[[0, 'green'], [1, 'green']],
-    sizemode='absolute', sizeref=axis_tip_scale, anchor='tail',
-    showlegend=False,
-    hoverinfo='skip',
-))
-fig.add_trace(go.Cone(
-    x=[0], y=[0], z=[axis_len],
-    u=[0], v=[0], w=[axis_len],
-    showscale=False, colorscale=[[0, 'blue'], [1, 'blue']],
-    sizemode='absolute', sizeref=axis_tip_scale, anchor='tail',
-    showlegend=False,
-    hoverinfo='skip',
-))
-
-fig.add_trace(go.Scatter3d(
-    x=[axis_len, 0.3, 0, 0],
-    y=[0.3, axis_len, 0.3, 0],
-    z=[0, 0, axis_len, 0.15],
-    mode='text',
-    text=['X', 'Y', 'Z', '(0, 0, 0)'],
-    textposition=['middle right', 'middle right', 'top center', 'top center'],
-    textfont=dict(size=14, color='black'),
-    showlegend=False,
-))
+add_xyz_gizmo(fig, axis_len, axis_tip_scale)
 
 fig.update_layout(
     title=f'PDB ID: {pdb_id}',
@@ -306,8 +306,7 @@ fig.update_layout(
 )
 fig.show()
 
-# %%
-# Training
+# %% Training
 plt.rcParams['font.family'] = 'Nunito'
 
 
@@ -332,7 +331,7 @@ if 'train/loss' in wide.columns:
     wide['train_noise_rmse'] = np.sqrt(wide['train/loss'].clip(lower=0))
 
 
-def _plot_metric(ax, table, column, color, label, linestyle='-'):
+def plot_metric(ax, table, column, color, label, linestyle='-'):
     values = table[column].dropna()
     return ax.plot(
         values.index.to_numpy(),
@@ -354,7 +353,7 @@ validation_labels = {
 fig, ax = plt.subplots(figsize=(7, 4))
 ax.tick_params(axis='both', labelsize=15)
 if 'train_noise_rmse' in wide.columns:
-    _plot_metric(ax, wide, 'train_noise_rmse', 'indigo', 'train_rmse')
+    plot_metric(ax, wide, 'train_noise_rmse', 'indigo', 'train_rmse')
 swa_epoch = 80
 ax.axvline(swa_epoch, color='red', linewidth=3, linestyle='--')
 ax.text(
@@ -379,7 +378,7 @@ ax.tick_params(axis='both', labelsize=15)
 for mode in target_modes:
     w = wide_per_mode[mode]
     if 'val/rmsd' in w.columns:
-        _plot_metric(
+        plot_metric(
             ax,
             w,
             'val/rmsd',
@@ -415,12 +414,12 @@ fig.tight_layout()
 fig.savefig(osp.join(run_dir, 'test.png'), bbox_inches='tight', dpi=300)
 plt.show()
 
-# %%
-# Results
+# %% Results
 test_pdb_to_local: dict[str, list[int]] = defaultdict(list)
-_base_paths = test_dataset.base.data_list
-test_paths = [_base_paths[w_idx] for w_idx, _ in test_dataset.virtual_entries]
-for local_i, p in enumerate(test_paths):
+test_paths = []
+for local_i, (w_idx, _) in enumerate(test_dataset.virtual_entries):
+    p = test_dataset.base.data_list[w_idx]
+    test_paths.append(p)
     test_pdb_to_local[Path(p).parent.name].append(local_i)
 
 sample_pdb_id = random.choice(sorted(test_pdb_to_local.keys()))
@@ -436,7 +435,7 @@ if np.isnan(tidx_origin).any() or np.isnan(tidx_frame).any():
     tidx_frame = np.eye(3, dtype=np.float64)
 
 
-def _collect_frame_geometry(origins_world, frames_world, target_origin, target_frame, target_idx):
+def collect_frame_geometry(origins_world, frames_world, target_origin, target_frame, target_idx):
     labels = []
     axis_entries = []
     local_points = []
@@ -447,7 +446,7 @@ def _collect_frame_geometry(origins_world, frames_world, target_origin, target_f
         if np.isnan(origin_local).any():
             continue
         local_points.append(origin_local)
-        labels.append(_format_nt_label(i, target_idx))
+        labels.append(format_nt_label(i, target_idx))
         if not np.isnan(frame_world).any():
             axis_entries.append((i, origin_world, frame_world))
     return np.asarray(local_points, dtype=np.float64), labels, axis_entries
@@ -462,59 +461,47 @@ for i in range(data.bb_xyz_world.shape[0]):
 pos_full = np.asarray(pos_full, dtype=np.float64)
 target_mask = np.asarray(target_mask, dtype=bool)
 side_mask = ~target_mask
-true_backbone = pos_full[target_mask]
+true_bb = pos_full[target_mask]
 
 with torch.no_grad():
     batch = cast(Any, Batch.from_data_list([data])).to(device)
     pred_theta, pred_tau_m = model.sample(batch)
 
-restype = {v: k for k, v in BASE_TO_INDEX.items()}[
-    int(data.base_types[tidx].argmax().item())
-]
-_o3_prev_vis = None
+restype = IDX_TO_BASE[int(data.base_types[tidx].argmax().item())]
+o3_prev_vis = None
 if bool(data.o3_prev_valid[tidx].item()):
-    _o3_prev_vis = data.o3_prev_local[tidx].numpy()
-pred_local_dict = build_backbone_local(
+    o3_prev_vis = data.o3_prev_local[tidx].numpy()
+pred_local = build_backbone_local(
     pred_theta[0].cpu().numpy(),
     restype,
-    o3_prev_local=_o3_prev_vis,
+    o3_prev_local=o3_prev_vis,
     tau_m=float(pred_tau_m[0].clamp(min=1e-3).item()),
 )
 
-true_local_dict = {
-    name: xyz
-    for name, xyz in zip(
-        [BACKBONE_ATOMS[j] for j in range(len(BACKBONE_ATOMS)) if not np.isnan(data.bb_xyz_world[tidx].numpy()[j]).any()],
-        true_backbone,
-    )
+bb_tidx = data.bb_xyz_world[tidx].numpy()
+valid_mask = ~np.any(np.isnan(bb_tidx), axis=1)
+true_local = {
+    BACKBONE_ATOMS[j]: true_bb[k]
+    for k, j in enumerate(np.where(valid_mask)[0])
 }
-pred_backbone = np.array(
-    [pred_local_dict[name] for name in BACKBONE_ATOMS if name in pred_local_dict],
+pred_bb = np.array(
+    [pred_local[name] for name in BACKBONE_ATOMS if name in pred_local],
     dtype=np.float64,
 )
 
-_matched_window = find_window_matching_sample(test_dataset.base, sample_pdb_id, data)
-_full_source_segments: list[tuple[np.ndarray, np.ndarray]] = []
-_target_base_pts: list[np.ndarray] = []
-_side_base_pts: list[np.ndarray] = []
-if _matched_window is not None:
-    _per_nt_coords = coords_local_per_nt(_matched_window, tidx_origin, tidx_frame)
-    for nucleotide, cmap in zip(_matched_window, _per_nt_coords):
-        _full_source_segments.extend(
-            bond_segments_from_nt_graph(cmap, nucleotide.restype)
-        )
-    _full_source_segments.extend(
-        phosphodiester_segments_local(data, tidx_origin, tidx_frame)
-    )
-    _bb_atom_names = set(BACKBONE_ATOMS)
-    for i, cmap in enumerate(_per_nt_coords):
+matched_window = find_window_matching_sample(test_dataset.base, sample_pdb_id, data)
+full_source_segments: list[tuple[np.ndarray, np.ndarray]] = []
+target_base_pts: list[np.ndarray] = []
+side_base_pts: list[np.ndarray] = []
+if matched_window is not None:
+    per_nt_coords = coords_local_per_nt(matched_window, tidx_origin, tidx_frame)
+    bb_atom_names = set(BACKBONE_ATOMS)
+    for i, (nucleotide, cmap) in enumerate(zip(matched_window, per_nt_coords)):
+        full_source_segments.extend(bond_segments_from_nt_graph(cmap, nucleotide.restype))
         for aname, xyz in cmap.items():
-            if aname in _bb_atom_names:
-                continue
-            if i == tidx:
-                _target_base_pts.append(xyz)
-            else:
-                _side_base_pts.append(xyz)
+            if aname not in bb_atom_names:
+                (target_base_pts if i == tidx else side_base_pts).append(xyz)
+    full_source_segments.extend(phosphodiester_segments_local(data, tidx_origin, tidx_frame))
 else:
     print(
         'Results: не удалось сопоставить окно с mmCIF; '
@@ -523,42 +510,28 @@ else:
 
 fig = go.Figure()
 
-if _full_source_segments:
-    _lsx, _lsy, _lsz = [], [], []
-    for _p1, _p2 in _full_source_segments:
-        _lsx.extend([_p1[0], _p2[0], None])
-        _lsy.extend([_p1[1], _p2[1], None])
-        _lsz.extend([_p1[2], _p2[2], None])
+if full_source_segments:
+    lsx, lsy, lsz = segments_to_xyz(full_source_segments)
     fig.add_trace(go.Scatter3d(
-        x=_lsx,
-        y=_lsy,
-        z=_lsz,
+        x=lsx, y=lsy, z=lsz,
         mode='lines',
         line=dict(color='rgba(35, 35, 35, 0.55)', width=6),
         showlegend=False,
         hoverinfo='skip',
     ))
     fig.add_trace(go.Scatter3d(
-        x=_lsx,
-        y=_lsy,
-        z=_lsz,
+        x=lsx, y=lsy, z=lsz,
         mode='lines',
         line=dict(color='rgba(210, 210, 210, 0.95)', width=3),
         showlegend=False,
         hoverinfo='skip',
     ))
-elif _matched_window is None:
-    _fb_only = ordered_backbone_segments(true_local_dict)
-    if _fb_only:
-        _osx, _osy, _osz = [], [], []
-        for _p1, _p2 in _fb_only:
-            _osx.extend([_p1[0], _p2[0], None])
-            _osy.extend([_p1[1], _p2[1], None])
-            _osz.extend([_p1[2], _p2[2], None])
+elif matched_window is None:
+    fb_only = ordered_backbone_segments(true_local)
+    if fb_only:
+        osx, osy, osz = segments_to_xyz(fb_only)
         fig.add_trace(go.Scatter3d(
-            x=_osx,
-            y=_osy,
-            z=_osz,
+            x=osx, y=osy, z=osz,
             mode='lines',
             line=dict(color='rgba(210, 210, 210, 0.95)', width=3),
             showlegend=False,
@@ -583,9 +556,9 @@ if np.any(side_mask):
     ))
 
 fig.add_trace(go.Scatter3d(
-    x=true_backbone[:, 0],
-    y=true_backbone[:, 1],
-    z=true_backbone[:, 2],
+    x=true_bb[:, 0],
+    y=true_bb[:, 1],
+    z=true_bb[:, 2],
     mode='markers',
     marker=dict(
         size=8,
@@ -597,12 +570,12 @@ fig.add_trace(go.Scatter3d(
     name='Исходный целевой остов',
 ))
 
-if _target_base_pts:
-    _tbp = np.stack(_target_base_pts, axis=0)
+if target_base_pts:
+    tbp = np.stack(target_base_pts, axis=0)
     fig.add_trace(go.Scatter3d(
-        x=_tbp[:, 0],
-        y=_tbp[:, 1],
-        z=_tbp[:, 2],
+        x=tbp[:, 0],
+        y=tbp[:, 1],
+        z=tbp[:, 2],
         mode='markers',
         marker=dict(
             size=7,
@@ -615,9 +588,9 @@ if _target_base_pts:
     ))
 
 fig.add_trace(go.Scatter3d(
-    x=pred_backbone[:, 0],
-    y=pred_backbone[:, 1],
-    z=pred_backbone[:, 2],
+    x=pred_bb[:, 0],
+    y=pred_bb[:, 1],
+    z=pred_bb[:, 2],
     mode='markers',
     marker=dict(
         size=9,
@@ -629,12 +602,12 @@ fig.add_trace(go.Scatter3d(
     name='Сгенерированный остов',
 ))
 
-if _side_base_pts:
-    _sbp = np.stack(_side_base_pts, axis=0)
+if side_base_pts:
+    sbp = np.stack(side_base_pts, axis=0)
     fig.add_trace(go.Scatter3d(
-        x=_sbp[:, 0],
-        y=_sbp[:, 1],
-        z=_sbp[:, 2],
+        x=sbp[:, 0],
+        y=sbp[:, 1],
+        z=sbp[:, 2],
         mode='markers',
         marker=dict(
             size=9,
@@ -646,35 +619,22 @@ if _side_base_pts:
         name='Исходное: окружение, основание',
     ))
 
-for segments, color, width, name in [
-    (ordered_backbone_segments(pred_local_dict), 'rgba(8, 65, 140, 0.95)', 6, 'Связи сгенерированного остова'),
-]:
-    if not segments:
-        continue
-    lines_x, lines_y, lines_z = [], [], []
-    for p1, p2 in segments:
-        lines_x.extend([p1[0], p2[0], None])
-        lines_y.extend([p1[1], p2[1], None])
-        lines_z.extend([p1[2], p2[2], None])
+pred_bb_segments = ordered_backbone_segments(pred_local)
+if pred_bb_segments:
+    lines_x, lines_y, lines_z = segments_to_xyz(pred_bb_segments)
     fig.add_trace(go.Scatter3d(
-        x=lines_x,
-        y=lines_y,
-        z=lines_z,
+        x=lines_x, y=lines_y, z=lines_z,
         mode='lines',
-        line=dict(color=color, width=width),
+        line=dict(color='rgba(8, 65, 140, 0.95)', width=6),
         showlegend=False,
         hoverinfo='skip',
     ))
 
-shared_names = [name for name in BACKBONE_ATOMS if name in true_local_dict and name in pred_local_dict]
+shared_names = [name for name in BACKBONE_ATOMS if name in true_local and name in pred_local]
 if shared_names:
-    corr_x, corr_y, corr_z = [], [], []
-    for name in shared_names:
-        p_true = true_local_dict[name]
-        p_pred = pred_local_dict[name]
-        corr_x.extend([p_true[0], p_pred[0], None])
-        corr_y.extend([p_true[1], p_pred[1], None])
-        corr_z.extend([p_true[2], p_pred[2], None])
+    corr_x, corr_y, corr_z = segments_to_xyz(
+        [(true_local[n], pred_local[n]) for n in shared_names]
+    )
     fig.add_trace(go.Scatter3d(
         x=corr_x,
         y=corr_y,
@@ -686,7 +646,7 @@ if shared_names:
 
 results_origin_worlds = data.nt_origins_world.numpy()
 results_frame_worlds = data.nt_frames_world.numpy()
-results_origin_locals, results_origin_labels, results_axis_entries = _collect_frame_geometry(
+results_origin_locals, results_origin_labels, results_axis_entries = collect_frame_geometry(
     results_origin_worlds,
     results_frame_worlds,
     tidx_origin,
@@ -704,7 +664,7 @@ if len(results_origin_locals) > 0:
         showlegend=False,
     ))
 for i, origin_world, frame_world in results_axis_entries:
-    _add_local_axes(
+    add_local_axes(
         fig,
         origin_world,
         frame_world,
@@ -716,48 +676,10 @@ for i, origin_world, frame_world in results_axis_entries:
         label_prefix=f'Нуклеотид {i}',
     )
 
-all_points = np.vstack([pos_full, pred_backbone])
+all_points = np.vstack([pos_full, pred_bb])
 radius = float(np.max(np.linalg.norm(all_points, axis=1)))
 axis_len = max(4.0, radius * 1.15) / 5.0
-for axis_vals, color in [
-    ([0, axis_len, 0, 0, 0, 0], 'red'),
-    ([0, 0, 0, axis_len, 0, 0], 'green'),
-    ([0, 0, 0, 0, 0, axis_len], 'blue'),
-]:
-    fig.add_trace(go.Scatter3d(
-        x=[axis_vals[0], axis_vals[1]],
-        y=[axis_vals[2], axis_vals[3]],
-        z=[axis_vals[4], axis_vals[5]],
-        mode='lines',
-        line=dict(color=color, width=5),
-        showlegend=False,
-    ))
-
-fig.add_trace(go.Cone(
-    x=[axis_len], y=[0], z=[0], u=[1], v=[0], w=[0],
-    showscale=False, colorscale=[[0, 'red'], [1, 'red']],
-    sizemode='absolute', sizeref=0.45, anchor='tail', showlegend=False,
-))
-fig.add_trace(go.Cone(
-    x=[0], y=[axis_len], z=[0], u=[0], v=[1], w=[0],
-    showscale=False, colorscale=[[0, 'green'], [1, 'green']],
-    sizemode='absolute', sizeref=0.45, anchor='tail', showlegend=False,
-))
-fig.add_trace(go.Cone(
-    x=[0], y=[0], z=[axis_len], u=[0], v=[0], w=[1],
-    showscale=False, colorscale=[[0, 'blue'], [1, 'blue']],
-    sizemode='absolute', sizeref=0.45, anchor='tail', showlegend=False,
-))
-fig.add_trace(go.Scatter3d(
-    x=[axis_len, 0.3, 0, 0],
-    y=[0.3, axis_len, 0.3, 0],
-    z=[0, 0, axis_len, 0.25],
-    mode='text',
-    text=['X', 'Y', 'Z', '(0, 0, 0)'],
-    textposition=['middle right', 'middle right', 'top center', 'top center'],
-    textfont=dict(size=14, color='black'),
-    showlegend=False,
-))
+add_xyz_gizmo(fig, axis_len, 0.45, label_z=0.25, unit_cones=True)
 
 fig.update_layout(
     title=f'Эксперимент {run_dir}: PDB {sample_pdb_id}, окно {sample_window}',
@@ -774,14 +696,13 @@ fig.update_layout(
 )
 fig.show()
 
-# %%
-# Inference
+# %% Inference
 inference_pdb_id = random.choice(sorted(test_pdb_to_local.keys()))
 raw_inference_path = osp.join('..', 'data', 'raw', f'{inference_pdb_id}.cif')
 print(f'Generating backbone for {inference_pdb_id}...')
 
 generated_pdb_path = osp.join(run_dir, f'generated_backbone_{inference_pdb_id}.pdb')
-predictions, inference_chain_records = predict_backbone(
+generated_universe = predict_backbone(
     raw_inference_path,
     MODEL_DIR,
     device=device,
@@ -796,20 +717,24 @@ with warnings.catch_warnings():
         window_size=test_dataset.base.window_size,
     )
 
-original_predictions = {}
+original_preds = {}
 for _, chain, _ in full_chain_records:
     for nucleotide in chain:
         exp_positions = dict(default_atoms_provider(nucleotide))
         for atom_name in BACKBONE_ATOMS:
             xyz = exp_positions.get(atom_name)
             if xyz is not None:
-                original_predictions[(nucleotide.segid, int(nucleotide.resid), atom_name)] = xyz
+                original_preds[(nucleotide.segid, int(nucleotide.resid), atom_name)] = xyz
 
-write_structure(full_chain_records, predictions, generated_pdb_path)
+write_structure(generated_universe, generated_pdb_path)
 original_pdb_path = osp.join(run_dir, f'original_backbone_{inference_pdb_id}.pdb')
-write_structure(full_chain_records, original_predictions, original_pdb_path)
-print(f'Wrote {generated_pdb_path}  ({len(predictions)} backbone atoms)')
-print(f'Wrote {original_pdb_path}  ({len(original_predictions)} backbone atoms)')
+write_structure(
+    build_output_universe(full_chain_records, original_preds),
+    original_pdb_path,
+)
+assert generated_universe.atoms is not None
+print(f'Wrote {generated_pdb_path}  ({generated_universe.atoms.n_atoms} backbone atoms)')
+print(f'Wrote {original_pdb_path}  ({len(original_preds)} backbone atoms)')
 
 with open(generated_pdb_path) as f:
     pdb_str_generated = f.read()
@@ -837,12 +762,11 @@ view.addLabel(
 view.zoomTo()
 view.show()
 
-# %%
-# Estimate dataset noise
+# %% Estimate dataset noise
 
 
 @lru_cache
-def _dna_seqs(pdb_id):
+def dna_seqs(pdb_id):
     q = ('{ entry(entry_id: "%s") { polymer_entities { entity_poly {'
          'rcsb_entity_polymer_type pdbx_seq_one_letter_code_can } } } }') % pdb_id
     r = requests.post('https://data.rcsb.org/graphql', json={'query': q}, timeout=10)
@@ -854,7 +778,7 @@ def _dna_seqs(pdb_id):
 
 
 @lru_cache
-def _similar_entries(seq):
+def similar_entries(seq):
     r = requests.post('https://search.rcsb.org/rcsbsearch/v2/query', json={
         'query': {'type': 'terminal', 'service': 'sequence', 'parameters': {
             'evalue_cutoff': 1, 'identity_cutoff': 1.0,
@@ -865,7 +789,7 @@ def _similar_entries(seq):
 
 
 @lru_cache
-def _parsed_chain_records(pdb_id):
+def parsed_chain_records(pdb_id):
     path = osp.join('..', 'data', 'raw', f'{pdb_id}.cif')
     if not osp.exists(path):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -880,7 +804,7 @@ def _parsed_chain_records(pdb_id):
     return chain_records
 
 
-def _central_window_index(chain_records):
+def central_window_index(chain_records):
     ci = test_dataset.base.window_size // 2
     idx = {}
     for _, _, windows in chain_records:
@@ -890,29 +814,24 @@ def _central_window_index(chain_records):
     return idx
 
 
-def _central_backbone_local(data):
+def central_backbone_local(data):
     """Backbone atom positions in the local frame of the central nucleotide."""
-    ws = data.bb_xyz_world.shape[0]
-    ci = ws // 2
+    ci = data.bb_xyz_world.shape[0] // 2
     bb_world = data.bb_xyz_world[ci].numpy()    # [n_bb, 3]
     o_t = data.nt_origins_world[ci].numpy()
     R_t = data.nt_frames_world[ci].numpy()
     valid = ~np.any(np.isnan(bb_world), axis=1)
     local = (bb_world - o_t) @ R_t             # transform to local frame
-    return {
-        BACKBONE_ATOMS[j]: local[j]
-        for j in range(len(BACKBONE_ATOMS))
-        if valid[j]
-    }
+    return {BACKBONE_ATOMS[j]: local[j] for j in range(len(BACKBONE_ATOMS)) if valid[j]}
 
 
-def _experimental_rmsd_windows(pdb_id1, pdb_id2):
-    idx1 = _central_window_index(_parsed_chain_records(pdb_id1))
-    idx2 = _central_window_index(_parsed_chain_records(pdb_id2))
+def experimental_rmsd_windows(pdb_id1, pdb_id2):
+    idx1 = central_window_index(parsed_chain_records(pdb_id1))
+    idx2 = central_window_index(parsed_chain_records(pdb_id2))
     values = []
     for key in set(idx1) & set(idx2):
-        atoms1 = _central_backbone_local(idx1[key])
-        atoms2 = _central_backbone_local(idx2[key])
+        atoms1 = central_backbone_local(idx1[key])
+        atoms2 = central_backbone_local(idx2[key])
         shared = [n for n in BACKBONE_ATOMS if n in atoms1 and n in atoms2]
         if not shared:
             continue
@@ -922,13 +841,13 @@ def _experimental_rmsd_windows(pdb_id1, pdb_id2):
     return values
 
 
-def _noise_pairs_for_pdb(pdb_id):
+def noise_pairs_for_pdb(pdb_id):
     values = []
     try:
-        partners = {e for seq in _dna_seqs(pdb_id) for e in _similar_entries(seq)} - {pdb_id}
+        partners = {e for seq in dna_seqs(pdb_id) for e in similar_entries(seq)} - {pdb_id}
         for pid in sorted(partners):
             try:
-                w = _experimental_rmsd_windows(pdb_id, pid)
+                w = experimental_rmsd_windows(pdb_id, pid)
                 if w:
                     values.append((pdb_id, pid, w))
             except Exception:
@@ -945,7 +864,7 @@ test_pdb_ids = sorted({
 
 rmsd_values = []
 with ThreadPoolExecutor(max_workers=8) as executor:
-    futures = [executor.submit(_noise_pairs_for_pdb, pid) for pid in test_pdb_ids]
+    futures = [executor.submit(noise_pairs_for_pdb, pid) for pid in test_pdb_ids]
     for future in as_completed(futures):
         for pdb_id, pid, wv in future.result():
             rmsd_values.extend(wv)
@@ -962,12 +881,13 @@ for mode, color in mode_colors.items():
         linewidth=2,
         label=f'валидационный RMSD, {validation_labels[mode]} ({val:.2f} Å)',
     )
+noise_median = float(np.median(rmsd_values))
 ax.axvline(
-    np.median(rmsd_values),
+    noise_median,
     color='red',
     linestyle='--',
     linewidth=2,
-    label=f'медиана по экспериментальным структурам ({np.median(rmsd_values):.2f} Å)',
+    label=f'медиана по экспериментальным структурам ({noise_median:.2f} Å)',
 )
 ax.set_xlim(0, 3)
 ax.set_xlabel('RMSD (Å)', fontsize=13)
@@ -977,35 +897,34 @@ sns.despine(ax=ax)
 fig.tight_layout()
 plt.show()
 
-# %%
-# Measure stochastic spread across independent diffusion runs on the same input
+# %% Measure stochastic spread across independent diffusion runs on the same input
 K = 10
 N_SAMPLES = 60
 
-_skip_atoms = {'OP1', 'OP2', 'P'}
-_valid_bb_atoms = [a for a in BACKBONE_ATOMS if a not in _skip_atoms]
-_idx_to_base = {v: k for k, v in BASE_TO_INDEX.items()}
+skip_atoms = {'OP1', 'OP2', 'P'}
+valid_bb_atoms = [a for a in BACKBONE_ATOMS if a not in skip_atoms]
+idx_to_base = IDX_TO_BASE
 
-_pool_size = len(test_dataset)
-_inter_run_indices = rng.choice(
-    _pool_size, size=min(N_SAMPLES, _pool_size), replace=False
+pool_size = len(test_dataset)
+inter_run_indices = rng.choice(
+    pool_size, size=min(N_SAMPLES, pool_size), replace=False
 ).tolist()
 
 inter_run_rmsds: list[float] = []
-per_sample_medians: list[float] = []
+sample_medians: list[float] = []
 
 with torch.no_grad():
-    for _wi in tqdm(
-            _inter_run_indices,
+    for wi in tqdm(
+            inter_run_indices,
             desc='Inter-run RMSD',
             colour=PROGRESS_BAR_COLOR,
     ):
-        data = cast(Any, test_dataset[_wi].clone())
+        data = cast(Any, test_dataset[wi].clone())
         tidx = int(data.target_nt_idx.item())
-        restype = _idx_to_base[int(data.base_types[tidx].argmax().item())]
-        _o3_ir = None
+        restype = idx_to_base[int(data.base_types[tidx].argmax().item())]
+        o3_ir = None
         if bool(data.o3_prev_valid[tidx].item()):
-            _o3_ir = data.o3_prev_local[tidx].numpy()
+            o3_ir = data.o3_prev_local[tidx].numpy()
 
         batch = cast(Any, Batch.from_data_list([data])).to(device)
 
@@ -1015,15 +934,15 @@ with torch.no_grad():
             torsions_np = pred_theta[0].cpu().numpy()
             tau_m_val = float(pred_tau_m[0].clamp(min=1e-3).item())
             bb = build_backbone_local(
-                torsions_np, restype, o3_prev_local=_o3_ir, tau_m=tau_m_val,
+                torsions_np, restype, o3_prev_local=o3_ir, tau_m=tau_m_val,
             )
-            run_coords.append({k: v for k, v in bb.items() if k not in _skip_atoms})
+            run_coords.append({k: v for k, v in bb.items() if k not in skip_atoms})
 
         # intersection of atoms present in every run, ordered by backbone_atoms
         shared = set(run_coords[0].keys())
         for rc in run_coords[1:]:
             shared &= set(rc.keys())
-        shared_atoms = [a for a in _valid_bb_atoms if a in shared]
+        shared_atoms = [a for a in valid_bb_atoms if a in shared]
 
         if len(shared_atoms) < 3:
             continue
@@ -1032,32 +951,31 @@ with torch.no_grad():
             [[rc[a] for a in shared_atoms] for rc in run_coords]
         )  # [K, n_atoms, 3]
 
-        pair_rmsds: list[float] = []
-        for r1 in range(K):
-            for r2 in range(r1 + 1, K):
-                diff = coords[r1] - coords[r2]
-                pair_rmsds.append(float(np.sqrt(np.mean(np.sum(diff ** 2, axis=1)))))
+        # vectorized pairwise RMSD over all K*(K-1)/2 pairs
+        diffs = coords[:, None] - coords[None]  # [K, K, n_atoms, 3]
+        rmsds_mat = np.sqrt(np.mean(np.sum(diffs ** 2, axis=-1), axis=-1))  # [K, K]
+        r1, r2 = np.triu_indices(K, k=1)
+        pair_rmsds = rmsds_mat[r1, r2].tolist()
 
         inter_run_rmsds.extend(pair_rmsds)
-        per_sample_medians.append(float(np.median(pair_rmsds)))
+        sample_medians.append(float(np.median(pair_rmsds)))
 
 # %%
 
-_med = float(np.median(inter_run_rmsds))
-_mean = float(np.mean(inter_run_rmsds))
-_p25, _p75 = np.percentile(inter_run_rmsds, [25, 75])
-print(f'Inter-run RMSD  K={K}  N={len(per_sample_medians)} samples  '
-      f'({K * (K - 1) // 2 * len(per_sample_medians)} pairs):')
-print(f'  median={_med:.3f}  mean={_mean:.3f}  p25={_p25:.3f}  p75={_p75:.3f} Å')
+med = float(np.median(inter_run_rmsds))
+mean = float(np.mean(inter_run_rmsds))
+p25, p75 = np.percentile(inter_run_rmsds, [25, 75])
+print(f'Inter-run RMSD  K={K}  N={len(sample_medians)} samples  '
+      f'({K * (K - 1) // 2 * len(sample_medians)} pairs):')
+print(f'  median={med:.3f}  mean={mean:.3f}  p25={p25:.3f}  p75={p75:.3f} Å')
 
 fig, ax = plt.subplots(figsize=(7, 4))
 ax.hist(inter_run_rmsds, color='mediumpurple', edgecolor='white')
-ax.axvline(_med, color='black', linestyle='--', linewidth=2,
-           label=f'медиана: {_med:.1f} Å')
+ax.axvline(med, color='black', linestyle='--', linewidth=2,
+           label=f'медиана: {med:.1f} Å')
 if rmsd_values:
-    _noise_med = float(np.median(rmsd_values))
-    ax.axvline(_noise_med, color='red', linestyle='--', linewidth=2,
-               label=f'экспериментальный порог: {_noise_med:.1f} Å')
+    ax.axvline(noise_median, color='red', linestyle='--', linewidth=2,
+               label=f'экспериментальный порог: {noise_median:.1f} Å')
 ax.set_xlabel('RMSD (Å)', fontsize=13)
 ax.set_ylabel('Количество структур', fontsize=13)
 ax.legend(fontsize=11)
@@ -1066,80 +984,1487 @@ fig.tight_layout()
 fig.savefig(osp.join(run_dir, 'inter_run_rmsd.png'), dpi=300, bbox_inches='tight')
 plt.show()
 
-# %%
-# Compare with kNN baseline
+# %% Compare with kNN baseline
 
 
 # Reconstruct train split with the same fixed seed used during training
-_dm = DNADataModule(batch_size=1)
-_dm.setup()
-train_dataset = _dm.train_dataset
-
-_n_bb = len(BACKBONE_ATOMS)
-# --- Build train feature matrix and local backbone targets ---
-_train_feats: list[np.ndarray] = []
-_train_locals: list[np.ndarray] = []  # each [n_bb, 3], NaN where atom absent
-
-for _i in tqdm(
-        range(len(train_dataset)),
-        desc='kNN: building train index',
-        colour=PROGRESS_BAR_COLOR,
-):
-    _d = train_dataset[_i]
-    _ti = int(_d.target_nt_idx.item())
-    _train_feats.append(_d.rel_origins.flatten().numpy())          # [ws*3]
-    _bb_w = _d.bb_xyz_world[_ti].numpy()                          # [n_bb, 3]
-    _o = _d.nt_origins_world[_ti].numpy()                         # [3]
-    _R = _d.nt_frames_world[_ti].numpy()                          # [3, 3]
-    _train_locals.append((_bb_w - _o) @ _R)                       # local [n_bb, 3]
-
-_train_feats_arr = np.array(_train_feats, dtype=np.float32)       # [N_train, ws*3]
-
-_nn_index = NearestNeighbors(n_neighbors=1, algorithm='ball_tree')
-_nn_index.fit(_train_feats_arr)
+dm = DNADataModule(batch_size=1)
+dm.setup()
+train_dataset = dm.train_dataset
+val_dataset = dm.val_dataset
+knn_base_dataset = train_dataset.base
 
 
-# --- Evaluate on test dataset ---
-_knn_rmsds: list[float] = []
-_knn_is_edge: list[bool] = []
+@lru_cache
+def deposit_group_id(pdb_id):
+    return dm._read_deposit_group_id(knn_base_dataset, pdb_id)
 
-for _i in tqdm(
-        range(len(test_dataset)),
-        desc='kNN: evaluating test',
-        colour=PROGRESS_BAR_COLOR,
-):
-    _d = test_dataset[_i]
-    _ti = int(_d.target_nt_idx.item())
-    _feat = _d.rel_origins.flatten().numpy()[None].astype(np.float32)  # [1, ws*3]
-    _, _nb_idx = _nn_index.kneighbors(_feat)
-    _nn_i = int(_nb_idx[0, 0])
 
-    _bb_w = _d.bb_xyz_world[_ti].numpy()
-    _o = _d.nt_origins_world[_ti].numpy()
-    _R = _d.nt_frames_world[_ti].numpy()
-    _gt_local = (_bb_w - _o) @ _R
+def normalize_poly_seq(seq):
+    return ''.join(str(seq).split()).upper()
 
-    _knn_rmsds.append(local_backbone_rmsd(_train_locals[_nn_i], _gt_local))
-    _knn_is_edge.append(bool(_d.is_chain_edge_nt[_ti].item()))
 
-_knn_rmsds_arr = np.array(_knn_rmsds, dtype=np.float64)
-_knn_is_edge_arr = np.array(_knn_is_edge)
+@lru_cache
+def dna_sequence_tokens(pdb_id):
+    raw_path = osp.join(knn_base_dataset.raw_dir, f'{pdb_id}.cif')
+    if not osp.exists(raw_path):
+        return frozenset()
+    mmcif = MMCIF2Dict(raw_path)
+    poly_types = mmcif.get('_entity_poly.type', [])
+    poly_seqs = mmcif.get('_entity_poly.pdbx_seq_one_letter_code_can', [])
+    if isinstance(poly_types, str):
+        poly_types = [poly_types]
+    if isinstance(poly_seqs, str):
+        poly_seqs = [poly_seqs]
+    seqs = {
+        normalize_poly_seq(seq)
+        for poly_type, seq in zip(poly_types, poly_seqs)
+        if 'deoxyribonucleotide' in str(poly_type).lower() and normalize_poly_seq(seq)
+    }
+    return frozenset(seqs)
+
+
+def collect_pdb_ids(*datasets):
+    ids = set()
+    for dataset in datasets:
+        for w_idx, _ in dataset.virtual_entries:
+            path = dataset.base.data_list[w_idx]
+            ids.add(Path(path).parent.name)
+    return sorted(ids)
+
+
+def build_pdb_meta_cache(pdb_ids):
+    cache = {}
+    for pdb_id in tqdm(
+            pdb_ids,
+            desc='kNN: reading PDB metadata',
+            colour=PROGRESS_BAR_COLOR,
+    ):
+        cache[pdb_id] = {
+            'deposit_group_id': deposit_group_id(pdb_id),
+            'dna_sequence_tokens': dna_sequence_tokens(pdb_id),
+        }
+    return cache
+
+
+def payload_key(dataset, target_type):
+    return 'central' if target_type == dataset.CENTRAL else 'edge'
+
+
+def feature_blocks(base_data, payload):
+    return {
+        'rel_origins': payload['rel_origins'],
+        'rel_frames': payload['rel_frames'],
+        'pair_rel_origins': payload['pair_rel_origins'],
+        'pair_rel_frames': payload['pair_rel_frames'],
+        'base_types': base_data.base_types,
+        'has_pair_nt': base_data.has_pair_nt.float(),
+        'chain_end_class': base_data.chain_end_class,
+        'is_target_nt': payload['is_target_nt'].float(),
+    }
+
+
+def feature_dim_and_slices(base_data, payload):
+    """Return (total_dim, name→slice) in one pass over feature_blocks."""
+    slices = {}
+    offset = 0
+    for name, arr in feature_blocks(base_data, payload).items():
+        size = int(arr.numel())
+        slices[name] = slice(offset, offset + size)
+        offset += size
+    return offset, slices
+
+
+def knn_feature_into(base_data, payload, out):
+    offset = 0
+    for arr in feature_blocks(base_data, payload).values():
+        flat = arr.reshape(-1).numpy()
+        out[offset:offset + flat.size] = flat
+        offset += flat.size
+
+
+def dataset_samples_cached(dataset, label, pdb_meta_cache):
+    n_samples = len(dataset)
+    n_bb = len(BACKBONE_ATOMS)
+    metas: list[dict[str, Any]] = []
+
+    first_w_idx, first_target_type = dataset.virtual_entries[0]
+    first_base = dataset.base.get(first_w_idx)
+    first_payloads = cast(
+        dict[str, dict[str, torch.Tensor]],
+        getattr(first_base, '_precomputed_target_payloads'),
+    )
+    first_payload = first_payloads[payload_key(dataset, first_target_type)]
+    feat_dim, feat_slices = feature_dim_and_slices(first_base, first_payload)
+
+    feats = np.empty((n_samples, feat_dim), dtype=np.float32)
+    locals_ = np.empty((n_samples, n_bb, 3), dtype=np.float32)
+    base_cache: dict[int, Any] = {first_w_idx: first_base}
+
+    for i in tqdm(
+            range(n_samples),
+            desc=f'kNN: indexing {label}',
+            colour=PROGRESS_BAR_COLOR,
+    ):
+        w_idx, target_type = dataset.virtual_entries[i]
+        if w_idx not in base_cache:
+            base_cache[w_idx] = dataset.base.get(w_idx)
+        base = base_cache[w_idx]
+        payloads = cast(
+            dict[str, dict[str, torch.Tensor]],
+            getattr(base, '_precomputed_target_payloads'),
+        )
+        payload = payloads[payload_key(dataset, target_type)]
+        ti = int(payload['target_nt_idx'].item())
+        path = dataset.base.data_list[w_idx]
+        pdb_id = Path(path).parent.name
+        bb_w = base.bb_xyz_world[ti].numpy()
+        o = base.nt_origins_world[ti].numpy()
+        R = base.nt_frames_world[ti].numpy()
+        knn_feature_into(base, payload, feats[i])
+        locals_[i] = ((bb_w - o) @ R).astype(np.float32)
+        pdb_meta = pdb_meta_cache[pdb_id]
+        metas.append({
+            'sample_key': f'{label}:{w_idx}:{target_type}',
+            'pdb_id': pdb_id,
+            'deposit_group_id': pdb_meta['deposit_group_id'],
+            'dna_sequence_tokens': pdb_meta['dna_sequence_tokens'],
+            'base_type': int(base.base_types[ti].argmax().item()),
+            'is_edge': bool(base.is_chain_edge_nt[ti].item()),
+        })
+    return feats, locals_, metas, feat_slices
+
+
+def fit_knn_indices(ref_feats, ref_metas) -> tuple[
+    StandardScaler,
+    dict[int, np.ndarray],
+    dict[int, NearestNeighbors],
+]:
+    scaler = StandardScaler()
+    ref_feats_scaled = np.asarray(scaler.fit_transform(ref_feats), dtype=np.float32)
+    ref_indices_lists: defaultdict[int, list[int]] = defaultdict(list)
+    for idx, meta in enumerate(ref_metas):
+        ref_indices_lists[meta['base_type']].append(idx)
+    ref_indices_by_base = {
+        base_type: np.asarray(indices, dtype=np.int64)
+        for base_type, indices in ref_indices_lists.items()
+    }
+    nn_by_base = {}
+    for base_type, indices in ref_indices_by_base.items():
+        nn = NearestNeighbors(n_neighbors=len(indices), algorithm='auto')
+        nn.fit(ref_feats_scaled[indices])
+        nn_by_base[base_type] = nn
+    return scaler, ref_indices_by_base, nn_by_base
+
+
+def candidate_allowed(query_meta, ref_meta, allow_same_sample):
+    if not allow_same_sample and ref_meta['sample_key'] == query_meta['sample_key']:
+        return False
+    if ref_meta['pdb_id'] == query_meta['pdb_id']:
+        return False
+    if (
+        query_meta['deposit_group_id'] is not None
+        and ref_meta['deposit_group_id'] == query_meta['deposit_group_id']
+    ):
+        return False
+    if query_meta['dna_sequence_tokens'] & ref_meta['dna_sequence_tokens']:
+        return False
+    return True
+
+
+def print_knn_summary(title, rmsds, is_edge):
+    print(f'\n{title}')
+    for label, mask in [
+        ('avg', np.ones(len(rmsds), dtype=bool)),
+        ('central', ~is_edge),
+        ('edge', is_edge),
+    ]:
+        vals = rmsds[mask & np.isfinite(rmsds)]
+        if len(vals):
+            print(
+                f'  {label:>10}: median={np.median(vals):.3f}  '
+                f'mean={np.mean(vals):.3f}  n={len(vals)}'
+            )
+
+
+def run_knn_protocol(name, query_feats, query_locals, query_metas, ref_feats, ref_locals, ref_metas,
+                     allow_same_sample):
+    scaler, ref_indices_by_base, nn_by_base = fit_knn_indices(ref_feats, ref_metas)
+    query_feats_scaled = np.asarray(scaler.transform(query_feats), dtype=np.float32)
+    rmsds: list[float] = []
+    is_edge: list[bool] = []
+    missing = 0
+    for i, meta in enumerate(tqdm(
+            query_metas,
+            desc=f'kNN: {name}',
+            colour=PROGRESS_BAR_COLOR,
+    )):
+        ref_indices = ref_indices_by_base.get(meta['base_type'])
+        if ref_indices is None or len(ref_indices) == 0:
+            rmsds.append(np.nan)
+            is_edge.append(meta['is_edge'])
+            missing += 1
+            continue
+        _, neighbors = nn_by_base[meta['base_type']].kneighbors(
+            query_feats_scaled[i:i + 1],
+            n_neighbors=len(ref_indices),
+        )
+        match_idx = None
+        for local_idx in neighbors[0]:
+            ref_idx = int(ref_indices[int(local_idx)])
+            if candidate_allowed(meta, ref_metas[ref_idx], allow_same_sample):
+                match_idx = ref_idx
+                break
+        if match_idx is None:
+            rmsds.append(np.nan)
+            missing += 1
+        else:
+            rmsds.append(local_backbone_rmsd(ref_locals[match_idx], query_locals[i]))
+        is_edge.append(meta['is_edge'])
+    rmsds_arr = np.asarray(rmsds, dtype=np.float64)
+    is_edge_arr = np.asarray(is_edge, dtype=bool)
+    print_knn_summary(
+        f'kNN backbone RMSD (local frame) [{name}]',
+        rmsds_arr,
+        is_edge_arr,
+    )
+    print(
+        f'  {"eligible":>10}: '
+        f'{np.isfinite(rmsds_arr).sum()}/{len(rmsds_arr)} '
+        f'(missing={missing})'
+    )
+    return rmsds_arr, is_edge_arr
+
+
+pdb_meta_cache = build_pdb_meta_cache(
+    collect_pdb_ids(train_dataset, val_dataset, test_dataset)
+)
+
+train_feats, train_locals, train_metas, train_feat_slices = dataset_samples_cached(
+    train_dataset,
+    'train',
+    pdb_meta_cache,
+)
+val_feats, val_locals, val_metas, val_feat_slices = dataset_samples_cached(
+    val_dataset,
+    'val',
+    pdb_meta_cache,
+)
+test_feats, test_locals, test_metas, test_feat_slices = dataset_samples_cached(
+    test_dataset,
+    'test',
+    pdb_meta_cache,
+)
+
+feature_sets = [
+    ('base_type only', ['base_types']),
+    ('rel_origins only', ['rel_origins']),
+    ('rel_frames only', ['rel_frames']),
+    ('rel_origins + rel_frames', ['rel_origins', 'rel_frames']),
+    ('pair_rel_origins + pair_rel_frames', ['pair_rel_origins', 'pair_rel_frames']),
+    ('rel_origins + rel_frames + base_type', ['rel_origins', 'rel_frames', 'base_types']),
+    ('full static feature', list(train_feat_slices.keys())),
+]
+
+
+def select_feature_columns(feats, feat_slices, feature_names):
+    return np.concatenate(
+        [feats[:, feat_slices[name]] for name in feature_names],
+        axis=1,
+    )
+
 
 # %%
-
-print('kNN backbone RMSD (local frame):')
-for _label, _mask in [
-    ('avg',     np.ones(len(_knn_rmsds_arr), dtype=bool)),
-    ('central', ~_knn_is_edge_arr),
-    ('edge',    _knn_is_edge_arr),
-]:
-    _vals = _knn_rmsds_arr[_mask & np.isfinite(_knn_rmsds_arr)]
-    if len(_vals):
-        print(f'  {_label:>7}:  median={np.median(_vals):.3f}  mean={np.mean(_vals):.3f}'
-              f'  n={len(_vals)}')
-
+for feature_set_name, feature_names in feature_sets:
+    test_subset_feats = select_feature_columns(test_feats, test_feat_slices, feature_names)
+    train_subset_feats = select_feature_columns(train_feats, train_feat_slices, feature_names)
+    run_knn_protocol(
+        f'test-to-train, {feature_set_name}, same base type, no same PDB/deposit/identical DNA seq',
+        test_subset_feats,
+        test_locals,
+        test_metas,
+        train_subset_feats,
+        train_locals,
+        train_metas,
+        allow_same_sample=False,
+    )
+# %%
 print('\nModel test RMSD:')
-for _label, _w in [('avg', wide)] + [(m, wide_per_mode[m]) for m in ('central', 'edge')]:
-    if 'test/rmsd' in _w.columns:
-        _v = float(_w['test/rmsd'].dropna().iloc[-1])
-        print(f'  {_label:>7}: {_v:.3f} Å')
+wide_per_mode = globals().get('wide_per_mode')
+if wide_per_mode is None:
+    print('  unavailable: run the training-metrics cell first')
+else:
+    for label in ('avg', 'central', 'edge'):
+        w = wide_per_mode.get(label)
+        if w is None:
+            continue
+        if 'test/rmsd' in w.columns:
+            v = float(w['test/rmsd'].dropna().iloc[-1])
+            print(f'  {label:>10}: {v:.3f} Å')
+
+
+def print_stats_by_mode(rmsds, is_edge):
+    for label, mask in [
+        ('avg', np.isfinite(rmsds)),
+        ('central', (~is_edge) & np.isfinite(rmsds)),
+        ('edge', is_edge & np.isfinite(rmsds)),
+    ]:
+        vals = rmsds[mask]
+        if len(vals):
+            print(
+                f'  {label:>10}: median={np.median(vals):.3f}  '
+                f'mean={np.mean(vals):.3f}  '
+                f'p90={np.percentile(vals, 90):.3f}  '
+                f'n={len(vals)}'
+            )
+
+
+# %%
+print('\nOracle decoder RMSD:')
+oracle_rmsds_list: list[float] = []
+oracle_is_edge_list: list[bool] = []
+
+with torch.no_grad():
+    for i in tqdm(
+        range(len(test_dataset)),
+        desc='decoder oracle',
+        colour=PROGRESS_BAR_COLOR,
+    ):
+        data = cast(Data, test_dataset[i].clone())
+        batch = cast(Any, Batch.from_data_list([data])).to(device)
+
+        theta0, _, tau0, _, _ = model._theta_mask_target(batch)
+        rmsd = model._compute_rmsd_per_graph_local(theta0, tau0, batch)
+
+        oracle_rmsds_list.append(float(rmsd.item()))
+        tidx = int(data.target_nt_idx.item())
+        oracle_is_edge_list.append(bool(data.is_chain_edge_nt[tidx].item()))
+
+oracle_rmsds = np.asarray(oracle_rmsds_list, dtype=np.float64)
+oracle_is_edge = np.asarray(oracle_is_edge_list, dtype=bool)
+print_stats_by_mode(oracle_rmsds, oracle_is_edge)
+
+# %% Real test-sample roundtrip through the same single-residue decoder path.
+idx_to_base_local = IDX_TO_BASE
+window_cache: dict[int, Any | None] = {}
+
+
+def match_test_window(base_idx: int) -> Any | None:
+    if base_idx in window_cache:
+        return window_cache[base_idx]
+
+    base = test_dataset.base.get(base_idx)
+    pdb_id = Path(test_dataset.base.data_list[base_idx]).parent.name
+    ref_bb = base.bb_xyz_world.detach().cpu()
+    match = None
+    for _, _, windows in parsed_chain_records(pdb_id):
+        for window, _, wdata in windows:
+            cand = wdata.bb_xyz_world.detach().cpu()
+            if not torch.equal(torch.isnan(cand), torch.isnan(ref_bb)):
+                continue
+            if torch.allclose(
+                torch.nan_to_num(cand),
+                torch.nan_to_num(ref_bb),
+                rtol=5e-4,
+                atol=5e-4,
+            ):
+                match = window
+                break
+        if match is not None:
+            break
+    window_cache[base_idx] = match
+    return match
+
+
+sample_rmsds: list[float] = []
+sample_is_edge: list[bool] = []
+atom_sq_sums: defaultdict[str, float] = defaultdict(float)
+atom_counts: defaultdict[str, int] = defaultdict(int)
+atom_max_errs: defaultdict[str, float] = defaultdict(float)
+skip_counts: defaultdict[str, int] = defaultdict(int)
+bb_atom_idx = {name: i for i, name in enumerate(BACKBONE_ATOMS)}
+
+for sample_idx in tqdm(
+    range(len(test_dataset)),
+    desc='single-residue roundtrip',
+    colour=PROGRESS_BAR_COLOR,
+):
+    data = cast(Data, test_dataset[sample_idx].clone())
+    base_idx, _ = test_dataset.virtual_entries[sample_idx]
+    window = match_test_window(base_idx)
+    if window is None:
+        skip_counts['unmatched_window'] += 1
+        continue
+
+    tidx = int(data.target_nt_idx.item())
+    origin = data.nt_origins_world[tidx].numpy()
+    frame = data.nt_frames_world[tidx].numpy()
+    if np.isnan(origin).any() or np.isnan(frame).any():
+        skip_counts['nan_target_frame'] += 1
+        continue
+
+    coords_local = coords_local_per_nt(window, origin, frame)
+    cur = coords_local[tidx]
+    prev = coords_local[tidx - 1] if tidx > 0 else None
+    next_nt = coords_local[tidx + 1] if tidx + 1 < len(coords_local) else None
+    restype = idx_to_base_local[int(data.base_types[tidx].argmax().item())]
+
+    torsions, tor_mask, tau_m, tau_ok = nucleotide_torsions(cur, prev, next_nt, restype)
+    if not tau_ok:
+        skip_counts['missing_tau_m'] += 1
+        continue
+    if not (
+        tor_mask[TOR_GAMMA]
+        and tor_mask[TOR_CHI]
+        and tor_mask[TOR_PSEUDOROTATION_PHASE]
+    ):
+        skip_counts['missing_single_residue_torsions'] += 1
+        continue
+
+    o3_prev_local = None
+    if prev is not None and "O3'" in prev:
+        o3_prev_local = np.asarray(prev["O3'"], dtype=np.float64)
+
+    decoded = build_backbone_local(
+        torsions,
+        restype,
+        o3_prev_local=o3_prev_local,
+        tau_m=float(tau_m),
+    )
+    gt_local = np.full((len(BACKBONE_ATOMS), 3), np.nan, dtype=np.float64)
+    pred_local_rt = np.full((len(BACKBONE_ATOMS), 3), np.nan, dtype=np.float64)
+    for atom_idx, atom_name in enumerate(BACKBONE_ATOMS):
+        if atom_name in cur:
+            gt_local[atom_idx] = np.asarray(cur[atom_name], dtype=np.float64)
+        if atom_name in decoded:
+            pred_local_rt[atom_idx] = np.asarray(decoded[atom_name], dtype=np.float64)
+
+    rmsd = local_backbone_rmsd(pred_local_rt, gt_local)
+    if not np.isfinite(rmsd):
+        skip_counts['no_shared_backbone'] += 1
+        continue
+
+    sample_rmsds.append(float(rmsd))
+    sample_is_edge.append(bool(data.is_chain_edge_nt[tidx].item()))
+
+    op_match = {'OP1': 'OP1', 'OP2': 'OP2'}
+    j_op1 = bb_atom_idx['OP1']
+    j_op2 = bb_atom_idx['OP2']
+    pred_op1 = pred_local_rt[j_op1]
+    pred_op2 = pred_local_rt[j_op2]
+    gt_op1 = gt_local[j_op1]
+    gt_op2 = gt_local[j_op2]
+    if not (
+        np.isnan(pred_op1).any()
+        or np.isnan(pred_op2).any()
+        or np.isnan(gt_op1).any()
+        or np.isnan(gt_op2).any()
+    ):
+        direct_err = np.sum((pred_op1 - gt_op1) ** 2) + np.sum((pred_op2 - gt_op2) ** 2)
+        swapped_err = np.sum((pred_op1 - gt_op2) ** 2) + np.sum((pred_op2 - gt_op1) ** 2)
+        if swapped_err < direct_err:
+            op_match = {'OP1': 'OP2', 'OP2': 'OP1'}
+
+    for atom_name in BACKBONE_ATOMS:
+        pred_idx = bb_atom_idx[atom_name]
+        gt_idx = bb_atom_idx[op_match.get(atom_name, atom_name)]
+        pred_xyz = pred_local_rt[pred_idx]
+        gt_xyz = gt_local[gt_idx]
+        if np.isnan(pred_xyz).any() or np.isnan(gt_xyz).any():
+            continue
+        sq_err = float(np.sum((pred_xyz - gt_xyz) ** 2))
+        err = float(np.sqrt(sq_err))
+        atom_sq_sums[atom_name] += sq_err
+        atom_counts[atom_name] += 1
+        atom_max_errs[atom_name] = max(atom_max_errs[atom_name], err)
+
+sample_rmsds_arr = np.asarray(sample_rmsds, dtype=np.float64)
+sample_is_edge_arr = np.asarray(sample_is_edge, dtype=bool)
+print('\nSingle-residue decoder roundtrip on real test samples:')
+print_stats_by_mode(sample_rmsds_arr, sample_is_edge_arr)
+
+if skip_counts:
+    print('\nSkipped samples:')
+    for reason, count in sorted(skip_counts.items()):
+        print(f'  {reason:>30}: {count}')
+
+total_sq = float(sum(atom_sq_sums.values()))
+atom_rows = []
+for atom_name in BACKBONE_ATOMS:
+    count = atom_counts[atom_name]
+    if not count:
+        continue
+    mean_sq = atom_sq_sums[atom_name] / count
+    atom_rows.append((
+        atom_name,
+        float(np.sqrt(mean_sq)),
+        100.0 * atom_sq_sums[atom_name] / max(total_sq, 1e-12),
+        count,
+        atom_max_errs[atom_name],
+    ))
+
+print('\nPer-atom error contribution:')
+for atom_name, atom_rmsd, contrib_pct, count, max_err in sorted(
+    atom_rows,
+    key=lambda row: row[2],
+    reverse=True,
+):
+    print(
+        f'  {atom_name:>4}: rmsd={atom_rmsd:.3f} A  '
+        f'contrib={contrib_pct:5.1f}%  '
+        f'max={max_err:.3f} A  '
+        f'n={count}'
+    )
+
+if atom_rows:
+    atom_names = [row[0] for row in atom_rows]
+    atom_rmsds = [row[1] for row in atom_rows]
+    atom_contribs = [row[2] for row in atom_rows]
+
+    fig2, (ax_atom_rmsd, ax_atom_contrib) = plt.subplots(1, 2, figsize=(12, 4))
+    ax_atom_rmsd.bar(atom_names, atom_rmsds, color='steelblue')
+    ax_atom_rmsd.set_title('Per-atom RMSD')
+    ax_atom_rmsd.set_ylabel('RMSD (A)')
+    ax_atom_rmsd.tick_params(axis='x', rotation=45)
+
+    ax_atom_contrib.bar(atom_names, atom_contribs, color='indianred')
+    ax_atom_contrib.set_title('Contribution to total squared error')
+    ax_atom_contrib.set_ylabel('Contribution (%)')
+    ax_atom_contrib.tick_params(axis='x', rotation=45)
+
+    fig2.tight_layout()
+    plt.show()
+
+# %% Compare PHENIX run time with our model
+
+NUM_TIMESTEPS_LIST = [5, 10, 15, 30, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+
+
+def pick_phenix_minimized_structure(tmpdir: Path, local_input: Path) -> Path | None:
+    """Find geometry_minimization coordinates under ``tmpdir`` (including subdirs)."""
+
+    local_resolved = local_input.resolve()
+
+    def candidates(paths):
+        out = []
+        for p in paths:
+            if p.is_file() and p.resolve() != local_resolved:
+                out.append(p)
+        return out
+
+    geo_patterns = (
+        '**/*geo_minimized*.pdb',
+        '**/*geo_minimized*.cif',
+        '**/*geo_minimized*.mmcif',
+    )
+    minimized_patterns = (
+        '**/*minimized*.pdb',
+        '**/*minimized*.cif',
+        '**/*minimized*.mmcif',
+    )
+
+    tier1 = []
+    for pattern in geo_patterns:
+        tier1.extend(tmpdir.glob(pattern))
+    tier1 = candidates(tier1)
+    if tier1:
+        return max(tier1, key=lambda p: p.stat().st_mtime)
+
+    tier2 = []
+    for pattern in minimized_patterns:
+        tier2.extend(tmpdir.glob(pattern))
+    tier2 = candidates(tier2)
+    if tier2:
+        return max(tier2, key=lambda p: p.stat().st_mtime)
+
+    fallback = []
+    for path in tmpdir.rglob('*'):
+        if path.suffix.lower() not in ('.pdb', '.cif', '.mmcif'):
+            continue
+        if path.is_file() and path.resolve() != local_resolved:
+            fallback.append(path)
+    return max(fallback, key=lambda p: p.stat().st_mtime) if fallback else None
+
+
+def run_phenix_geometry_minimization(
+    input_pdb: str | Path,
+    output_dir: str | Path,
+    selection: str = 'dna backbone',
+    max_iterations: int = 500,
+    macro_cycles: int = 5,
+    timeout_s: int = 300,
+) -> dict:
+    """
+    Run Phenix geometry minimization on a DNA structure.
+
+    Returns:
+        {
+            "success": bool,
+            "wall_time_s": float,
+            "returncode": int,
+            "output_pdb": Path | None,
+            "stdout": str,
+            "stderr": str,
+        }
+    """
+
+    input_pdb = Path(input_pdb).resolve()
+    output_dir = Path(output_dir).resolve()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    prefix = input_pdb.stem
+
+    t0 = time.perf_counter()
+
+    with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        local_pdb = tmpdir / input_pdb.name
+        shutil.copy2(input_pdb, local_pdb)
+
+        out_prefix = tmpdir / prefix
+
+        # geometry_minimization rejects ``output.prefix=`` on CLI for some builds; prefix is standardized here.
+        phenix_args = [
+            shlex.quote(str(local_pdb)),
+            shlex.quote(f'selection={selection}'),
+            shlex.quote(f'minimization.max_iterations={max_iterations}'),
+            shlex.quote(f'minimization.macro_cycles={macro_cycles}'),
+            shlex.quote(f'output_file_name_prefix={out_prefix}'),
+        ]
+        bash_script = (
+            'source /etc/profile.d/modules.sh'
+            ' && module load phenix'
+            f" && phenix.geometry_minimization {' '.join(phenix_args)}"
+        )
+
+        try:
+            result = subprocess.run(
+                ['bash', '-lc', bash_script],
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+                cwd=str(tmpdir),
+            )
+
+            wall_time_s = time.perf_counter() - t0
+
+        except subprocess.TimeoutExpired as e:
+            return {
+                "success": False,
+                "wall_time_s": time.perf_counter() - t0,
+                "returncode": -1,
+                "output_pdb": None,
+                "stdout": e.stdout or '',
+                "stderr": f"Timeout after {timeout_s}s\n{e.stderr or ''}",
+            }
+
+        src = pick_phenix_minimized_structure(tmpdir, local_pdb)
+
+        output_pdb = None
+        if src is not None:
+            dst = output_dir / src.name
+            shutil.copy2(src, dst)
+            output_pdb = dst
+
+        stderr_out = result.stderr or ''
+        if src is None and result.returncode == 0:
+            stdout_tail = (result.stdout or '').strip()
+            if stdout_tail:
+                stderr_out = (
+                    f'{stderr_out}\n--- phenix stdout (tail) ---\n{stdout_tail[-6000:]}'
+                ).strip()
+
+        return {
+            "success": result.returncode == 0 and output_pdb is not None,
+            "wall_time_s": wall_time_s,
+            "returncode": result.returncode,
+            "output_pdb": output_pdb,
+            "stdout": result.stdout,
+            "stderr": stderr_out,
+        }
+
+
+def run_base2backbone_inference(
+    input_path: str | Path,
+    output_dir: str | Path,
+    model_path: str | Path = MODEL_DIR,
+    device: str | None = None,
+    window_size: int | None = None,
+) -> dict:
+    """
+    Run end-to-end base2backbone inference and write a reconstructed backbone PDB.
+
+    Timing includes model load and output serialization to mirror PHENIX's
+    end-to-end single-structure latency.
+    """
+
+    input_path = Path(input_path).resolve()
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model_path = str(model_path)
+
+    output_pdb = output_dir / f'{input_path.stem}_base2backbone.pdb'
+    t0 = time.perf_counter()
+
+    try:
+        output_universe = predict_backbone(
+            str(input_path),
+            model_path,
+            device=device,
+            show_progress=False,
+        )
+        # Older builds only accept positional arguments (keyword names differ).
+        write_structure(output_universe, output_pdb)
+    except Exception as e:
+        return {
+            'success': False,
+            'wall_time_s': time.perf_counter() - t0,
+            'returncode': -999,
+            'output_pdb': None,
+            'stdout': '',
+            'stderr': repr(e),
+        }
+
+    return {
+        'success': True,
+        'wall_time_s': time.perf_counter() - t0,
+        'returncode': 0,
+        'output_pdb': output_pdb,
+        'stdout': '',
+        'stderr': '',
+    }
+
+
+class CheckpointSamplerAdapter:
+    def __init__(self, checkpoint_model, num_timesteps: int):
+        self.checkpoint_model = checkpoint_model
+        self.num_timesteps = int(num_timesteps)
+
+    def sample(self, batch):
+        return self.checkpoint_model.sample(
+            batch,
+            num_timesteps=self.num_timesteps,
+        )
+
+
+def run_base2backbone_checkpoint_inference(
+    input_path: str | Path,
+    output_dir: str | Path,
+    checkpoint_model,
+    num_timesteps: int,
+    device: str | None = None,
+    window_size: int | None = None,
+) -> dict:
+    input_path = Path(input_path).resolve()
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if window_size is None:
+        window_size_i = int(getattr(test_dataset.base, 'window_size', 3))
+    else:
+        window_size_i = int(window_size)
+
+    output_pdb = output_dir / f'{input_path.stem}_steps_{num_timesteps}.pdb'
+    t0 = time.perf_counter()
+    input_path_str = str(input_path)
+
+    try:
+        _, chain_records = parse_dna(
+            input_path_str,
+            use_full_nucleotide=False,
+            window_size=window_size_i,
+        )
+        adapter = CheckpointSamplerAdapter(checkpoint_model, num_timesteps)
+        predictions = predict_backbone_from_chain_records(
+            [chain_records],
+            adapter,
+            device,
+            show_progress=False,
+        )[0]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', PDBConstructionWarning)
+            _, full_chain_records = parse_dna(
+                input_path_str,
+                use_full_nucleotide=True,
+                window_size=window_size_i,
+            )
+        write_structure(build_output_universe(full_chain_records, predictions), output_pdb)
+    except Exception as e:
+        return {
+            'success': False,
+            'wall_time_s': time.perf_counter() - t0,
+            'returncode': -999,
+            'output_pdb': None,
+            'stdout': '',
+            'stderr': repr(e),
+        }
+
+    return {
+        'success': True,
+        'wall_time_s': time.perf_counter() - t0,
+        'returncode': 0,
+        'output_pdb': output_pdb,
+        'stdout': '',
+        'stderr': '',
+    }
+
+
+def run_structure_benchmark(
+    input_paths,
+    output_dir,
+    runner,
+    label,
+    max_workers=1,
+    **runner_kwargs,
+):
+    output_dir = Path(output_dir)
+    input_paths = [Path(path) for path in input_paths]
+
+    rows = []
+    batch_t0 = time.perf_counter()
+    output_pdb_dir = output_dir / 'pdb'
+    output_pdb_dir.mkdir(parents=True, exist_ok=True)
+
+    def append_result(input_path, res):
+        rows.append({
+            'id': input_path.stem,
+            'input_path': str(input_path),
+            'success': res['success'],
+            'wall_time_s': res['wall_time_s'],
+            'returncode': res['returncode'],
+            'output_pdb': str(res['output_pdb']) if res['output_pdb'] else '',
+            'stderr': res['stderr'][:1000],
+        })
+
+    if max_workers == 1:
+        for input_path in tqdm(
+            input_paths,
+            desc=f'{label} benchmark',
+            leave=False,
+            colour=PROGRESS_BAR_COLOR,
+        ):
+            try:
+                res = runner(input_path, output_pdb_dir, **runner_kwargs)
+            except Exception as e:
+                res = {
+                    'success': False,
+                    'wall_time_s': None,
+                    'returncode': -999,
+                    'output_pdb': None,
+                    'stderr': repr(e),
+                }
+            append_result(input_path, res)
+    else:
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(
+                    runner,
+                    input_path,
+                    output_pdb_dir,
+                    **runner_kwargs,
+                ): input_path
+                for input_path in input_paths
+            }
+
+            for fut in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=f'{label} benchmark',
+                leave=False,
+                colour=PROGRESS_BAR_COLOR,
+            ):
+                input_path = futures[fut]
+
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {
+                        'success': False,
+                        'wall_time_s': None,
+                        'returncode': -999,
+                        'output_pdb': None,
+                        'stderr': repr(e),
+                    }
+
+                append_result(input_path, res)
+
+    print(
+        f'{label}: processed {len(rows)} structures '
+        f'in {time.perf_counter() - batch_t0:.2f}s'
+    )
+    return rows
+
+
+def run_dataset(input_dir, output_dir, max_workers=4):
+    input_dir = Path(input_dir)
+    input_paths = sorted(
+        list(input_dir.glob('*.pdb'))
+        + list(input_dir.glob('*.cif'))
+        + list(input_dir.glob('*.mmcif'))
+    )
+    return run_structure_benchmark(
+        input_paths,
+        output_dir,
+        run_phenix_geometry_minimization,
+        label='PHENIX',
+        max_workers=max_workers,
+    )
+
+
+STANDARD_DNA_MONOMERS = frozenset({'DA', 'DC', 'DG', 'DT'})
+ALLOWED_NONPOLY_COMPONENTS = frozenset({
+    'ACT', 'CA', 'CL', 'DMS', 'DOD', 'EDO', 'FMT', 'GOL', 'HOH', 'IOD', 'K',
+    'MG', 'MN', 'NA', 'NH4', 'NO3', 'PEG', 'PO4', 'SO4', 'TRS', 'ZN',
+})
+
+
+def mmcif_list(mmcif_dict, key):
+    values = mmcif_dict.get(key, [])
+    if isinstance(values, str):
+        return [values]
+    return list(values)
+
+
+@lru_cache(maxsize=None)
+def mmcif_nonstandard_reasons(path_str):
+    mmcif_dict = MMCIF2Dict(path_str)
+    reasons = []
+
+    flags = mmcif_list(mmcif_dict, '_entity_poly.nstd_monomer')
+    if any(str(flag).strip().lower() == 'yes' for flag in flags):
+        reasons.append('nstd_monomer')
+
+    entity_ids = mmcif_list(mmcif_dict, '_entity_poly.entity_id')
+    poly_types = mmcif_list(mmcif_dict, '_entity_poly.type')
+    poly_types_norm = [str(poly_type).strip().lower() for poly_type in poly_types]
+    dna_entity_ids = {
+        str(entity_id).strip()
+        for entity_id, poly_type in zip(entity_ids, poly_types_norm)
+        if poly_type == "polydeoxyribonucleotide"
+    }
+    if any(
+        'ribonucleotide' in poly_type or 'hybrid' in poly_type
+        for poly_type in poly_types_norm
+        if poly_type != 'polydeoxyribonucleotide'
+    ):
+        reasons.append('rna_or_hybrid_polymer')
+
+    atom_entity_ids = mmcif_list(mmcif_dict, '_atom_site.label_entity_id')
+    atom_comp_ids = mmcif_list(mmcif_dict, '_atom_site.label_comp_id')
+    if dna_entity_ids and atom_entity_ids and atom_comp_ids:
+        dna_comp_ids = {
+            str(comp_id).strip().upper()
+            for entity_id, comp_id in zip(atom_entity_ids, atom_comp_ids)
+            if (
+                str(entity_id).strip() in dna_entity_ids
+                and str(comp_id).strip() not in {'', '.', '?'}
+            )
+        }
+        unexpected_dna_comp_ids = sorted(dna_comp_ids - STANDARD_DNA_MONOMERS)
+        if unexpected_dna_comp_ids:
+            reasons.append(
+                f'dna_components={",".join(unexpected_dna_comp_ids[:5])}'
+            )
+
+    nonpoly_ids = {
+        str(mon_id).strip().upper()
+        for mon_id in mmcif_list(mmcif_dict, '_pdbx_nonpoly_scheme.mon_id')
+        if str(mon_id).strip() not in {'', '.', '?'}
+    }
+    unexpected_nonpoly_ids = sorted(nonpoly_ids - ALLOWED_NONPOLY_COMPONENTS)
+    if unexpected_nonpoly_ids:
+        reasons.append(f'nonpoly={",".join(unexpected_nonpoly_ids[:5])}')
+
+    return tuple(reasons)
+
+
+def filter_standard_raw_paths(input_paths):
+    standard_paths = []
+    skipped_entries = []
+    for path in input_paths:
+        reasons = ()
+        if path.suffix.lower() in ('.cif', '.mmcif'):
+            reasons = mmcif_nonstandard_reasons(str(path))
+        if reasons:
+            skipped_entries.append(f'{path.stem} ({reasons[0]})')
+            continue
+        standard_paths.append(path)
+
+    if skipped_entries:
+        preview = ', '.join(skipped_entries[:10])
+        extra = '' if len(skipped_entries) <= 10 else f' ... (+{len(skipped_entries) - 10})'
+        print(f'Skipped {len(skipped_entries)} structures with nonstandard chemistry: {preview}{extra}')
+
+    return standard_paths
+
+
+def collect_test_dataset_raw_paths(dataset):
+    raw_dir = Path(dataset.base.raw_dir)
+    raw_paths_by_id = {}
+    for base_idx, _ in dataset.virtual_entries:
+        pdb_id = Path(dataset.base.data_list[base_idx]).parent.name
+        raw_paths_by_id[pdb_id] = raw_dir / f'{pdb_id}.cif'
+
+    missing_paths = [path for path in raw_paths_by_id.values() if not path.exists()]
+    if missing_paths:
+        missing_str = '\n'.join(str(path) for path in missing_paths[:10])
+        raise FileNotFoundError(
+            'Missing raw test structures:\n'
+            f'{missing_str}'
+        )
+
+    return [raw_paths_by_id[pdb_id] for pdb_id in sorted(raw_paths_by_id)]
+
+
+def residue_backbone_positions(chain_records):
+    residue_positions = {}
+    for chain_key, chain, _ in chain_records:
+        for nucleotide in chain:
+            residue_key = (chain_key, int(nucleotide.resid))
+            residue_positions[residue_key] = {
+                atom_name: np.asarray(atom_pos, dtype=np.float64)
+                for atom_name, atom_pos in default_atoms_provider(nucleotide)
+                if atom_name in BACKBONE_ATOMS
+            }
+    return residue_positions
+
+
+def backbone_local_array(atom_positions, origin_world, frame_world):
+    local_coords = np.full((len(BACKBONE_ATOMS), 3), np.nan, dtype=np.float64)
+    for atom_idx, atom_name in enumerate(BACKBONE_ATOMS):
+        atom_pos = atom_positions.get(atom_name)
+        if atom_pos is None or not np.isfinite(atom_pos).all():
+            continue
+        local_coords[atom_idx] = world_to_local_np(atom_pos, origin_world, frame_world).reshape(3)
+    return local_coords
+
+
+@lru_cache(maxsize=None)
+def parse_chain_records_for_backbone_rmsd(path, window_size=3):
+    with warnings.catch_warnings():
+        warnings.filterwarnings(
+            'ignore',
+            message=r'1 A\^3 CRYST1 record, this is usually a placeholder\..*',
+            category=UserWarning,
+            module=r'MDAnalysis\.coordinates\.PDB',
+        )
+        _, chain_records = parse_dna(
+            str(path),
+            use_full_nucleotide=True,
+            window_size=window_size,
+        )
+    return chain_records
+
+
+def collect_backbone_local_arrays(ref_chain_records, *position_maps):
+    local_arrays = []
+    seen_residues = set()
+    for chain_key, _, windows in ref_chain_records:
+        for window, _, data in windows:
+            for nt_idx, nucleotide in enumerate(window):
+                residue_key = (chain_key, int(nucleotide.resid))
+                if residue_key in seen_residues:
+                    continue
+                seen_residues.add(residue_key)
+
+                atoms_per_map = [positions.get(residue_key) for positions in position_maps]
+                if any(atoms is None for atoms in atoms_per_map):
+                    continue
+
+                origin_world = data.nt_origins_world[nt_idx].numpy()
+                frame_world = data.nt_frames_world[nt_idx].numpy()
+                if np.isnan(origin_world).any() or np.isnan(frame_world).any():
+                    continue
+
+                local_arrays.append(tuple(
+                    backbone_local_array(atoms, origin_world, frame_world)
+                    for atoms in atoms_per_map
+                ))
+    return local_arrays
+
+
+def compute_structure_vs_ref_backbone_rmsd(
+    reference_path,
+    output_path,
+    window_size=3,
+):
+    ref_chain_records = parse_chain_records_for_backbone_rmsd(reference_path, window_size=window_size)
+    output_chain_records = parse_chain_records_for_backbone_rmsd(output_path, window_size=window_size)
+
+    ref_positions = residue_backbone_positions(ref_chain_records)
+    output_positions = residue_backbone_positions(output_chain_records)
+
+    local_arrays = collect_backbone_local_arrays(
+        ref_chain_records,
+        ref_positions,
+        output_positions,
+    )
+    rmsds = []
+    for ref_local, output_local in local_arrays:
+        rmsd = local_backbone_rmsd(output_local, ref_local)
+        if np.isfinite(rmsd):
+            rmsds.append(float(rmsd))
+
+    if not rmsds:
+        return {
+            'success': False,
+            'n_residues': 0,
+            'mean_rmsd': None,
+            'median_rmsd': None,
+        }
+
+    rmsd_arr = np.asarray(rmsds, dtype=np.float64)
+    return {
+        'success': True,
+        'n_residues': int(len(rmsd_arr)),
+        'mean_rmsd': float(np.mean(rmsd_arr)),
+        'median_rmsd': float(np.median(rmsd_arr)),
+    }
+
+
+def summarize_structure_vs_ref_backbone_rmsd(label, rows, window_size=3):
+    per_structure_medians = []
+    for row in rows:
+        if not row['success'] or not row['output_pdb']:
+            continue
+        try:
+            rmsd_stats = compute_structure_vs_ref_backbone_rmsd(
+                row['input_path'],
+                row['output_pdb'],
+                window_size=window_size,
+            )
+        except Exception:
+            continue
+        if rmsd_stats['median_rmsd'] is not None:
+            per_structure_medians.append(rmsd_stats['median_rmsd'])
+
+    if not per_structure_medians:
+        print(f'No successful {label}/ref RMSD pairs were available.')
+        return {
+            'n_rmsd_compared': 0,
+            'median_backbone_rmsd': None,
+        }
+
+    summary = {
+        'n_rmsd_compared': len(per_structure_medians),
+        'median_backbone_rmsd': float(np.median(np.asarray(per_structure_medians, dtype=np.float64))),
+    }
+    print(f'Median {label} RMSD: {summary["median_backbone_rmsd"]:.3f} A')
+    return summary
+
+
+def summarize_runtime_comparison(model_rows, phenix_rows, window_size=3):
+    model_by_id = {row['id']: row for row in model_rows}
+    phenix_by_id = {row['id']: row for row in phenix_rows}
+
+    comparison_rows = []
+    for pdb_id in sorted(model_by_id.keys() & phenix_by_id.keys()):
+        model_row = model_by_id[pdb_id]
+        phenix_row = phenix_by_id[pdb_id]
+        model_time = model_row['wall_time_s']
+        phenix_time = phenix_row['wall_time_s']
+        speedup = ''
+        model_rmsd_stats = {
+            'success': False,
+            'n_residues': 0,
+            'model_vs_ref_mean_rmsd': None,
+            'model_vs_ref_median_rmsd': None,
+        }
+        phenix_rmsd_stats = {
+            'success': False,
+            'n_residues': 0,
+            'phenix_vs_ref_mean_rmsd': None,
+            'phenix_vs_ref_median_rmsd': None,
+        }
+        if (
+            model_row['success']
+            and phenix_row['success']
+            and model_time not in (None, 0)
+            and phenix_time is not None
+        ):
+            speedup = phenix_time / model_time
+            try:
+                model_stats = compute_structure_vs_ref_backbone_rmsd(
+                    model_row['input_path'],
+                    model_row['output_pdb'],
+                    window_size=window_size,
+                )
+                model_rmsd_stats = {
+                    'success': model_stats['success'],
+                    'n_residues': model_stats['n_residues'],
+                    'model_vs_ref_mean_rmsd': model_stats['mean_rmsd'],
+                    'model_vs_ref_median_rmsd': model_stats['median_rmsd'],
+                }
+                phenix_stats = compute_structure_vs_ref_backbone_rmsd(
+                    phenix_row['input_path'],
+                    phenix_row['output_pdb'],
+                    window_size=window_size,
+                )
+                phenix_rmsd_stats = {
+                    'success': phenix_stats['success'],
+                    'n_residues': phenix_stats['n_residues'],
+                    'phenix_vs_ref_mean_rmsd': phenix_stats['mean_rmsd'],
+                    'phenix_vs_ref_median_rmsd': phenix_stats['median_rmsd'],
+                }
+            except Exception as e:
+                model_rmsd_stats = {
+                    'success': False,
+                    'n_residues': 0,
+                    'model_vs_ref_mean_rmsd': None,
+                    'model_vs_ref_median_rmsd': None,
+                    'error': repr(e),
+                }
+                phenix_rmsd_stats = {
+                    'success': False,
+                    'n_residues': 0,
+                    'phenix_vs_ref_mean_rmsd': None,
+                    'phenix_vs_ref_median_rmsd': None,
+                    'error': repr(e),
+                }
+
+        comparison_rows.append({
+            'id': pdb_id,
+            'model_success': model_row['success'],
+            'model_wall_time_s': model_time,
+            'phenix_success': phenix_row['success'],
+            'phenix_wall_time_s': phenix_time,
+            'phenix_over_model_speedup': speedup,
+            'model_output_pdb': model_row['output_pdb'],
+            'phenix_output_pdb': phenix_row['output_pdb'],
+            'model_vs_ref_backbone_mean_rmsd': model_rmsd_stats['model_vs_ref_mean_rmsd'],
+            'model_vs_ref_backbone_median_rmsd': model_rmsd_stats['model_vs_ref_median_rmsd'],
+            'phenix_vs_ref_backbone_mean_rmsd': phenix_rmsd_stats['phenix_vs_ref_mean_rmsd'],
+            'phenix_vs_ref_backbone_median_rmsd': phenix_rmsd_stats['phenix_vs_ref_median_rmsd'],
+        })
+
+    valid_rows = [
+        row
+        for row in comparison_rows
+        if row['phenix_over_model_speedup'] != ''
+    ]
+    if not valid_rows:
+        summary = {
+            'n_compared': 0,
+            'model_median_wall_time_s': None,
+            'phenix_median_wall_time_s': None,
+            'median_phenix_over_model_speedup': None,
+            'n_rmsd_compared': 0,
+            'median_model_vs_ref_backbone_rmsd': None,
+            'median_phenix_vs_ref_backbone_rmsd': None,
+        }
+        print('No successful model/PHENIX pairs were available.')
+        return comparison_rows, summary
+
+    model_times = np.array([row['model_wall_time_s'] for row in valid_rows], dtype=float)
+    phenix_times = np.array([row['phenix_wall_time_s'] for row in valid_rows], dtype=float)
+    speedups = np.array([row['phenix_over_model_speedup'] for row in valid_rows], dtype=float)
+    rmsd_rows = [
+        row for row in comparison_rows
+        if row['model_vs_ref_backbone_median_rmsd'] is not None
+    ]
+    summary = {
+        'n_compared': len(valid_rows),
+        'model_median_wall_time_s': float(np.median(model_times)),
+        'phenix_median_wall_time_s': float(np.median(phenix_times)),
+        'median_phenix_over_model_speedup': float(np.median(speedups)),
+        'n_rmsd_compared': len(rmsd_rows),
+        'median_model_vs_ref_backbone_rmsd': (
+            float(np.median([
+                row['model_vs_ref_backbone_median_rmsd']
+                for row in rmsd_rows
+            ]))
+            if rmsd_rows else None
+        ),
+        'median_phenix_vs_ref_backbone_rmsd': (
+            float(np.median([
+                row['phenix_vs_ref_backbone_median_rmsd']
+                for row in rmsd_rows
+            ]))
+            if rmsd_rows else None
+        ),
+    }
+    model_line = f'Median model time: {summary["model_median_wall_time_s"]:.3f}s'
+    if summary['median_model_vs_ref_backbone_rmsd'] is not None:
+        model_line += (
+            f', median Base2Backbone RMSD: '
+            f'{summary["median_model_vs_ref_backbone_rmsd"]:.3f} A'
+        )
+    print(model_line)
+
+    print(f'Median PHENIX time: {summary["phenix_median_wall_time_s"]:.3f}s')
+
+    print(f'Median speedup: {summary["median_phenix_over_model_speedup"]:.2f}x')
+    return comparison_rows, summary
+
+
+def pick_runtime_subset(input_paths, subset_size=10, seed=42, require_standard_monomers=True):
+    rng = random.Random(int(seed))
+    shuffled_paths = list(input_paths)
+    rng.shuffle(shuffled_paths)
+
+    subset_paths = []
+    skipped_entries = []
+    for path in shuffled_paths:
+        if require_standard_monomers:
+            reasons = ()
+            if path.suffix.lower() in ('.cif', '.mmcif'):
+                reasons = mmcif_nonstandard_reasons(str(path))
+            if reasons:
+                skipped_entries.append(f'{path.stem} ({reasons[0]})')
+                continue
+        subset_paths.append(path)
+        if len(subset_paths) >= int(subset_size):
+            break
+
+    return sorted(subset_paths, key=lambda path: path.stem)
+
+
+def print_benchmark_summary(label, rows):
+    n_total = len(rows)
+    success_rows = [row for row in rows if row['success'] and row['wall_time_s'] is not None]
+    print(f'{label}: {len(success_rows)}/{n_total} successful')
+    if success_rows:
+        times = np.array([row['wall_time_s'] for row in success_rows], dtype=float)
+        print(
+            f'{label}: median={np.median(times):.3f}s '
+            f'mean={np.mean(times):.3f}s '
+            f'min={np.min(times):.3f}s '
+            f'max={np.max(times):.3f}s'
+        )
+
+
+def benchmark_timesteps_vs_phenix_on_subset(
+    output_dir,
+    subset_size=10,
+    subset_seed=42,
+    phenix_max_workers=4,
+    num_timesteps_list=None,
+    require_standard_monomers=True,
+):
+    if num_timesteps_list is None:
+        num_timesteps_list = [5, 10, 15, 30, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+
+    input_paths = collect_test_dataset_raw_paths(test_dataset)
+    subset_paths = pick_runtime_subset(
+        input_paths,
+        subset_size=subset_size,
+        seed=subset_seed,
+        require_standard_monomers=require_standard_monomers,
+    )
+    output_dir = Path(output_dir)
+
+    print('Subset IDs:', [path.stem for path in subset_paths])
+    phenix_rows = run_structure_benchmark(
+        subset_paths,
+        output_dir / 'phenix',
+        run_phenix_geometry_minimization,
+        label='PHENIX',
+        max_workers=phenix_max_workers,
+    )
+    print_benchmark_summary('PHENIX', phenix_rows)
+    summarize_structure_vs_ref_backbone_rmsd(
+        'PHENIX',
+        phenix_rows,
+        window_size=test_dataset.base.window_size,
+    )
+
+    model_rows_by_timesteps = {}
+    comparison_by_timesteps = {}
+    summary_by_timesteps = {}
+    for num_timesteps in num_timesteps_list:
+        label = f'base2backbone ({num_timesteps} steps)'
+        model_rows = run_structure_benchmark(
+            subset_paths,
+            output_dir / f'base2backbone_steps_{num_timesteps}',
+            run_base2backbone_checkpoint_inference,
+            label=label,
+            max_workers=1,
+            checkpoint_model=model,
+            num_timesteps=num_timesteps,
+            device=device,
+            window_size=test_dataset.base.window_size,
+        )
+        print_benchmark_summary(label, model_rows)
+        comparison_rows, summary = summarize_runtime_comparison(
+            model_rows,
+            phenix_rows,
+            window_size=test_dataset.base.window_size,
+        )
+        model_rows_by_timesteps[num_timesteps] = model_rows
+        comparison_by_timesteps[num_timesteps] = comparison_rows
+        summary_by_timesteps[num_timesteps] = summary
+
+    return {
+        'subset_seed': subset_seed,
+        'subset_paths': subset_paths,
+        'phenix_rows': phenix_rows,
+        'model_rows_by_timesteps': model_rows_by_timesteps,
+        'comparison_by_timesteps': comparison_by_timesteps,
+        'summary_by_timesteps': summary_by_timesteps,
+    }
+
+
+def compare_model_vs_phenix_on_test_dataset(
+    output_dir,
+    phenix_max_workers=4,
+    model_path=None,
+    model_device=None,
+    require_standard_monomers=True,
+):
+    input_paths = collect_test_dataset_raw_paths(test_dataset)
+    if require_standard_monomers:
+        input_paths = filter_standard_raw_paths(input_paths)
+    output_dir = Path(output_dir)
+
+    model_rows = run_structure_benchmark(
+        input_paths,
+        output_dir / 'base2backbone',
+        run_base2backbone_inference,
+        label='base2backbone',
+        max_workers=1,
+        model_path=MODEL_DIR if model_path is None else model_path,
+        device=device if model_device is None else model_device,
+        window_size=test_dataset.base.window_size,
+    )
+    phenix_rows = run_structure_benchmark(
+        input_paths,
+        output_dir / 'phenix',
+        run_phenix_geometry_minimization,
+        label='PHENIX',
+        max_workers=phenix_max_workers,
+    )
+    summarize_structure_vs_ref_backbone_rmsd(
+        'PHENIX',
+        phenix_rows,
+        window_size=test_dataset.base.window_size,
+    )
+    comparison_rows, summary = summarize_runtime_comparison(
+        model_rows,
+        phenix_rows,
+        window_size=test_dataset.base.window_size,
+    )
+    return {
+        'input_paths': input_paths,
+        'model_rows': model_rows,
+        'phenix_rows': phenix_rows,
+        'comparison_rows': comparison_rows,
+        'summary': summary,
+    }
+
+
+runtime_subset_seed = 42
+runtime_subset_benchmark = benchmark_timesteps_vs_phenix_on_subset(
+    Path(run_dir) / 'runtime_benchmark_subset',
+    subset_size=10,
+    subset_seed=runtime_subset_seed,
+    phenix_max_workers=4,
+    num_timesteps_list=NUM_TIMESTEPS_LIST,
+)

@@ -1,6 +1,6 @@
 """Shared data vocabulary and DNA window materialization helpers."""
 
-from .dna_windows import build_window_data, get_pdb_ids, parse_dna
+from .dna_windows import build_window_data, get_pdb_ids, parse_dna, parse_dna_universe
 from .vocab import (
     ATOM_TO_INDEX,
     BACKBONE_ATOMS,
@@ -30,4 +30,5 @@ __all__ = [
     'NUCLEIC_ACID_ATOMS',
     'NUCLEOTIDE_ATOMS',
     'parse_dna',
+    'parse_dna_universe',
 ]

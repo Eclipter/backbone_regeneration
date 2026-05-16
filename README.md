@@ -9,16 +9,15 @@ git clone https://github.com/Eclipter/base2backbone.git
 cd base2backbone
 ```
 
-2. Install Conda. See [Conda Installation](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
-
-3. Download PyNAMod:
+1. Install Conda. See [Conda Installation](https://docs.conda.io/projects/conda/en/latest/user-guide/install/index.html)
+2. Download PyNAMod:
 
 ```bash
 git clone https://github.com/intbio/PyNAMod.git pynamod
 cd pynamod
 ```
 
-4. Create a new environment with PyNAMod dependencies:
+1. Create a new environment with PyNAMod dependencies:
 
 ```bash
 /opt/miniconda/bin/conda env create \
@@ -26,7 +25,7 @@ cd pynamod
   --file pynamod/environment.yml
 ```
 
-5. Install the project dependencies:
+1. Install the project dependencies:
 
 ```bash
 /opt/miniconda/bin/conda env update \
@@ -43,20 +42,19 @@ cd pynamod
 ## Training
 
 1. Make sure to set up the environment. See [Setup](#setup)
-
 2. Train and test the model:
 
 ```bash
 python scripts/train.py
 ```
 
-3. Analyze the results if necessary
+1. Analyze the results if necessary
 
 ```bash
 python scripts/analyze.py
 ```
 
-4. Export the best model to ONNX:
+1. Export the best model to ONNX:
 
 ```bash
 python scripts/export.py --run-id torsions/1/baseline
@@ -65,15 +63,44 @@ python scripts/export.py --run-id torsions/1/baseline
 ## Usage
 
 1. Make sure to set up the environment. See [Setup](#setup)
+2. Predict the backbone (CLI):
+  3. For a single structure:
 
-2. Predict the backbone
+    ```bash
+    base2backbone \
+      --input input.pdb \
+      --output output.pdb
+    ```
 
-```bash
-base2backbone \
-    --input input.pdb \
-    --output output.pdb
+    Input topology may be PDB or mmCIF. Output may be PDB or mmCIF independently.
+
+  4. For a trajectory:
+
+    ```bash
+    base2backbone \
+      --input topology.pdb \
+      --trajectory traj.xtc \
+      --output output_traj.pdb
+    ```
+
+    When `--trajectory` is provided, the CLI writes a **multi-model** output file.
+
+  5. Supported output formats:
+    - `.pdb` for PDB / multi-model PDB
+    - `.cif` for mmCIF / multi-model mmCIF
+      The output format is inferred from `--output`, or can be overridden explicitly:
+      The CLI currently writes to a single output file, not to an output directory.
+      If you need one file per frame, this is not exposed in the CLI at the moment.
+      By default **5'-terminal phosphate atoms** (`P`, `OP1`, `OP2`) are **not** predicted. Pass `--generate-5-prime-phosphate` to include them.
+
+3. Predict the backbone (Python API):
+   The library always returns an `MDAnalysis.Universe`.
+
+```python
+import MDAnalysis as mda
+from base2backbone import predict_backbone, predict_backbone_trajectory
+
+single = predict_backbone('input.cif', device='cuda')
+traj_in = mda.Universe('topology.pdb', 'traj.xtc')
+traj_out = predict_backbone_trajectory(traj_in, device='cuda')
 ```
-
-Input and output may be PDB or mmCIF independently (e.g. PDB in, mmCIF out). By default **5'-terminal phosphate atoms** (`P`, `OP1`, `OP2`) are **not** predicted. Pass `--generate-5-prime-phosphate` to include them.
-
-A tradeoff between speed and quality can be chosen by changing the number of ODE steps using the `--num-timesteps` argument. Default is 50.

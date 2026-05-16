@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from Bio.PDB.mmcifio import MMCIFIO
 from Bio.PDB.PDBParser import PDBParser
+from MDAnalysis.coordinates.memory import MemoryReader
 from torch_geometric.data import Batch
 
 from .data import (
@@ -18,6 +19,7 @@ from .data import (
     CHAIN_END_CLASS_5_PRIME,
     FIVE_PRIME_PHOSPHATE_ATOMS,
     parse_dna,
+    parse_dna_universe,
 )
 from .geometry import build_batch_window_backbone_from_torsions
 from .io import default_atoms_provider, inference_atoms_provider
@@ -53,54 +55,102 @@ def _merge_window_pred_for_residue(
 
 
 @torch.no_grad()
-def _predict_full_window_predictions_dict(model, sample_data, device) -> dict[Any, Any]:
-    """Infer all window residues once, then assemble world coords with phosphate bridges."""
-    window = getattr(sample_data, '_window_ref', None)
-    if window is None:
+def _prepare_target_view(sample_data, target_idx: int):
+    dc = sample_data.clone()
+    dc.target_nt_idx = torch.tensor(target_idx, dtype=torch.long)
+    is_target = torch.zeros(WINDOW_SIZE, dtype=torch.float32)
+    is_target[target_idx] = 1.0
+    dc.is_target_nt = is_target
+    origin_t = dc.nt_origins_world[target_idx]
+    frame_t = dc.nt_frames_world[target_idx]
+    dc.rel_origins = ((dc.nt_origins_world - origin_t) @ frame_t).float()
+    dc.rel_frames = torch.einsum('ji,njk->nik', frame_t, dc.nt_frames_world).float()
+    dc.pair_rel_origins = ((dc.pair_origins_world - origin_t) @ frame_t).float()
+    dc.pair_rel_frames = torch.einsum('ji,njk->nik', frame_t, dc.pair_frames_world).float()
+    return dc
+
+
+def _window_predictions_from_coords(window, coords: np.ndarray) -> dict[Any, Any]:
+    preds: dict[Any, Any] = {}
+    for local_i, nt in enumerate(window):
+        row_w = coords[local_i]
+        for j_atom, atom_name in enumerate(BACKBONE_ATOMS):
+            pos = row_w[j_atom]
+            if np.isfinite(pos).all():
+                preds[(nt.segid, int(nt.resid), atom_name)] = pos
+    return preds
+
+
+@torch.no_grad()
+def _predict_full_window_predictions_dicts(model, window_jobs, device) -> dict[tuple[int, str, int], dict[Any, Any]]:
+    """Infer all targets for all windows in one batch and decode the windows together."""
+    if not window_jobs:
         return {}
 
-    theta_acc = sample_data.torsions.clone()
-    tau_acc = sample_data.tau_m.clone()
+    target_samples = []
+    sample_keys: list[tuple[int, int]] = []
+    for job_idx, (_, _, _, _window, data) in enumerate(window_jobs):
+        for target_idx in range(WINDOW_SIZE):
+            target_samples.append(_prepare_target_view(data, target_idx))
+            sample_keys.append((job_idx, target_idx))
 
-    for k in range(WINDOW_SIZE):
-        dc = sample_data.clone()
-        dc.target_nt_idx = torch.tensor(k, dtype=torch.long)
-        is_target = torch.zeros(WINDOW_SIZE, dtype=torch.float32)
-        is_target[k] = 1.0
-        dc.is_target_nt = is_target
-        o_t = dc.nt_origins_world[k]
-        r_t = dc.nt_frames_world[k]
-        dc.rel_origins = ((dc.nt_origins_world - o_t) @ r_t).float()
-        dc.rel_frames = torch.einsum('ji,njk->nik', r_t, dc.nt_frames_world).float()
+    batch = cast(Any, Batch.from_data_list(target_samples)).to(device)
+    pred_theta, pred_tau_m = model.sample(batch)
+    pred_theta = pred_theta.detach().cpu()
+    pred_tau_m = pred_tau_m.detach().cpu().reshape(-1)
 
-        dc.pair_rel_origins = ((dc.pair_origins_world - o_t) @ r_t).float()
-        dc.pair_rel_frames = torch.einsum('ji,njk->nik', r_t, dc.pair_frames_world).float()
+    theta_acc = torch.stack([data.torsions.clone() for _, _, _, _, data in window_jobs], dim=0)
+    tau_acc = torch.stack([data.tau_m.clone() for _, _, _, _, data in window_jobs], dim=0)
+    for sample_idx, (job_idx, target_idx) in enumerate(sample_keys):
+        theta_acc[job_idx, target_idx] = pred_theta[sample_idx]
+        tau_acc[job_idx, target_idx] = pred_tau_m[sample_idx]
 
-        batch = cast(Any, Batch.from_data_list([dc])).to(device)
-        pred_theta, pred_tau_m = model.sample(batch)
-        theta_acc[k] = pred_theta[0].detach().cpu()
-        tau_acc[k] = pred_tau_m[0].detach().cpu()
-
-    theta_w = theta_acc.unsqueeze(0).float().to(device)
-    tau_w = tau_acc.unsqueeze(0).float().to(device).clamp(min=TAU_M_MIN, max=TAU_M_MAX)
-    mask = _inference_chain_end_mask_tensor(sample_data).unsqueeze(0).to(device)
-    ri = sample_data.base_types.argmax(dim=-1).unsqueeze(0).long().to(device)
-    origins_w = sample_data.nt_origins_world.float().unsqueeze(0).to(device)
-    frames_w = sample_data.nt_frames_world.float().unsqueeze(0).to(device)
+    theta_w = theta_acc.float().to(device)
+    tau_w = tau_acc.float().to(device).clamp(min=TAU_M_MIN, max=TAU_M_MAX)
+    mask = torch.stack(
+        [_inference_chain_end_mask_tensor(data) for _, _, _, _, data in window_jobs],
+        dim=0,
+    ).to(device)
+    ri = torch.stack(
+        [data.base_types.argmax(dim=-1).long() for _, _, _, _, data in window_jobs],
+        dim=0,
+    ).to(device)
+    origins_w = torch.stack(
+        [data.nt_origins_world.float() for _, _, _, _, data in window_jobs],
+        dim=0,
+    ).to(device)
+    frames_w = torch.stack(
+        [data.nt_frames_world.float() for _, _, _, _, data in window_jobs],
+        dim=0,
+    ).to(device)
 
     bb_t = build_batch_window_backbone_from_torsions(
         theta_w, tau_w, ri, origins_w, frames_w, mask,
     )
+    coords_all = bb_t.detach().cpu().numpy()
 
-    preds: dict[Any, Any] = {}
-    coords = bb_t[0].cpu().numpy()
-    for local_i, nt in enumerate(window):
-        row_w = coords[local_i]
-        for j_atom, nm in enumerate(BACKBONE_ATOMS):
-            pos = row_w[j_atom]
-            if np.isfinite(pos).all():
-                preds[(nt.segid, int(nt.resid), nm)] = pos
-    return preds
+    cached: dict[tuple[int, str, int], dict[Any, Any]] = {}
+    for job_idx, (structure_idx, chain_key, window_idx, window, _data) in enumerate(window_jobs):
+        cached[(structure_idx, chain_key, window_idx)] = _window_predictions_from_coords(
+            window,
+            coords_all[job_idx],
+        )
+    return cached
+
+
+@torch.no_grad()
+def _predict_full_window_predictions_dict(model, sample_data, device) -> dict[Any, Any]:
+    """Backwards-compatible single-window wrapper over the batched inference path."""
+    window = getattr(sample_data, '_window_ref', None)
+    if window is None:
+        return {}
+    # Keep the legacy helper name while routing through build_batch_window_backbone_from_torsions.
+    cached = _predict_full_window_predictions_dicts(
+        model,
+        [(0, '', 0, window, sample_data)],
+        device,
+    )
+    return cached[(0, '', 0)]
 
 
 def _inference_chain_end_mask_tensor(sample_data):
@@ -140,7 +190,100 @@ def _window_tidx_for_chain_index(chain_len: int, j: int):
     return int(w_cent), int(c)
 
 
-def predict_backbone(
+def _batched_window_predictions(model, chain_records_by_structure, device, show_progress, window_batch_size):
+    jobs = []
+    for structure_idx, chain_records in enumerate(chain_records_by_structure):
+        for chain_key, _chain, windows in chain_records:
+            for window, window_idx, data in windows:
+                jobs.append((structure_idx, chain_key, int(window_idx), window, data.clone()))
+
+    if not jobs:
+        return {}
+
+    if window_batch_size is None or window_batch_size <= 0:
+        window_batch_size = len(jobs)
+
+    cached: dict[tuple[int, str, int], dict[Any, Any]] = {}
+    chunk_starts = range(0, len(jobs), window_batch_size)
+    for start in tqdm(
+        chunk_starts,
+        total=(len(jobs) + window_batch_size - 1) // window_batch_size,
+        desc='Backbone inference',
+        leave=False,
+        disable=not show_progress,
+        colour=PROGRESS_BAR_COLOR,
+    ):
+        chunk = jobs[start:start + window_batch_size]
+        cached.update(_predict_full_window_predictions_dicts(model, chunk, device))
+    return cached
+
+
+def _assemble_predictions(chain_records_by_structure, cached_window_predictions):
+    predictions_by_structure: list[dict[Any, Any]] = []
+    for structure_idx, chain_records in enumerate(chain_records_by_structure):
+        predictions: dict[Any, Any] = {}
+        for chain_key, chain, windows in chain_records:
+            if len(chain) < WINDOW_SIZE:
+                continue
+            available_window_indices = {int(widx) for _window, widx, _data in windows}
+            chain_len = len(chain)
+            for j in _chain_indices_5prime_to_3prime(chain):
+                window_idx, _target_idx = _window_tidx_for_chain_index(chain_len, j)
+                if window_idx not in available_window_indices:
+                    continue
+                window_pred = cached_window_predictions.get((structure_idx, chain_key, window_idx))
+                if window_pred is None:
+                    continue
+                _merge_window_pred_for_residue(predictions, window_pred, chain[j])
+        predictions_by_structure.append(predictions)
+    return predictions_by_structure
+
+
+def _predict_backbone_from_chain_records(
+    chain_records_by_structure,
+    model,
+    device,
+    show_progress: bool = False,
+    window_batch_size: int | None = None,
+):
+    cached_window_predictions = _batched_window_predictions(
+        model,
+        chain_records_by_structure,
+        device,
+        show_progress,
+        window_batch_size,
+    )
+    return _assemble_predictions(chain_records_by_structure, cached_window_predictions)
+
+
+def _build_output_trajectory(universes):
+    if not universes:
+        raise RuntimeError('No structures to write; trajectory prediction produced no frames.')
+
+    first = universes[0]
+    assert first.atoms is not None
+    ref_names = first.atoms.names.tolist()
+    ref_resids = first.atoms.resids.tolist()
+    ref_chainids = first.atoms.chainIDs.tolist()
+    positions = [first.atoms.positions.copy()]
+
+    for universe in universes[1:]:
+        assert universe.atoms is not None
+        if (
+            universe.atoms.n_atoms != first.atoms.n_atoms
+            or universe.atoms.names.tolist() != ref_names
+            or universe.atoms.resids.tolist() != ref_resids
+            or universe.atoms.chainIDs.tolist() != ref_chainids
+        ):
+            raise RuntimeError('Trajectory frames do not share a stable atom topology.')
+        positions.append(universe.atoms.positions.copy())
+
+    trajectory = mda.Merge(first.atoms)
+    trajectory.load_new(np.stack(positions, axis=0).astype(np.float32), format=MemoryReader)
+    return trajectory
+
+
+def _predict_backbone_outputs(
     input_path,
     model_path=MODEL_DIR,
     device='cuda',
@@ -152,35 +295,93 @@ def predict_backbone(
         window_size=WINDOW_SIZE,
     )
     model = _load_model(model_path, device)
-    predictions: dict = {}
-
-    for _chain_key, chain, windows in chain_records:
-        if len(chain) < WINDOW_SIZE:
-            continue
-        w_by_start = {widx: (w, d.clone()) for w, widx, d in windows}
-        L = len(chain)
-        ordered_j = _chain_indices_5prime_to_3prime(chain)
-
-        cached: dict[int, dict[Any, Any]] = {}
-        for j in tqdm(
-                ordered_j,
-                desc='Backbone inference',
-                leave=False,
-                disable=not show_progress,
-                colour=PROGRESS_BAR_COLOR,
-        ):
-            widx, _tidx = _window_tidx_for_chain_index(L, j)
-            if widx not in w_by_start:
-                continue
-            window, data = w_by_start[widx]
-            nt = chain[j]
-            if widx not in cached:
-                dc = data.clone()
-                dc._window_ref = window
-                cached[widx] = _predict_full_window_predictions_dict(model, dc, device)
-            _merge_window_pred_for_residue(predictions, cached[widx], nt)
-
+    predictions = _predict_backbone_from_chain_records(
+        [chain_records],
+        model,
+        device,
+        show_progress=show_progress,
+    )[0]
     return predictions, chain_records
+
+
+def predict_backbone(
+    input_path,
+    model_path=MODEL_DIR,
+    device='cuda',
+    show_progress: bool = False,
+    generate_5prime_phosphate: bool = False,
+):
+    predictions, chain_records = _predict_backbone_outputs(
+        input_path,
+        model_path=model_path,
+        device=device,
+        show_progress=show_progress,
+    )
+    return _build_output_universe(
+        chain_records,
+        predictions,
+        generate_5prime_phosphate=generate_5prime_phosphate,
+    )
+
+
+def _predict_backbone_trajectory_outputs(
+    universe,
+    model_path=MODEL_DIR,
+    device='cuda',
+    show_progress: bool = False,
+    window_batch_size: int | None = None,
+) -> Tuple[list[dict[Any, Any]], list[Any]]:
+    """Predict backbone atoms for every frame of an MDAnalysis trajectory."""
+    chain_records_by_structure = []
+    for _frame in tqdm(
+        universe.trajectory,
+        desc='Trajectory parsing',
+        leave=False,
+        disable=not show_progress,
+        colour=PROGRESS_BAR_COLOR,
+    ):
+        _, chain_records = parse_dna_universe(
+            universe,
+            use_full_nucleotide=False,
+            window_size=WINDOW_SIZE,
+        )
+        chain_records_by_structure.append(chain_records)
+
+    model = _load_model(model_path, device)
+    predictions_by_structure = _predict_backbone_from_chain_records(
+        chain_records_by_structure,
+        model,
+        device,
+        show_progress=show_progress,
+        window_batch_size=window_batch_size,
+    )
+    return predictions_by_structure, chain_records_by_structure
+
+
+def predict_backbone_trajectory(
+    universe,
+    model_path=MODEL_DIR,
+    device='cuda',
+    show_progress: bool = False,
+    window_batch_size: int | None = None,
+    generate_5prime_phosphate: bool = False,
+):
+    predictions_by_structure, chain_records_by_structure = _predict_backbone_trajectory_outputs(
+        universe,
+        model_path=model_path,
+        device=device,
+        show_progress=show_progress,
+        window_batch_size=window_batch_size,
+    )
+    frame_universes = [
+        _build_output_universe(
+            chain_records,
+            predictions,
+            generate_5prime_phosphate=generate_5prime_phosphate,
+        )
+        for predictions, chain_records in zip(predictions_by_structure, chain_records_by_structure)
+    ]
+    return _build_output_trajectory(frame_universes)
 
 
 def _element_of(atom_name):
@@ -278,21 +479,31 @@ def _build_output_universe(chain_records, predictions, generate_5prime_phosphate
     return u
 
 
-def write_structure(chain_records, predictions, output_path, generate_5prime_phosphate=False):
-    ext = osp.splitext(output_path)[1].lower()
-    if ext not in ('.pdb', '.cif', '.mmcif'):
-        raise ValueError(f'Unsupported output format: {ext!r} (expected .pdb/.cif/.mmcif)')
-    universe = _build_output_universe(chain_records, predictions, generate_5prime_phosphate)
+def _normalize_output_path(output_path, output_format: str | None = None):
+    output_path = str(output_path)
+    ext = output_format if output_format is not None else osp.splitext(output_path)[1].lower()
+    if ext == '.mmcif':
+        ext = '.cif'
+    if ext not in ('.pdb', '.cif'):
+        raise ValueError(f'Unsupported output format: {ext!r} (expected .pdb/.cif)')
+    root, current_ext = osp.splitext(output_path)
+    if output_format is not None and current_ext.lower() != ext:
+        output_path = root + ext if current_ext else output_path + ext
+    return output_path, ext
+
+
+def write_structure(universe, output_path, output_format: str | None = None):
+    output_path, ext = _normalize_output_path(output_path, output_format)
     assert universe.atoms is not None
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', category=UserWarning)
         if ext == '.pdb':
-            universe.atoms.write(output_path)
-            return
+            universe.atoms.write(output_path, frames='all')
+            return output_path
         fd, tmp_pdb = tempfile.mkstemp(suffix='.pdb')
         os.close(fd)
         try:
-            universe.atoms.write(tmp_pdb)
+            universe.atoms.write(tmp_pdb, frames='all')
             parser = PDBParser(QUIET=True)
             bio_structure = parser.get_structure('regen', tmp_pdb)
             io = MMCIFIO()
@@ -301,12 +512,19 @@ def write_structure(chain_records, predictions, output_path, generate_5prime_pho
         finally:
             if osp.exists(tmp_pdb):
                 os.remove(tmp_pdb)
+    return output_path
 
 
 def _parse_args():
     p = ArgumentParser(description='Regenerate DNA backbone atoms from a base-only PDB/mmCIF.')
-    p.add_argument('--input', required=True, help='Path to input .pdb/.cif/.mmcif (DNA without backbone).')
-    p.add_argument('--output', required=True, help='Output path; format from extension (.pdb or .cif/.mmcif).')
+    p.add_argument('--input', required=True, help='Path to input topology .pdb/.cif/.mmcif (DNA without backbone).')
+    p.add_argument('--trajectory', help='Optional trajectory path (for example .xtc/.dcd); writes a multi-model output.')
+    p.add_argument('--output', required=True, help='Output path; format from extension or --output-format.')
+    p.add_argument(
+        '--output-format',
+        choices=['.pdb', '.cif'],
+        help='Override output format. .cif writes mmCIF.',
+    )
     p.add_argument(
         '--generate-5-prime-phosphate',
         action='store_true',
@@ -318,17 +536,27 @@ def _parse_args():
 def main():
     args = _parse_args()
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    predictions, chain_records = predict_backbone(
-        args.input,
-        device=device,
-    )
-    write_structure(
-        chain_records,
-        predictions,
+    if args.trajectory:
+        input_universe = mda.Universe(args.input, args.trajectory)
+        output_universe = predict_backbone_trajectory(
+            input_universe,
+            device=device,
+            generate_5prime_phosphate=args.generate_5_prime_phosphate,
+        )
+    else:
+        output_universe = predict_backbone(
+            args.input,
+            device=device,
+            generate_5prime_phosphate=args.generate_5_prime_phosphate,
+        )
+    output_path = write_structure(
+        output_universe,
         args.output,
-        generate_5prime_phosphate=args.generate_5_prime_phosphate,
+        output_format=args.output_format,
     )
-    print(f'Wrote {args.output} ({len(predictions)} predicted backbone atoms).')
+    assert output_universe.atoms is not None
+    n_frames = len(output_universe.trajectory)
+    print(f'Wrote {output_path} ({output_universe.atoms.n_atoms} atoms, {n_frames} frame(s)).')
 
 
 if __name__ == '__main__':

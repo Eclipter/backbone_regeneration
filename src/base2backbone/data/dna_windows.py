@@ -269,20 +269,10 @@ def build_window_data(window, window_idx, chain_len, chain_direction, structure,
     )
 
 
-def parse_dna(path, use_full_nucleotide, window_size=3):
-    """Parse a DNA structure and build sliding-window records."""
-    ext = os.path.splitext(path)[1].lower()
-    if ext == '.pdb':
-        universe = load_pdb_universe(path)
-    elif ext in ('.cif', '.mmcif'):
-        universe = load_mmcif_universe(path)
-    else:
-        raise ValueError(f'Unsupported input format: {ext!r} (expected .pdb/.cif/.mmcif)')
-
-    structure = CG_Structure(mdaUniverse=universe)
+def _build_chain_records(structure, use_full_nucleotide, window_size):
     nucleic_atoms = structure.u.select_atoms('nucleic')  # type: ignore
     if len(nucleic_atoms) == 0:
-        raise RuntimeError(f'No nucleic atoms found in {path}.')
+        raise RuntimeError('No nucleic atoms found in the provided structure.')
     dna_segids = list(np.unique(nucleic_atoms.segids))
     structure.analyze_dna(leading_strands=dna_segids, use_full_nucleotide=use_full_nucleotide)
 
@@ -330,4 +320,25 @@ def parse_dna(path, use_full_nucleotide, window_size=3):
                 pass
         chain_records.append((chain_key, chain, windows))
 
+    return chain_records
+
+
+def parse_dna_universe(universe, use_full_nucleotide, window_size=3):
+    """Parse a DNA structure from an MDAnalysis universe and build sliding-window records."""
+    structure = CG_Structure(mdaUniverse=universe)
+    chain_records = _build_chain_records(structure, use_full_nucleotide, window_size)
     return structure, chain_records
+
+
+def parse_dna(path, use_full_nucleotide, window_size=3):
+    """Parse a DNA structure and build sliding-window records."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.pdb':
+        universe = load_pdb_universe(path)
+    elif ext in ('.cif', '.mmcif'):
+        universe = load_mmcif_universe(path)
+    else:
+        raise ValueError(f'Unsupported input format: {ext!r} (expected .pdb/.cif/.mmcif)')
+
+    return parse_dna_universe(universe, use_full_nucleotide, window_size=window_size)
+

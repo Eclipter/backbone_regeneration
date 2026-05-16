@@ -13,6 +13,7 @@ from ..torsion_constants import (
     TOR_BETA,
     TOR_CHI,
     TOR_EPS,
+    TOR_ETA_P,
     TOR_GAMMA,
     TOR_PSEUDOROTATION_PHASE,
     TOR_ZETA,
@@ -109,6 +110,7 @@ def _get_template_tensors(device_str: str) -> dict:
         'bl_op1', 'bl_op2',
         'ang_op1', 'ang_op2',
         'psi_op1', 'psi_op2',
+        'psi_op1_c5', 'psi_op2_c5',
         'psi_o3', 'psi_o3_ring', 'bl_o4_c4', 'ba_c1_o4_c4', 'ba_o4_c4_c3',
         'ring_chiral_triple',
     ]
@@ -154,6 +156,8 @@ def _get_template_tensors(device_str: str) -> dict:
         rows_1d['ang_op2'].append(_ba(tpl, "O5'", 'P', 'OP2'))
         rows_1d['psi_op1'].append(_dr(tpl, "O3'", "O5'", 'P', 'OP1'))
         rows_1d['psi_op2'].append(_dr(tpl, "O3'", "O5'", 'P', 'OP2'))
+        rows_1d['psi_op1_c5'].append(_dr(tpl, "C5'", "O5'", 'P', 'OP1'))
+        rows_1d['psi_op2_c5'].append(_dr(tpl, "C5'", "O5'", 'P', 'OP2'))
         rows_1d['psi_o3'].append(_dr(tpl, "C5'", "C4'", "C3'", "O3'"))
         rows_1d['psi_o3_ring'].append(_dr(tpl, "O4'", "C4'", "C3'", "O3'"))
         rows_1d['bl_o4_c4'].append(_bl(tpl, "O4'", "C4'"))
@@ -1138,8 +1142,23 @@ def build_backbone_from_torsions(
         weight_beta=1.0,
     )
     out['P'] = phosph['P']
-    out['OP1'] = phosph['OP1']
-    out['OP2'] = phosph['OP2']
+    # Place OP1/OP2 using predicted eta_p = dihedral(C5', O5', P, OP1)
+    # instead of the fixed canonical template dihedral.
+    eta_p = torsions[:, TOR_ETA_P]
+    tc = geometry['template_tensors']
+    p_local = phosph['P']
+    c5n = out["C5'"]
+    o5n = out["O5'"]
+    half_pi = torsions.new_tensor(_HALF_PI)
+    bl_op1 = _template_select(tc, 'bl_op1', ri, dtype=torsions.dtype)
+    bl_op2 = _template_select(tc, 'bl_op2', ri, dtype=torsions.dtype)
+    ang_op1 = _template_select(tc, 'ang_op1', ri, dtype=torsions.dtype)
+    ang_op2 = _template_select(tc, 'ang_op2', ri, dtype=torsions.dtype)
+    psi_op1_c5 = _template_select(tc, 'psi_op1_c5', ri, dtype=torsions.dtype)
+    psi_op2_c5 = _template_select(tc, 'psi_op2_c5', ri, dtype=torsions.dtype)
+    delta_op_c5 = psi_op2_c5 - psi_op1_c5
+    out['OP1'] = nerf_place(c5n, o5n, p_local, bl_op1, ang_op1, eta_p - half_pi)
+    out['OP2'] = nerf_place(c5n, o5n, p_local, bl_op2, ang_op2, eta_p + delta_op_c5 - half_pi)
     return out
 
 
@@ -1237,6 +1256,8 @@ def build_batch_window_backbone_from_torsions(
             wa = torsion_mask[idx, k, TOR_ALPHA].to(dtype=dtype)
             wb = torsion_mask[idx, k, TOR_BETA].to(dtype=dtype)
 
+        tc_bb = geometry['template_tensors']
+        ri_k = restype_indices[idx, k]
         phosph = close_phosphate_bridge_multi(
             prev_loc,
             next_loc,
@@ -1245,13 +1266,31 @@ def build_batch_window_backbone_from_torsions(
             torsions[idx, k, TOR_ALPHA],
             torsions[idx, k, TOR_BETA],
             geometry={
-                'restype_indices_next': restype_indices[idx, k],
-                'template_tensors': geometry['template_tensors'],
+                'restype_indices_next': ri_k,
+                'template_tensors': tc_bb,
             },
             weight_epsilon=we,
             weight_zeta=wz,
             weight_alpha=wa,
             weight_beta=wb,
+        )
+        # Re-place OP1/OP2 using predicted eta_p = dihedral(C5', O5', P, OP1).
+        eta_p_k = torsions[idx, k, TOR_ETA_P]
+        half_pi_k = torsions.new_tensor(_HALF_PI)
+        psi_op1_c5_k = _template_select(tc_bb, 'psi_op1_c5', ri_k, dtype=dtype)
+        psi_op2_c5_k = _template_select(tc_bb, 'psi_op2_c5', ri_k, dtype=dtype)
+        delta_op_c5_k = psi_op2_c5_k - psi_op1_c5_k
+        phosph['OP1'] = nerf_place(
+            next_loc["C5'"], next_loc["O5'"], phosph['P'],
+            _template_select(tc_bb, 'bl_op1', ri_k, dtype=dtype),
+            _template_select(tc_bb, 'ang_op1', ri_k, dtype=dtype),
+            eta_p_k - half_pi_k,
+        )
+        phosph['OP2'] = nerf_place(
+            next_loc["C5'"], next_loc["O5'"], phosph['P'],
+            _template_select(tc_bb, 'bl_op2', ri_k, dtype=dtype),
+            _template_select(tc_bb, 'ang_op2', ri_k, dtype=dtype),
+            eta_p_k + delta_op_c5_k - half_pi_k,
         )
         phosph_local = torch.stack([phosph[nm] for nm in _PHOSPHATE_ATOM_ORDER], dim=1)
         bb[idx.unsqueeze(-1), k, phosphate_index] = local_to_world_points(phosph_local, ok, Rk)

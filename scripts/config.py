@@ -44,7 +44,7 @@ EXPERIMENTS = [
     # Increase angle weight so normalized angle violations get more gradient; keeps overall closure mild (CLW=1e-3).
     {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.3},
     # Stronger closure pressure across bond/torsion/angle; verify RMSD vs lower fail_rate trade-off.
-    {'CLOSURE_LOSS_WEIGHT': 3e-3, 'CLOSURE_ANGLE_WEIGHT': 0.1},
+    {'CLOSURE_LOSS_WEIGHT': 1e-2, 'CLOSURE_ANGLE_WEIGHT': 0.3},
     # Tighter bond σ: bond error ~1.2σ at default σ_A=0.05; amplify normalized bond term without new weights.
     {
         'CLOSURE_LOSS_WEIGHT': 1e-3,
@@ -56,7 +56,7 @@ EXPERIMENTS = [
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'torsions/6'
+RUN_NAME = 'torsions/7'
 
 SEED = 42
 

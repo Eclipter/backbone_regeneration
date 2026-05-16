@@ -187,8 +187,8 @@ def test_sugar_ring_from_xy_z_contract(device='cpu'):
 
 
 def test_closed_form_no_delta_no_sincos():
-    assert N_TORSIONS == 7
-    assert N_LATENT == 8
+    assert N_TORSIONS == 8
+    assert N_LATENT == 9
     assert TORSION_NAMES == (
         'alpha',
         'beta',
@@ -197,6 +197,7 @@ def test_closed_form_no_delta_no_sincos():
         'zeta',
         'chi',
         'pseudorotation_phase',
+        'eta_p',
     )
     src = inspect.getsource(build_sugar_ring_closed_form)
     assert 'delta' not in inspect.signature(build_sugar_ring_closed_form).parameters

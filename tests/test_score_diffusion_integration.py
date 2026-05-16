@@ -87,8 +87,8 @@ def test_torsion_constants_consistent():
 
 def test_delta_absent_everywhere():
     assert 'delta' not in TORSION_NAMES
-    assert N_TORSIONS == 7
-    assert N_LATENT == 8
+    assert N_TORSIONS == 8
+    assert N_LATENT == 9
     cl_text = Path(__file__).resolve().parents[1] / 'src' / 'base2backbone' / 'bridge_closure.py'
     assert 'delta' not in cl_text.read_text().lower()
 

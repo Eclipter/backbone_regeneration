@@ -12,6 +12,7 @@ from ..torsion_constants import (
     TOR_BETA,
     TOR_CHI,
     TOR_EPS,
+    TOR_ETA_P,
     TOR_GAMMA,
     TOR_PSEUDOROTATION_PHASE,
     TOR_ZETA,
@@ -85,6 +86,9 @@ def nucleotide_torsions(xyz_by_name_cur, xyz_by_name_prev, xyz_by_name_next, bas
     _set(TOR_GAMMA, o5, c5, c4, c3)
     _set(TOR_EPS,   c4, c3, o3_cur, p_next)
     _set(TOR_ZETA,  c3, o3_cur, p_next, o5_next)
+
+    op1 = g(xyz_by_name_cur, 'OP1')
+    _set(TOR_ETA_P, c5, o5, p_cur, op1)  # dihedral(C5', O5', P, OP1)
 
     o4 = g(xyz_by_name_cur, "O4'")
     c1 = g(xyz_by_name_cur, "C1'")

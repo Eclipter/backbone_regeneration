@@ -20,8 +20,8 @@ _MODEL_PY = _SRC / 'model.py'
 
 
 def test_torsion_counts():
-    assert N_TORSIONS == 7
-    assert N_LATENT == 8
+    assert N_TORSIONS == 8
+    assert N_LATENT == 9
     assert N_TORSIONS_LATENT == N_LATENT
 
 
@@ -53,7 +53,7 @@ def test_coordinate_builders_have_no_delta_parameter():
 @pytest.mark.parametrize(
     'restype', ('A', 'C', 'G', 'T'),
 )
-def test_backbone_torch_runs_with_seven_angles(restype):
+def test_backbone_torch_runs_with_eight_angles(restype):
     ri = torch.tensor([{'A': 0, 'C': 1, 'G': 2, 'T': 3}[restype]])
     theta = torch.zeros(1, N_TORSIONS)
     tau = torch.tensor([0.35])

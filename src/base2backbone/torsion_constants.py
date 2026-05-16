@@ -11,7 +11,7 @@ TAU_M_MAX = 1.5
 LOG_TAU_M_MIN = math.log(TAU_M_MIN)
 LOG_TAU_M_MAX = math.log(TAU_M_MAX)
 
-TORSION_NAMES = ('alpha', 'beta', 'gamma', 'epsilon', 'zeta', 'chi', 'pseudorotation_phase')
+TORSION_NAMES = ('alpha', 'beta', 'gamma', 'epsilon', 'zeta', 'chi', 'pseudorotation_phase', 'eta_p')
 N_TORSIONS = len(TORSION_NAMES)
 N_LATENT = N_TORSIONS + 1
 N_TORSIONS_LATENT = N_LATENT
@@ -23,6 +23,8 @@ TOR_EPS = TORSION_NAMES.index('epsilon')
 TOR_ZETA = TORSION_NAMES.index('zeta')
 TOR_CHI = TORSION_NAMES.index('chi')
 TOR_PSEUDOROTATION_PHASE = TORSION_NAMES.index('pseudorotation_phase')
+# eta_p = dihedral(C5', O5', P, OP1): orientation of the non-bridging PO2 group
+TOR_ETA_P = TORSION_NAMES.index('eta_p')
 
 TORSION_IS_CIRCULAR = torch.tensor(
     [True] * N_TORSIONS,
@@ -31,7 +33,7 @@ TORSION_IS_CIRCULAR = torch.tensor(
 
 
 def assert_torsion_layout():
-    """Debug helper: latent is seven wrapped angles plus log τ_m."""
-    assert len(TORSION_NAMES) == N_TORSIONS == 7
-    assert N_LATENT == N_TORSIONS + 1 == 8
+    """Debug helper: latent is eight wrapped angles plus log τ_m."""
+    assert len(TORSION_NAMES) == N_TORSIONS == 8
+    assert N_LATENT == N_TORSIONS + 1 == 9
     assert 'delta' not in TORSION_NAMES

@@ -6,7 +6,6 @@ BASE = dict(
     NUM_HEADS=8,
     NUM_LAYERS=3,
     NUM_TIMESTEPS=200,
-    SAMPLER='ODE',  # 'SDE' | 'ODE'
     BATCH_SIZE=50000,
     LR=1e-3,
     WEIGHT_DECAY=0.01,
@@ -41,7 +40,6 @@ BASE = dict(
 EXPERIMENTS = [
     # {},  # baseline (matches BASE)
     {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.1},
-    {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.1, 'SAMPLER': 'SDE'}
 ]
 
 # Run path under `logs/`

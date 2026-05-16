@@ -43,7 +43,6 @@ def main() -> None:
                 pred_theta, pred_tau_m = model.sample(
                     batch,
                     num_timesteps=num_timesteps,
-                    sampler='ode',
                 )
                 rmsd = model._compute_rmsd_per_graph_local(pred_theta, pred_tau_m, batch)
                 finite = torch.isfinite(rmsd)

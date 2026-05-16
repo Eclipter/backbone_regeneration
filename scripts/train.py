@@ -66,7 +66,6 @@ def train_one(cfg):
         num_heads=cfg['NUM_HEADS'],
         num_layers=cfg['NUM_LAYERS'],
         num_timesteps=cfg['NUM_TIMESTEPS'],
-        sampler=cfg['SAMPLER'].lower(),
         batch_size=cfg['BATCH_SIZE'],
         lr=cfg['LR'],
         lr_scheduler=cfg['LR_SCHEDULER'],

@@ -15,9 +15,8 @@ from .data import BACKBONE_ATOMS, BASE_TO_INDEX, N_CHAIN_END_CLASSES
 from .geometry import build_batch_window_backbone_from_torsions
 from .score_diffusion import (decode_torsions, encode_torsions,
                               estimate_latent_from_ve_score, perturb_torsions,
-                              reverse_ve_score_ode_step, reverse_ve_score_step,
-                              sigma_schedule, ve_sigma_grid,
-                              weighted_score_mse, wrap_angle)
+                              reverse_ve_score_ode_step, sigma_schedule,
+                              ve_sigma_grid, weighted_score_mse, wrap_angle)
 from .torsion_constants import (LOG_TAU_M_MAX, LOG_TAU_M_MIN, N_LATENT,
                                 N_TORSIONS, TAU_M_MAX, TAU_M_MIN)
 
@@ -104,7 +103,6 @@ class BackboneLightningModule(pl.LightningModule):
         closure_sigma_angle_rad: float = CLOSURE_SIGMA_ANGLE_RAD,
         closure_sigma_torsion_rad: float = CLOSURE_SIGMA_TORSION_RAD,
         log_tau_init_noise_scale: float | None = None,
-        sampler: str = 'sde',
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -543,22 +541,14 @@ class BackboneLightningModule(pl.LightningModule):
         self._write_rmsd_scalars('test')
 
     @torch.no_grad()
-    def p_sample_loop(self, batch, num_timesteps: int | None = None, sampler: str | None = None):
+    def p_sample_loop(self, batch, num_timesteps: int | None = None):
         theta0, _, _, _, _ = self._theta_mask_target(batch)
         b = batch.num_graphs
         dev = self.device
         dtype = torch.float32
         if num_timesteps is None:
             num_timesteps = int(self.hparams['num_timesteps'])
-        if sampler is None:
-            sampler = str(self.hparams.get('sampler', 'sde'))
-        sampler = sampler.lower()
-        if sampler == 'sde':
-            step_fn = reverse_ve_score_step
-        elif sampler == 'ode':
-            step_fn = reverse_ve_score_ode_step
-        else:
-            raise ValueError(f'unknown sampler: {sampler!r}')
+        step_fn = reverse_ve_score_ode_step
         device = torch.device(dev)
         sig_theta, sig_tau = self._get_sampling_sigmas(device, dtype, num_timesteps)
         prefix = self._build_static_x_prefix(batch)
@@ -731,11 +721,10 @@ class BackboneLightningModule(pl.LightningModule):
         self._log_rmsd('test', pred_theta, pred_tau_m, batch)
 
     @torch.no_grad()
-    def sample(self, batch, num_timesteps: int | None = None, sampler: str | None = None):
+    def sample(self, batch, num_timesteps: int | None = None):
         _, (pred_theta, pred_tau_m) = self.p_sample_loop(
             batch,
             num_timesteps=num_timesteps,
-            sampler=sampler,
         )
         return pred_theta, pred_tau_m
 

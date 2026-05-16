@@ -7,7 +7,7 @@ import torch
 
 from .data import BASE_TO_INDEX, N_CHAIN_END_CLASSES
 from .torsion_constants import LOG_TAU_M_MAX, LOG_TAU_M_MIN, N_LATENT, N_TORSIONS
-from .score_diffusion import decode_torsions, reverse_ve_score_step, ve_sigma_grid, wrap_angle
+from .score_diffusion import decode_torsions, reverse_ve_score_ode_step, ve_sigma_grid, wrap_angle
 
 
 class OnnxSampler:
@@ -129,7 +129,7 @@ class OnnxSampler:
                 dtype=dtype,
             )
             pred = self.forward_score_network(batch, x_t, log_s, sc)
-            theta, logt = reverse_ve_score_step(
+            theta, logt = reverse_ve_score_ode_step(
                 x_t[..., :N_TORSIONS],
                 x_t[..., N_TORSIONS:N_LATENT],
                 pred,

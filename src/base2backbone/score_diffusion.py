@@ -211,45 +211,6 @@ def ve_sigma_grid(
     return torch.exp(log_sig)
 
 
-def reverse_ve_score_step(
-    theta: torch.Tensor,
-    log_tau: torch.Tensor,
-    score_pred: torch.Tensor,
-    sigma_cur: torch.Tensor,
-    sigma_next: torch.Tensor,
-    sigma_tau_cur: torch.Tensor,
-    sigma_tau_next: torch.Tensor,
-    *,
-    rng_theta: torch.Tensor | None = None,
-    rng_tau: torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """One ancestral VE reverse step toward lower σ using predicted scores."""
-    eps_safe = 1e-12
-    d2_theta = (sigma_cur ** 2 - sigma_next ** 2).clamp(min=0.0)
-    d2_tau = (sigma_tau_cur ** 2 - sigma_tau_next ** 2).clamp(min=0.0)
-
-    while d2_theta.ndim < theta.ndim:
-        d2_theta = d2_theta.unsqueeze(-1)
-    while d2_tau.ndim < log_tau.ndim:
-        d2_tau = d2_tau.unsqueeze(-1)
-
-    z_th = torch.randn_like(theta) if rng_theta is None else rng_theta
-    z_tau = torch.randn_like(log_tau) if rng_tau is None else rng_tau
-
-    step_noise_theta = torch.zeros_like(theta)
-    if float(sigma_next.max()) > eps_safe:
-        step_noise_theta = torch.sqrt(d2_theta.clamp(min=eps_safe)) * z_th
-    step_noise_tau = torch.zeros_like(log_tau)
-    if float(sigma_tau_next.max()) > eps_safe:
-        step_noise_tau = torch.sqrt(d2_tau.clamp(min=eps_safe)) * z_tau
-
-    theta_next = wrap_angle(theta + d2_theta * score_pred[..., :N_TORSIONS] + step_noise_theta)
-    log_next = (
-        log_tau + d2_tau * score_pred[..., N_TORSIONS:N_LATENT] + step_noise_tau
-    ).clamp(LOG_TAU_M_MIN, LOG_TAU_M_MAX)
-    return theta_next, log_next
-
-
 def reverse_ve_score_ode_step(
     theta: torch.Tensor,
     log_tau: torch.Tensor,

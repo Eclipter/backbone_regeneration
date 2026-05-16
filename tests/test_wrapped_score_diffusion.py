@@ -25,7 +25,6 @@ from base2backbone.score_diffusion import (
     gaussian_score,
     perturb_torsions,
     reverse_ve_score_ode_step,
-    reverse_ve_score_step,
     sigma_schedule,
     ve_sigma_grid,
     weighted_score_mse,
@@ -180,7 +179,7 @@ def test_wrapped_small_angle_ve_step_reduces_magnitude():
     assert abs(float(theta_next)) < abs(float(theta))
 
 
-def test_score_sampler_reverse_step_shapes_and_finite():
+def test_score_sampler_reverse_ode_step_shapes_and_finite():
     B = 6
     theta = torch.randn(B, N_TORSIONS)
     log_tau = torch.randn(B, 1)
@@ -191,7 +190,7 @@ def test_score_sampler_reverse_step_shapes_and_finite():
     sn = torch.tensor(0.55, device=dev, dtype=dtype)
     st = torch.tensor(1.2, device=dev, dtype=dtype)
     stn = torch.tensor(0.6, device=dev, dtype=dtype)
-    th2, lt2 = reverse_ve_score_step(theta, log_tau, score, sc, sn, st, stn)
+    th2, lt2 = reverse_ve_score_ode_step(theta, log_tau, score, sc, sn, st, stn)
     assert th2.shape == theta.shape and lt2.shape == log_tau.shape
     assert torch.isfinite(th2).all() and torch.isfinite(lt2).all()
 

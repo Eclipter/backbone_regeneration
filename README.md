@@ -66,10 +66,14 @@ python scripts/export.py --run-id torsions/1/baseline
 
 1. Make sure to set up the environment. See [Setup](#setup)
 
-2. Predict the backbone. Input and output may be PDB or mmCIF independently (e.g. PDB in, mmCIF out). By default **5'-terminal phosphate atoms** (`P`, `OP1`, `OP2`) are **not** predicted. Pass `--generate-5-prime-phosphate` to include them.
+2. Predict the backbone
 
 ```bash
 base2backbone \
     --input input.pdb \
     --output output.pdb
 ```
+
+Input and output may be PDB or mmCIF independently (e.g. PDB in, mmCIF out). By default **5'-terminal phosphate atoms** (`P`, `OP1`, `OP2`) are **not** predicted. Pass `--generate-5-prime-phosphate` to include them.
+
+A tradeoff between speed and quality can be chosen by changing the number of ODE steps using the `--num-timesteps` argument. Default is 50.

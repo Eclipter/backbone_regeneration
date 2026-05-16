@@ -204,7 +204,7 @@ def test_p_sample_loop_reuses_cached_sigma_grids(monkeypatch):
     assert len(grid_calls) == 2
 
 
-def test_p_sample_loop_selects_ode_sampler_case_insensitive(monkeypatch):
+def test_p_sample_loop_calls_ode_reverse_step(monkeypatch):
     hp = dict(
         hidden_dim=32,
         num_heads=4,
@@ -227,10 +227,9 @@ def test_p_sample_loop_selects_ode_sampler_case_insensitive(monkeypatch):
         closure_bond_weight=1.0,
         closure_angle_weight=1.0,
         closure_torsion_weight=1.0,
-        sampler='ODE',
     )
     mod = BackboneLightningModule(**cast(Any, hp)).eval()
-    calls = {'sde': 0, 'ode': 0}
+    calls = {'ode': 0}
 
     def _stub_fwd(self, prefix, batch, x_tl, lg, sc):  # noqa: ARG001
         return torch.zeros(
@@ -240,25 +239,19 @@ def test_p_sample_loop_selects_ode_sampler_case_insensitive(monkeypatch):
             dtype=torch.float32,
         )
 
-    def _stub_sde(theta, log_tau, score_pred, sigma_cur, sigma_next, sigma_tau_cur, sigma_tau_next):
-        calls['sde'] += 1
-        return theta, log_tau
-
     def _stub_ode(theta, log_tau, score_pred, sigma_cur, sigma_next, sigma_tau_cur, sigma_tau_next):
         calls['ode'] += 1
         return theta, log_tau
 
     monkeypatch.setattr(BackboneLightningModule, 'forward_score_network_from_prefix', _stub_fwd)
-    monkeypatch.setattr(model_module, 'reverse_ve_score_step', _stub_sde)
     monkeypatch.setattr(model_module, 'reverse_ve_score_ode_step', _stub_ode)
 
     mod.p_sample_loop(_minimal_train_batch())
 
-    assert calls['sde'] == 0
     assert calls['ode'] == 2
 
 
-def test_sample_forwards_num_steps_and_sampler(monkeypatch):
+def test_sample_forwards_num_timesteps(monkeypatch):
     hp = dict(
         hidden_dim=32,
         num_heads=4,
@@ -285,10 +278,9 @@ def test_sample_forwards_num_steps_and_sampler(monkeypatch):
     mod = BackboneLightningModule(**cast(Any, hp)).eval()
     seen: dict[str, Any] = {}
 
-    def _stub_loop(self, batch, num_steps=None, sampler=None):
+    def _stub_loop(self, batch, num_timesteps=None):
         seen['batch'] = batch
-        seen['num_steps'] = num_steps
-        seen['sampler'] = sampler
+        seen['num_timesteps'] = num_timesteps
         b = batch.num_graphs
         return (
             torch.zeros((b, N_TORSIONS), dtype=torch.float32),
@@ -301,9 +293,9 @@ def test_sample_forwards_num_steps_and_sampler(monkeypatch):
     monkeypatch.setattr(BackboneLightningModule, 'p_sample_loop', _stub_loop)
 
     batch = _minimal_train_batch()
-    pred_theta, pred_tau_m = mod.sample(batch, num_steps=50, sampler='ode')
+    pred_theta, pred_tau_m = mod.sample(batch, num_timesteps=50)
 
-    assert seen == {'batch': batch, 'num_steps': 50, 'sampler': 'ode'}
+    assert seen == {'batch': batch, 'num_timesteps': 50}
     assert pred_theta.shape == (batch.num_graphs, N_TORSIONS)
     assert pred_tau_m.shape == (batch.num_graphs,)
 

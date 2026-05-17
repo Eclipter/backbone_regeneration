@@ -7,7 +7,7 @@ name = 'base2backbone'
 version = '0.1.0'
 description = 'DNA backbone regeneration from base-only structures'
 readme = 'README.md'
-requires-python = '==3.13.12'
+requires-python = '>=3.13,<3.14'
 urls = {Repository = 'https://github.com/Eclipter/base2backbone'}
 # PyNAMod remains a manual prerequisite; this project expects the local clone documented in README.
 dependencies = [

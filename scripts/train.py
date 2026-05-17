@@ -11,7 +11,8 @@ from pathlib import Path
 import lightning.pytorch as pl
 import torch
 from config import BASE, EXPERIMENTS, RUN_NAME, SEED
-from lightning.pytorch.callbacks import ModelCheckpoint, StochasticWeightAveraging
+from lightning.pytorch.callbacks import (ModelCheckpoint,
+                                         StochasticWeightAveraging)
 from lightning.pytorch.loggers import TensorBoardLogger
 from lightning_utilities.core.rank_zero import rank_zero_info
 

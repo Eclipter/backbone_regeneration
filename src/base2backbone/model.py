@@ -379,6 +379,17 @@ class BackboneLightningModule(pl.LightningModule):
             float(self.hparams['angular_sigma_max']),
         )
         log_sigma_cond = torch.log(sigma_theta_b.clamp(min=1e-8))
+        if torch.rand((), device=x_t.device) < 0.5:
+            with torch.no_grad():
+                pred_sc = self.forward_score_network(batch, x_t, log_sigma_cond, sc)
+                sc = estimate_latent_from_ve_score(
+                    pert['theta_t'],
+                    log_tau_t,
+                    pred_sc,
+                    pert['sigma_theta'],
+                    pert['sigma_tau'],
+                ).detach()
+                sc = torch.nan_to_num(sc)
         pred = self.forward_score_network(batch, x_t, log_sigma_cond, sc)
         sw = str(self.hparams.get('score_loss_weighting', 'sigma2'))
         lam_theta = (pert['sigma_theta'] ** 2) if sw == 'sigma2' else None
@@ -576,6 +587,14 @@ class BackboneLightningModule(pl.LightningModule):
                 dtype=dtype,
             )
             pred = self.forward_score_network_from_prefix(prefix, batch, x_t, log_s, sc)
+            sc = estimate_latent_from_ve_score(
+                x_t[..., :N_TORSIONS],
+                x_t[..., N_TORSIONS:N_LATENT],
+                pred,
+                sigma_cur_th,
+                sigma_cur_tau,
+            ).detach()
+            sc = torch.nan_to_num(sc)
             theta, logt = step_fn(
                 x_t[..., :N_TORSIONS],
                 x_t[..., N_TORSIONS:N_LATENT],
@@ -586,7 +605,6 @@ class BackboneLightningModule(pl.LightningModule):
                 sigma_next_tau,
             )
             x_t = torch.cat([theta, logt], dim=-1)
-            sc = torch.zeros_like(x_t)
             if not torch.isfinite(x_t).all():
                 x_t = torch.nan_to_num(x_t, nan=0.0, posinf=math.pi, neginf=-math.pi)
                 theta = wrap_angle(x_t[..., :N_TORSIONS])

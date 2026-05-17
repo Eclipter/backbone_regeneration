@@ -39,8 +39,7 @@ from base2backbone.eval import (backbone_local_in_target_frame,
                                 local_backbone_rmsd, ordered_backbone_segments,
                                 phosphodiester_segments_local,
                                 world_to_local_np)
-from base2backbone.geometry.backbone import (build_backbone_local,
-                                             nucleotide_torsions)
+from base2backbone.geometry.backbone import build_backbone_local
 from base2backbone.inference import \
     _build_output_universe as build_output_universe
 from base2backbone.inference import \
@@ -49,8 +48,6 @@ from base2backbone.inference import write_structure
 from base2backbone.io import default_atoms_provider
 from base2backbone.runtime import (PROGRESS_BAR_COLOR, collect_scalar_history,
                                    load_analysis_run_artifacts)
-from base2backbone.torsion_constants import (TOR_CHI, TOR_GAMMA,
-                                             TOR_PSEUDOROTATION_PHASE)
 
 IDX_TO_BASE = {v: k for k, v in BASE_TO_INDEX.items()}
 
@@ -364,7 +361,7 @@ def plot_metric(ax, table, column, color, label, linestyle='-'):
 
 validation_labels = {
     'avg': 'все нуклеотиды',
-    'central': 'центральные нуклеотиды',
+    'central': 'внутренние нуклеотиды',
     'edge': 'крайние нуклеотиды',
 }
 
@@ -729,8 +726,7 @@ _, chain_records_inference = parse_dna(
 _predictions_inference = predict_backbone_from_chain_records(
     [chain_records_inference],
     _inference_sampler,
-    device,
-    show_progress=True,
+    device
 )[0]
 with warnings.catch_warnings():
     warnings.simplefilter('ignore', PDBConstructionWarning)
@@ -1365,10 +1361,102 @@ def print_stats_by_mode(rmsds, is_edge):
             )
 
 
+def accumulate_per_atom_errors(
+    pred_local,
+    gt_local,
+    atom_sq_sums,
+    atom_counts,
+    atom_max_errs,
+):
+    bb_atom_idx = {name: i for i, name in enumerate(BACKBONE_ATOMS)}
+    op_match = {'OP1': 'OP1', 'OP2': 'OP2'}
+    j_op1 = bb_atom_idx['OP1']
+    j_op2 = bb_atom_idx['OP2']
+    pred_op1 = pred_local[j_op1]
+    pred_op2 = pred_local[j_op2]
+    gt_op1 = gt_local[j_op1]
+    gt_op2 = gt_local[j_op2]
+    if not (
+        np.isnan(pred_op1).any()
+        or np.isnan(pred_op2).any()
+        or np.isnan(gt_op1).any()
+        or np.isnan(gt_op2).any()
+    ):
+        direct_err = np.sum((pred_op1 - gt_op1) ** 2) + np.sum((pred_op2 - gt_op2) ** 2)
+        swapped_err = np.sum((pred_op1 - gt_op2) ** 2) + np.sum((pred_op2 - gt_op1) ** 2)
+        if swapped_err < direct_err:
+            op_match = {'OP1': 'OP2', 'OP2': 'OP1'}
+
+    for atom_name in BACKBONE_ATOMS:
+        pred_idx = bb_atom_idx[atom_name]
+        gt_idx = bb_atom_idx[op_match.get(atom_name, atom_name)]
+        pred_xyz = pred_local[pred_idx]
+        gt_xyz = gt_local[gt_idx]
+        if np.isnan(pred_xyz).any() or np.isnan(gt_xyz).any():
+            continue
+        sq_err = float(np.sum((pred_xyz - gt_xyz) ** 2))
+        err = float(np.sqrt(sq_err))
+        atom_sq_sums[atom_name] += sq_err
+        atom_counts[atom_name] += 1
+        atom_max_errs[atom_name] = max(atom_max_errs[atom_name], err)
+
+
+def summarize_per_atom_errors(atom_sq_sums, atom_counts, atom_max_errs):
+    total_sq = float(sum(atom_sq_sums.values()))
+    atom_rows = []
+    for atom_name in BACKBONE_ATOMS:
+        count = atom_counts[atom_name]
+        if not count:
+            continue
+        mean_sq = atom_sq_sums[atom_name] / count
+        atom_rows.append((
+            atom_name,
+            float(np.sqrt(mean_sq)),
+            100.0 * atom_sq_sums[atom_name] / max(total_sq, 1e-12),
+            count,
+            atom_max_errs[atom_name],
+        ))
+
+    print('\nPer-atom error contribution:')
+    for atom_name, atom_rmsd, contrib_pct, count, max_err in sorted(
+        atom_rows,
+        key=lambda row: row[2],
+        reverse=True,
+    ):
+        print(
+            f'  {atom_name:>4}: rmsd={atom_rmsd:.3f} A  '
+            f'contrib={contrib_pct:5.1f}%  '
+            f'max={max_err:.3f} A  '
+            f'n={count}'
+        )
+
+    if atom_rows:
+        atom_names = [row[0] for row in atom_rows]
+        atom_rmsds = [row[1] for row in atom_rows]
+        atom_contribs = [row[2] for row in atom_rows]
+
+        fig2, (ax_atom_rmsd, ax_atom_contrib) = plt.subplots(1, 2, figsize=(12, 4))
+        ax_atom_rmsd.bar(atom_names, atom_rmsds, color='steelblue')
+        ax_atom_rmsd.set_title('Per-atom RMSD')
+        ax_atom_rmsd.set_ylabel('RMSD (A)')
+        ax_atom_rmsd.tick_params(axis='x', rotation=45)
+
+        ax_atom_contrib.bar(atom_names, atom_contribs, color='indianred')
+        ax_atom_contrib.set_title('Contribution to total squared error')
+        ax_atom_contrib.set_ylabel('Contribution (%)')
+        ax_atom_contrib.tick_params(axis='x', rotation=45)
+
+        fig2.tight_layout()
+        plt.show()
+
+
 # %%
 print('\nOracle decoder RMSD:')
 oracle_rmsds_list: list[float] = []
 oracle_is_edge_list: list[bool] = []
+oracle_atom_sq_sums: defaultdict[str, float] = defaultdict(float)
+oracle_atom_counts: defaultdict[str, int] = defaultdict(int)
+oracle_atom_max_errs: defaultdict[str, float] = defaultdict(float)
 
 with torch.no_grad():
     for i in tqdm(
@@ -1386,200 +1474,42 @@ with torch.no_grad():
         tidx = int(data.target_nt_idx.item())
         oracle_is_edge_list.append(bool(data.is_chain_edge_nt[tidx].item()))
 
+        gt_bb_world = data.bb_xyz_world[tidx].detach().cpu().numpy()
+        origin = data.nt_origins_world[tidx].detach().cpu().numpy()
+        frame = data.nt_frames_world[tidx].detach().cpu().numpy()
+        gt_local = (gt_bb_world - origin) @ frame
+
+        restype = IDX_TO_BASE[int(data.base_types[tidx].argmax().item())]
+        o3_prev_local = None
+        if bool(data.o3_prev_valid[tidx].item()):
+            o3_prev_local = data.o3_prev_local[tidx].detach().cpu().numpy()
+        decoded = build_backbone_local(
+            theta0[0].detach().cpu().numpy(),
+            restype,
+            o3_prev_local=o3_prev_local,
+            tau_m=float(tau0[0].clamp(min=1e-3).item()),
+        )
+
+        pred_local = np.full((len(BACKBONE_ATOMS), 3), np.nan, dtype=np.float64)
+        for atom_idx, atom_name in enumerate(BACKBONE_ATOMS):
+            if atom_name in decoded:
+                pred_local[atom_idx] = np.asarray(decoded[atom_name], dtype=np.float64)
+        accumulate_per_atom_errors(
+            pred_local,
+            gt_local,
+            oracle_atom_sq_sums,
+            oracle_atom_counts,
+            oracle_atom_max_errs,
+        )
+
 oracle_rmsds = np.asarray(oracle_rmsds_list, dtype=np.float64)
 oracle_is_edge = np.asarray(oracle_is_edge_list, dtype=bool)
 print_stats_by_mode(oracle_rmsds, oracle_is_edge)
-
-# %% Real test-sample roundtrip through the same single-residue decoder path.
-idx_to_base_local = IDX_TO_BASE
-window_cache: dict[int, Any | None] = {}
-
-
-def match_test_window(base_idx: int) -> Any | None:
-    if base_idx in window_cache:
-        return window_cache[base_idx]
-
-    base = test_dataset.base.get(base_idx)
-    pdb_id = Path(test_dataset.base.data_list[base_idx]).parent.name
-    ref_bb = base.bb_xyz_world.detach().cpu()
-    match = None
-    for _, _, windows in parsed_chain_records(pdb_id):
-        for window, _, wdata in windows:
-            cand = wdata.bb_xyz_world.detach().cpu()
-            if not torch.equal(torch.isnan(cand), torch.isnan(ref_bb)):
-                continue
-            if torch.allclose(
-                torch.nan_to_num(cand),
-                torch.nan_to_num(ref_bb),
-                rtol=5e-4,
-                atol=5e-4,
-            ):
-                match = window
-                break
-        if match is not None:
-            break
-    window_cache[base_idx] = match
-    return match
-
-
-sample_rmsds: list[float] = []
-sample_is_edge: list[bool] = []
-atom_sq_sums: defaultdict[str, float] = defaultdict(float)
-atom_counts: defaultdict[str, int] = defaultdict(int)
-atom_max_errs: defaultdict[str, float] = defaultdict(float)
-skip_counts: defaultdict[str, int] = defaultdict(int)
-bb_atom_idx = {name: i for i, name in enumerate(BACKBONE_ATOMS)}
-
-for sample_idx in tqdm(
-    range(len(test_dataset)),
-    desc='single-residue roundtrip',
-    colour=PROGRESS_BAR_COLOR,
-):
-    data = cast(Data, test_dataset[sample_idx].clone())
-    base_idx, _ = test_dataset.virtual_entries[sample_idx]
-    window = match_test_window(base_idx)
-    if window is None:
-        skip_counts['unmatched_window'] += 1
-        continue
-
-    tidx = int(data.target_nt_idx.item())
-    origin = data.nt_origins_world[tidx].numpy()
-    frame = data.nt_frames_world[tidx].numpy()
-    if np.isnan(origin).any() or np.isnan(frame).any():
-        skip_counts['nan_target_frame'] += 1
-        continue
-
-    coords_local = coords_local_per_nt(window, origin, frame)
-    cur = coords_local[tidx]
-    prev = coords_local[tidx - 1] if tidx > 0 else None
-    next_nt = coords_local[tidx + 1] if tidx + 1 < len(coords_local) else None
-    restype = idx_to_base_local[int(data.base_types[tidx].argmax().item())]
-
-    torsions, tor_mask, tau_m, tau_ok = nucleotide_torsions(cur, prev, next_nt, restype)
-    if not tau_ok:
-        skip_counts['missing_tau_m'] += 1
-        continue
-    if not (
-        tor_mask[TOR_GAMMA]
-        and tor_mask[TOR_CHI]
-        and tor_mask[TOR_PSEUDOROTATION_PHASE]
-    ):
-        skip_counts['missing_single_residue_torsions'] += 1
-        continue
-
-    o3_prev_local = None
-    if prev is not None and "O3'" in prev:
-        o3_prev_local = np.asarray(prev["O3'"], dtype=np.float64)
-
-    decoded = build_backbone_local(
-        torsions,
-        restype,
-        o3_prev_local=o3_prev_local,
-        tau_m=float(tau_m),
-    )
-    gt_local = np.full((len(BACKBONE_ATOMS), 3), np.nan, dtype=np.float64)
-    pred_local_rt = np.full((len(BACKBONE_ATOMS), 3), np.nan, dtype=np.float64)
-    for atom_idx, atom_name in enumerate(BACKBONE_ATOMS):
-        if atom_name in cur:
-            gt_local[atom_idx] = np.asarray(cur[atom_name], dtype=np.float64)
-        if atom_name in decoded:
-            pred_local_rt[atom_idx] = np.asarray(decoded[atom_name], dtype=np.float64)
-
-    rmsd = local_backbone_rmsd(pred_local_rt, gt_local)
-    if not np.isfinite(rmsd):
-        skip_counts['no_shared_backbone'] += 1
-        continue
-
-    sample_rmsds.append(float(rmsd))
-    sample_is_edge.append(bool(data.is_chain_edge_nt[tidx].item()))
-
-    op_match = {'OP1': 'OP1', 'OP2': 'OP2'}
-    j_op1 = bb_atom_idx['OP1']
-    j_op2 = bb_atom_idx['OP2']
-    pred_op1 = pred_local_rt[j_op1]
-    pred_op2 = pred_local_rt[j_op2]
-    gt_op1 = gt_local[j_op1]
-    gt_op2 = gt_local[j_op2]
-    if not (
-        np.isnan(pred_op1).any()
-        or np.isnan(pred_op2).any()
-        or np.isnan(gt_op1).any()
-        or np.isnan(gt_op2).any()
-    ):
-        direct_err = np.sum((pred_op1 - gt_op1) ** 2) + np.sum((pred_op2 - gt_op2) ** 2)
-        swapped_err = np.sum((pred_op1 - gt_op2) ** 2) + np.sum((pred_op2 - gt_op1) ** 2)
-        if swapped_err < direct_err:
-            op_match = {'OP1': 'OP2', 'OP2': 'OP1'}
-
-    for atom_name in BACKBONE_ATOMS:
-        pred_idx = bb_atom_idx[atom_name]
-        gt_idx = bb_atom_idx[op_match.get(atom_name, atom_name)]
-        pred_xyz = pred_local_rt[pred_idx]
-        gt_xyz = gt_local[gt_idx]
-        if np.isnan(pred_xyz).any() or np.isnan(gt_xyz).any():
-            continue
-        sq_err = float(np.sum((pred_xyz - gt_xyz) ** 2))
-        err = float(np.sqrt(sq_err))
-        atom_sq_sums[atom_name] += sq_err
-        atom_counts[atom_name] += 1
-        atom_max_errs[atom_name] = max(atom_max_errs[atom_name], err)
-
-sample_rmsds_arr = np.asarray(sample_rmsds, dtype=np.float64)
-sample_is_edge_arr = np.asarray(sample_is_edge, dtype=bool)
-print('\nSingle-residue decoder roundtrip on real test samples:')
-print_stats_by_mode(sample_rmsds_arr, sample_is_edge_arr)
-
-if skip_counts:
-    print('\nSkipped samples:')
-    for reason, count in sorted(skip_counts.items()):
-        print(f'  {reason:>30}: {count}')
-
-total_sq = float(sum(atom_sq_sums.values()))
-atom_rows = []
-for atom_name in BACKBONE_ATOMS:
-    count = atom_counts[atom_name]
-    if not count:
-        continue
-    mean_sq = atom_sq_sums[atom_name] / count
-    atom_rows.append((
-        atom_name,
-        float(np.sqrt(mean_sq)),
-        100.0 * atom_sq_sums[atom_name] / max(total_sq, 1e-12),
-        count,
-        atom_max_errs[atom_name],
-    ))
-
-print('\nPer-atom error contribution:')
-for atom_name, atom_rmsd, contrib_pct, count, max_err in sorted(
-    atom_rows,
-    key=lambda row: row[2],
-    reverse=True,
-):
-    print(
-        f'  {atom_name:>4}: rmsd={atom_rmsd:.3f} A  '
-        f'contrib={contrib_pct:5.1f}%  '
-        f'max={max_err:.3f} A  '
-        f'n={count}'
-    )
-
-if atom_rows:
-    atom_names = [row[0] for row in atom_rows]
-    atom_rmsds = [row[1] for row in atom_rows]
-    atom_contribs = [row[2] for row in atom_rows]
-
-    fig2, (ax_atom_rmsd, ax_atom_contrib) = plt.subplots(1, 2, figsize=(12, 4))
-    ax_atom_rmsd.bar(atom_names, atom_rmsds, color='steelblue')
-    ax_atom_rmsd.set_title('Per-atom RMSD')
-    ax_atom_rmsd.set_ylabel('RMSD (A)')
-    ax_atom_rmsd.tick_params(axis='x', rotation=45)
-
-    ax_atom_contrib.bar(atom_names, atom_contribs, color='indianred')
-    ax_atom_contrib.set_title('Contribution to total squared error')
-    ax_atom_contrib.set_ylabel('Contribution (%)')
-    ax_atom_contrib.tick_params(axis='x', rotation=45)
-
-    fig2.tight_layout()
-    plt.show()
+summarize_per_atom_errors(
+    oracle_atom_sq_sums,
+    oracle_atom_counts,
+    oracle_atom_max_errs,
+)
 
 # %% Compare PHENIX run time with our model
 
@@ -1772,8 +1702,7 @@ def run_base2backbone_inference(
         predictions = predict_backbone_from_chain_records(
             [chain_records],
             adapter,
-            device,
-            show_progress=False,
+            device
         )[0]
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', PDBConstructionWarning)
@@ -1836,8 +1765,7 @@ def run_base2backbone_checkpoint_inference(
         predictions = predict_backbone_from_chain_records(
             [chain_records],
             adapter,
-            device,
-            show_progress=False,
+            device
         )[0]
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', PDBConstructionWarning)

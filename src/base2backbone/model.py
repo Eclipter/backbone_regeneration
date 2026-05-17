@@ -7,18 +7,21 @@ import torch.nn as nn
 from lightning.pytorch.loggers import TensorBoardLogger
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from torch_geometric.data import Batch
 
 from .bridge_closure import (CLOSURE_SIGMA_ANGLE_RAD, CLOSURE_SIGMA_BOND_A,
                              CLOSURE_SIGMA_TORSION_RAD,
                              compute_bridge_closure_loss)
-from .data import BACKBONE_ATOMS, BASE_TO_INDEX, N_CHAIN_END_CLASSES
+from .data import (BACKBONE_ATOMS, BASE_TO_INDEX, CHAIN_END_CLASS_3_PRIME,
+                   CHAIN_END_CLASS_5_PRIME, N_CHAIN_END_CLASSES)
 from .geometry import build_batch_window_backbone_from_torsions
 from .score_diffusion import (decode_torsions, encode_torsions,
                               estimate_latent_from_ve_score, perturb_torsions,
                               reverse_ve_score_ode_step, sigma_schedule,
                               ve_sigma_grid, weighted_score_mse, wrap_angle)
 from .torsion_constants import (LOG_TAU_M_MAX, LOG_TAU_M_MIN, N_LATENT,
-                                N_TORSIONS, TAU_M_MAX, TAU_M_MIN)
+                                N_TORSIONS, TAU_M_MAX, TAU_M_MIN, TOR_ALPHA,
+                                TOR_EPS, TOR_ZETA)
 
 # Same dimension constant name as in ONNX companion JSON (`N_TORSIONS_LATENT`).
 N_TORSIONS_LATENT = N_LATENT
@@ -287,6 +290,92 @@ class BackboneLightningModule(pl.LightningModule):
     def _build_x(self, batch, x_t_latent, log_sigma_per_graph, sc):
         prefix = self._build_static_x_prefix(batch)
         return self._build_x_from_prefix(prefix, batch, x_t_latent, log_sigma_per_graph, sc)
+
+    @staticmethod
+    def _prepare_target_view(sample_data, target_idx: int):
+        ws = int(sample_data.nt_origins_world.size(0))
+        dc = sample_data.clone()
+        dev = dc.nt_origins_world.device
+        dc.target_nt_idx = torch.tensor(target_idx, dtype=torch.long, device=dev)
+        is_target = torch.zeros(ws, dtype=torch.float32, device=dev)
+        is_target[target_idx] = 1.0
+        dc.is_target_nt = is_target.unsqueeze(-1)
+        origin_t = dc.nt_origins_world[target_idx]
+        frame_t = dc.nt_frames_world[target_idx]
+        dc.rel_origins = ((dc.nt_origins_world - origin_t) @ frame_t).float()
+        dc.rel_frames = torch.einsum('ji,njk->nik', frame_t, dc.nt_frames_world).float()
+        dc.pair_rel_origins = ((dc.pair_origins_world - origin_t) @ frame_t).float()
+        dc.pair_rel_frames = torch.einsum('ji,njk->nik', frame_t, dc.pair_frames_world).float()
+        return dc
+
+    def _inference_chain_end_mask(self, batch) -> torch.Tensor:
+        b, ws = self._b_ws(batch)
+        mask = torch.ones((b, ws, N_TORSIONS), dtype=torch.bool, device=batch.torsions.device)
+        ce = batch.chain_end_class.view(b, ws, N_CHAIN_END_CLASSES)
+        is_5prime = ce[..., CHAIN_END_CLASS_5_PRIME] > 0
+        is_3prime = ce[..., CHAIN_END_CLASS_3_PRIME] > 0
+        mask[..., TOR_ALPHA] &= ~is_5prime
+        mask[..., TOR_EPS] &= ~is_3prime
+        mask[..., TOR_ZETA] &= ~is_3prime
+        return mask
+
+    def _build_window_backbone(
+        self,
+        theta_w: torch.Tensor,
+        tau_w: torch.Tensor,
+        batch,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        b, ws = self._b_ws(batch)
+        restype = batch.base_types.view(b, ws, len(BASE_TO_INDEX)).argmax(-1)
+        origins_w = batch.nt_origins_world.view(b, ws, 3)
+        frames_w = batch.nt_frames_world.view(b, ws, 3, 3)
+        return build_batch_window_backbone_from_torsions(
+            theta_w,
+            tau_w,
+            restype.long(),
+            origins_w.float(),
+            frames_w.float(),
+            mask,
+        )
+
+    @torch.no_grad()
+    def _predict_eval_window(self, batch):
+        sample_data_list = batch.to_data_list()
+        target_samples = []
+        sample_keys: list[tuple[int, int]] = []
+        for graph_idx, data in enumerate(sample_data_list):
+            ws = int(data.nt_origins_world.size(0))
+            for target_idx in range(ws):
+                target_samples.append(self._prepare_target_view(data, target_idx))
+                sample_keys.append((graph_idx, target_idx))
+
+        if not target_samples:
+            raise ValueError('Cannot evaluate an empty batch.')
+
+        pred_batch = Batch.from_data_list(target_samples).to(self.device)
+        pred_theta_all, pred_tau_all = self.sample(pred_batch)
+        eval_batch = batch.to(pred_theta_all.device)
+        theta_w = torch.stack([data.torsions.clone() for data in sample_data_list], dim=0).to(
+            device=pred_theta_all.device,
+            dtype=pred_theta_all.dtype,
+        )
+        tau_w = torch.stack([data.tau_m.clone() for data in sample_data_list], dim=0).to(
+            device=pred_tau_all.device,
+            dtype=pred_tau_all.dtype,
+        )
+        for sample_idx, (graph_idx, target_idx) in enumerate(sample_keys):
+            theta_w[graph_idx, target_idx] = pred_theta_all[sample_idx]
+            tau_w[graph_idx, target_idx] = pred_tau_all[sample_idx]
+        tau_w = tau_w.clamp(min=TAU_M_MIN, max=TAU_M_MAX)
+        mask = self._inference_chain_end_mask(eval_batch)
+        coords_w = self._build_window_backbone(
+            theta_w.float(),
+            tau_w.float(),
+            eval_batch,
+            mask,
+        )
+        return eval_batch, theta_w, tau_w, coords_w
 
     def forward_score_network_from_prefix(self, prefix, batch, x_t_latent, log_sigma_per_graph, sc):
         b, _ = self._b_ws(batch)
@@ -618,6 +707,7 @@ class BackboneLightningModule(pl.LightningModule):
         pred_torsions: torch.Tensor,
         pred_tau_m: torch.Tensor,
         batch,
+        coords_w: torch.Tensor | None = None,
     ) -> torch.Tensor:
         _require_window_batch_fields(batch)
         if batch.torsions.shape[-1] != N_TORSIONS:
@@ -638,24 +728,17 @@ class BackboneLightningModule(pl.LightningModule):
         frames = batch.nt_frames_world.view(b, ws, 3, 3)[bi, ti]
         gt_local = (gt_bb_world - origins.unsqueeze(1)) @ frames
 
-        theta_w = batch.torsions.view(b, ws, N_TORSIONS).clone()
-        tau_w = batch.tau_m.view(b, ws).clone()
-        theta_w[bi, ti] = pred_torsions.float()
-        tau_w[bi, ti] = pred_tau_m.clamp(min=TAU_M_MIN, max=TAU_M_MAX).float()
-
-        restype = batch.base_types.view(b, ws, len(BASE_TO_INDEX)).argmax(-1)
-        mask = batch.torsion_mask.view(b, ws, N_TORSIONS)
-        origins_w = batch.nt_origins_world.view(b, ws, 3)
-        frames_w = batch.nt_frames_world.view(b, ws, 3, 3)
-
-        coords_w = build_batch_window_backbone_from_torsions(
-            theta_w,
-            tau_w,
-            restype.long(),
-            origins_w.float(),
-            frames_w.float(),
-            mask,
-        )
+        if coords_w is None:
+            theta_w = batch.torsions.view(b, ws, N_TORSIONS).clone()
+            tau_w = batch.tau_m.view(b, ws).clone()
+            theta_w[bi, ti] = pred_torsions.float()
+            tau_w[bi, ti] = pred_tau_m.clamp(min=TAU_M_MIN, max=TAU_M_MAX).float()
+            coords_w = self._build_window_backbone(
+                theta_w,
+                tau_w,
+                batch,
+                batch.torsion_mask.view(b, ws, N_TORSIONS),
+            )
         pred_bb_world = coords_w[bi, ti]
         pred_local = (pred_bb_world - origins.unsqueeze(1)) @ frames
 
@@ -696,12 +779,65 @@ class BackboneLightningModule(pl.LightningModule):
         out = torch.where(ok, torch.sqrt(contrib / count), out)
         return out.to(pred_torsions.dtype)
 
+    def _bridge_closure_metrics_full_window(
+        self,
+        theta_w: torch.Tensor,
+        tau_w: torch.Tensor,
+        batch,
+        bb_world: torch.Tensor | None = None,
+    ) -> dict:
+        b, ws = self._b_ws(batch)
+        ti = batch.target_nt_idx.long()
+        bi = torch.arange(b, device=tau_w.device)
+        if bb_world is None:
+            bb_world = self._build_window_backbone(
+                theta_w.float(),
+                tau_w.float(),
+                batch,
+                self._inference_chain_end_mask(batch),
+            )
+        pair_mask = torch.zeros(b, ws - 1, dtype=torch.bool, device=tau_w.device)
+        mk_l = ti > 0
+        pair_mask[bi[mk_l], ti[mk_l] - 1] = True
+        mk_r = ti < ws - 1
+        pair_mask[bi[mk_r], ti[mk_r]] = True
+        restype = batch.base_types.view(b, ws, len(BASE_TO_INDEX)).argmax(-1)
+        weights = {
+            'bond': float(self.hparams.get('closure_bond_weight', 1.0)),
+            'angle': float(self.hparams.get('closure_angle_weight', 1.0)),
+            'torsion': float(self.hparams.get('closure_torsion_weight', 1.0)),
+        }
+        geometry = {
+            'sigma_bond': float(self.hparams.get('closure_sigma_bond_a', CLOSURE_SIGMA_BOND_A)),
+            'sigma_angle_rad': float(self.hparams.get('closure_sigma_angle_rad', CLOSURE_SIGMA_ANGLE_RAD)),
+            'sigma_torsion_rad': float(self.hparams.get('closure_sigma_torsion_rad', CLOSURE_SIGMA_TORSION_RAD)),
+        }
+        return compute_bridge_closure_loss(
+            bb_world,
+            batch.torsions.view(b, ws, N_TORSIONS),
+            self._inference_chain_end_mask(batch),
+            restype.long(),
+            same_chain_mask=None,
+            valid_pair_mask=pair_mask,
+            geometry=geometry,
+            weights=weights,
+            grad_prop_tensor=theta_w[bi, ti],
+        )
+
     def _log_rmsd(
-        self, prefix: str, pred_theta: torch.Tensor, pred_tau_m: torch.Tensor, batch,
+        self,
+        prefix: str,
+        pred_theta: torch.Tensor,
+        pred_tau_m: torch.Tensor,
+        batch,
+        coords_w: torch.Tensor | None = None,
     ):
-        """Oracle-context window RMSD (GT neighbor torsions, predicted target); TensorBoard step log."""
+        """TensorBoard RMSD for the target nucleotide in each window."""
         per_graph_rmsd = self._compute_rmsd_per_graph_local(
-            pred_theta, pred_tau_m, batch,
+            pred_theta,
+            pred_tau_m,
+            batch,
+            coords_w=coords_w,
         )
         is_edge = self._is_edge_target(batch)
         finite = torch.isfinite(per_graph_rmsd)
@@ -719,10 +855,13 @@ class BackboneLightningModule(pl.LightningModule):
                 )
 
     def validation_step(self, batch, batch_idx):
-        _, (pred_theta, pred_tau_m) = self.p_sample_loop(batch)
-        self._log_rmsd('val', pred_theta, pred_tau_m, batch)
-        pred_x0 = encode_torsions(pred_theta, pred_tau_m)
-        clo = self._bridge_closure_metrics(pred_x0, batch)
+        eval_batch, theta_w, tau_w, coords_w = self._predict_eval_window(batch)
+        bi = torch.arange(eval_batch.num_graphs, device=coords_w.device)
+        ti = eval_batch.target_nt_idx.long()
+        pred_theta = theta_w[bi, ti]
+        pred_tau_m = tau_w[bi, ti]
+        self._log_rmsd('val', pred_theta, pred_tau_m, eval_batch, coords_w=coords_w)
+        clo = self._bridge_closure_metrics_full_window(theta_w, tau_w, eval_batch, bb_world=coords_w)
         for key, val in clo.items():
             self.log(
                 f'diagnostics/val/{key}',
@@ -735,8 +874,16 @@ class BackboneLightningModule(pl.LightningModule):
             )
 
     def test_step(self, batch, _):
-        _, (pred_theta, pred_tau_m) = self.p_sample_loop(batch)
-        self._log_rmsd('test', pred_theta, pred_tau_m, batch)
+        eval_batch, theta_w, tau_w, coords_w = self._predict_eval_window(batch)
+        bi = torch.arange(eval_batch.num_graphs, device=coords_w.device)
+        ti = eval_batch.target_nt_idx.long()
+        self._log_rmsd(
+            'test',
+            theta_w[bi, ti],
+            tau_w[bi, ti],
+            eval_batch,
+            coords_w=coords_w,
+        )
 
     @torch.no_grad()
     def sample(self, batch, num_timesteps: int | None = None):

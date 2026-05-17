@@ -9,7 +9,7 @@ import base2backbone.inference as pred_mod
 
 def test_val_rmsd_impl_calls_window_backbone_builder_only():
     src = inspect.getsource(BackboneLightningModule._compute_rmsd_per_graph_local)
-    assert 'build_batch_window_backbone_from_torsions' in src
+    assert '_build_window_backbone' in src
     assert 'build_backbone_from_torsions' not in src
 
 

@@ -9,7 +9,7 @@ from torch_geometric.data import Batch, Data
 import base2backbone.model as model_module
 from base2backbone.data import BACKBONE_ATOMS
 from base2backbone.model import BackboneLightningModule
-from base2backbone.torsion_constants import N_LATENT, N_TORSIONS
+from base2backbone.torsion_constants import N_LATENT, N_TORSIONS, TAU_M_MAX
 from base2backbone.score_diffusion import encode_torsions
 
 
@@ -101,7 +101,8 @@ def test_bridge_closure_metrics_returns_finite_dict():
 def test_validation_step_source_always_logs_val_closure():
     src = inspect.getsource(BackboneLightningModule.validation_step)
     assert 'log_closure_metrics_val' not in src
-    assert '_bridge_closure_metrics' in src
+    assert '_predict_eval_window' in src
+    assert '_bridge_closure_metrics_full_window' in src
     assert "f'diagnostics/val/{key}'" in src.replace(' ', '')
 
 
@@ -349,6 +350,67 @@ def test_rmsd_ignores_invalid_non_op_atoms(monkeypatch):
 
     assert torch.isfinite(rmsd).all()
     assert torch.allclose(rmsd, torch.zeros_like(rmsd))
+
+
+def test_predict_eval_window_retargets_all_positions(monkeypatch):
+    hp = dict(
+        hidden_dim=32,
+        num_heads=4,
+        num_layers=1,
+        num_timesteps=2,
+        batch_size=1,
+        lr=1e-3,
+        lr_scheduler=None,
+        lr_scheduler_patience=1,
+        lr_scheduler_threshold=0.1,
+        lr_scheduler_cooldown=0,
+        angular_sigma_min=0.05,
+        angular_sigma_max=0.15,
+        tau_sigma_min=0.05,
+        tau_sigma_max=0.15,
+        tau_loss_weight=1.0,
+        score_loss_weighting='sigma2',
+        weight_decay=0.01,
+        closure_loss_weight=0.0,
+        closure_bond_weight=1.0,
+        closure_angle_weight=1.0,
+        closure_torsion_weight=1.0,
+    )
+    mod = BackboneLightningModule(**cast(Any, hp)).eval()
+    batch = _minimal_train_batch()
+    ws = batch.torsions.size(0)
+    seen_target_nt: list[torch.Tensor] = []
+
+    def _stub_sample(self, batch, num_timesteps=None):  # noqa: ARG001
+        seen_target_nt.append(batch.is_target_nt.detach().cpu().clone())
+        vals = torch.arange(batch.num_graphs, dtype=torch.float32, device=batch.torsions.device)
+        pred_theta = vals.unsqueeze(-1).expand(batch.num_graphs, N_TORSIONS)
+        pred_tau_m = vals + 0.5
+        return pred_theta, pred_tau_m
+
+    monkeypatch.setattr(BackboneLightningModule, 'sample', _stub_sample)
+    monkeypatch.setattr(
+        BackboneLightningModule,
+        '_build_window_backbone',
+        lambda self, theta_w, tau_w, batch, mask: torch.zeros(
+            batch.num_graphs,
+            ws,
+            len(BACKBONE_ATOMS),
+            3,
+            dtype=theta_w.dtype,
+            device=theta_w.device,
+        ),
+    )
+
+    _eval_batch, theta_w, tau_w, _coords_w = mod._predict_eval_window(batch)
+
+    assert len(seen_target_nt) == 1
+    got = seen_target_nt[0].view(ws, ws, 1).squeeze(-1)
+    assert torch.equal(got, torch.eye(ws, dtype=torch.float32))
+    expected_theta = torch.arange(ws, dtype=torch.float32).unsqueeze(-1).expand(ws, N_TORSIONS)
+    expected_tau = (torch.arange(ws, dtype=torch.float32) + 0.5).clamp(max=TAU_M_MAX)
+    assert torch.allclose(theta_w.squeeze(0), expected_theta)
+    assert torch.allclose(tau_w.squeeze(0), expected_tau)
 
 
 test_sampler_shapes_finite = test_p_sample_loop_finite_shapes_with_stub_scores

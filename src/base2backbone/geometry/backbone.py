@@ -12,6 +12,7 @@ from ..torsion_constants import (
     TOR_ALPHA,
     TOR_BETA,
     TOR_CHI,
+    TOR_DELTA,
     TOR_EPS,
     TOR_ETA_P,
     TOR_GAMMA,
@@ -776,11 +777,12 @@ def build_sugar_ring_closed_form(
 
 def add_exocyclic_sugar_atoms(
     ring_atoms: dict[str, torch.Tensor],
+    delta: torch.Tensor,
     *,
     restype_indices: Optional[torch.Tensor] = None,
     geometry: Optional[dict] = None,
 ) -> dict[str, torch.Tensor]:
-    """Add O3' and C5' using template stereochemistry (fixed ψ from template)."""
+    """Add C5' from template geometry and O3' from the predicted δ torsion."""
     g = geometry or {}
     ri = restype_indices if restype_indices is not None else ring_atoms.get('_ri')
     if ri is None:
@@ -788,10 +790,12 @@ def add_exocyclic_sugar_atoms(
     o4 = ring_atoms["O4'"]
     c3 = ring_atoms["C3'"]
     c4 = ring_atoms["C4'"]
+    d = delta
     if o4.ndim == 1:
         o4 = o4.unsqueeze(0)
         c3 = c3.unsqueeze(0)
         c4 = c4.unsqueeze(0)
+        d = d.reshape(1)
         squeeze = True
     else:
         squeeze = False
@@ -811,10 +815,10 @@ def add_exocyclic_sugar_atoms(
         _template_select(tc, 'psi_c5', ri, dtype=dtype) - half_pi,
     )
     o3 = nerf_place(
-        o4, c4, c3,
+        c5, c4, c3,
         _template_select(tc, 'bl_o3_c3', ri, dtype=dtype),
         _template_select(tc, 'ba_c4_c3_o3', ri, dtype=dtype),
-        _template_select(tc, 'psi_o3_ring', ri, dtype=dtype) - half_pi,
+        d - half_pi,
     )
 
     out = dict(ring_atoms)
@@ -1092,12 +1096,13 @@ def build_backbone_from_torsions(
     chi = torsions[:, TOR_CHI]
     P = torsions[:, TOR_PSEUDOROTATION_PHASE]
     gamma = torsions[:, TOR_GAMMA]
+    delta = torsions[:, TOR_DELTA]
     alpha = torsions[:, TOR_ALPHA]
     beta = torsions[:, TOR_BETA]
     eps_lat = torsions[:, TOR_EPS]
     zet_lat = torsions[:, TOR_ZETA]
     ring = build_sugar_ring_closed_form(chi, P, tau_m, ri, geometry=geometry)
-    atoms = add_exocyclic_sugar_atoms(ring, restype_indices=ri, geometry=geometry)
+    atoms = add_exocyclic_sugar_atoms(ring, delta, restype_indices=ri, geometry=geometry)
     atoms = add_o5_from_gamma(atoms, gamma, restype_indices=ri, geometry=geometry)
 
     out = {
@@ -1195,7 +1200,12 @@ def build_batch_window_backbone_from_torsions(
     chi = flat_t[:, TOR_CHI]
     P_rad = flat_t[:, TOR_PSEUDOROTATION_PHASE]
     ring = build_sugar_ring_closed_form(chi, P_rad, flat_tm, flat_ri, geometry=geometry)
-    atoms = add_exocyclic_sugar_atoms(ring, restype_indices=flat_ri, geometry=geometry)
+    atoms = add_exocyclic_sugar_atoms(
+        ring,
+        flat_t[:, TOR_DELTA],
+        restype_indices=flat_ri,
+        geometry=geometry,
+    )
     atoms = add_o5_from_gamma(
         atoms, flat_t[:, TOR_GAMMA], restype_indices=flat_ri, geometry=geometry,
     )
@@ -1344,7 +1354,7 @@ def build_chain_backbone_from_predictions(
     if theta.dim() == 2:
         if tau_m.dim() != 1 or restype_indices.dim() != 1:
             raise ValueError(
-                f'Expected tau_m [N], restype [N] with theta [N,7]; '
+                f'Expected tau_m [N], restype [N] with theta [N,{N_TORSIONS}]; '
                 f'got tau {tuple(tau_m.shape)}, ri {tuple(restype_indices.shape)}',
             )
         if nt_origins_world.shape[0] != theta.shape[0] or nt_frames_world.shape[0] != theta.shape[0]:

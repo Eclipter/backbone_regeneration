@@ -1,4 +1,4 @@
-"""Layout invariants: no δ in generative torsion channels, model I/O, or builder API."""
+"""Layout invariants for the packed torsion latent and builder API."""
 
 import inspect
 import re
@@ -20,8 +20,8 @@ _MODEL_PY = _SRC / 'model.py'
 
 
 def test_torsion_counts():
-    assert N_TORSIONS == 8
-    assert N_LATENT == 9
+    assert N_TORSIONS == 9
+    assert N_LATENT == 10
     assert N_TORSIONS_LATENT == N_LATENT
 
 
@@ -33,10 +33,10 @@ def test_model_score_network_output_is_n_latent():
     )
 
 
-def test_model_source_has_no_tor_delta_or_ascii_delta_in_plm():
+def test_model_source_uses_delta_torsion_layout():
     text = _MODEL_PY.read_text()
     assert 'TOR_DELTA' not in text
-    assert 'delta' not in text.lower()
+    assert 'N_TORSIONS' in text
 
 
 def test_training_logs_named_loss_not_per_torsion_delta():
@@ -53,7 +53,7 @@ def test_coordinate_builders_have_no_delta_parameter():
 @pytest.mark.parametrize(
     'restype', ('A', 'C', 'G', 'T'),
 )
-def test_backbone_torch_runs_with_eight_angles(restype):
+def test_backbone_torch_runs_with_nine_angles(restype):
     ri = torch.tensor([{'A': 0, 'C': 1, 'G': 2, 'T': 3}[restype]])
     theta = torch.zeros(1, N_TORSIONS)
     tau = torch.tensor([0.35])

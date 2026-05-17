@@ -126,15 +126,15 @@ def test_score_target_differs_from_naive_gaussian_score_when_wrapping_matters():
 
 
 def test_no_sincos_latent_constants():
-    assert N_LATENT == 9 and N_TORSIONS == 8
-    assert 'delta' not in TORSION_NAMES
+    assert N_LATENT == 10 and N_TORSIONS == 9
+    assert 'delta' in TORSION_NAMES
 
 
 test_wrapped_constants_layout = test_no_sincos_latent_constants
 
 
-def test_delta_absent():
-    assert 'delta' not in TORSION_NAMES
+def test_delta_present():
+    assert 'delta' in TORSION_NAMES
 
 
 def test_decode_clamps_extreme_log_tau():
@@ -242,7 +242,7 @@ def test_sigma_schedule_endpoints():
 def test_perturb_raises_on_wrong_torsion_width():
     with pytest.raises(ValueError, match='theta_0 last dimension'):
         perturb_torsions(
-            torch.randn(2, 7),   # wrong width (N_TORSIONS is now 8)
+            torch.randn(2, 8),   # wrong width (N_TORSIONS is now 9)
             torch.randn(2, 1),
             torch.rand(2),
             0.1,
@@ -319,5 +319,5 @@ def test_torsion_score_network_out_features_is_packed_latent():
         closure_torsion_weight=1.0,
     )
     pl_mod = BackboneLightningModule(**cast(Any, hp)).float()
-    assert pl_mod.score_network.out.out_features == N_LATENT == 9
+    assert pl_mod.score_network.out.out_features == N_LATENT == 10
     assert pl_mod.score_network.out.out_features != N_TORSIONS * 2 + 1

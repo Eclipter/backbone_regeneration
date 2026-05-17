@@ -11,6 +11,7 @@ from ..torsion_constants import (
     TOR_ALPHA,
     TOR_BETA,
     TOR_CHI,
+    TOR_DELTA,
     TOR_EPS,
     TOR_ETA_P,
     TOR_GAMMA,
@@ -84,6 +85,7 @@ def nucleotide_torsions(xyz_by_name_cur, xyz_by_name_prev, xyz_by_name_next, bas
     _set(TOR_ALPHA, o3_prev, p_cur, o5, c5)
     _set(TOR_BETA,  p_cur, o5, c5, c4)
     _set(TOR_GAMMA, o5, c5, c4, c3)
+    _set(TOR_DELTA, c5, c4, c3, o3_cur)
     _set(TOR_EPS,   c4, c3, o3_cur, p_next)
     _set(TOR_ZETA,  c3, o3_cur, p_next, o5_next)
 

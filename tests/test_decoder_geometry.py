@@ -41,6 +41,10 @@ def _template_tc(dev):
     return _get_template_tensors(str(dev))
 
 
+def _template_delta(dev, ri: torch.Tensor) -> torch.Tensor:
+    return _template_tc(dev)['psi_o3'][ri.long()]
+
+
 @pytest.fixture
 def device():
     return torch.device('cpu')
@@ -97,7 +101,7 @@ def test_chi_scan_matches_measured_dihedral_preserves_pucker_and_sugar_metric(de
     dist_ref = None
     for chi in chis:
         ring = build_sugar_ring_closed_form(chi.unsqueeze(0), P, tau_m, ri)
-        atoms = add_exocyclic_sugar_atoms(ring, restype_indices=ri)
+        atoms = add_exocyclic_sugar_atoms(ring, _template_delta(device, ri), restype_indices=ri)
         mchi = dihedral_rad(
             atoms["O4'"].reshape(1, 3),
             atoms["C1'"].reshape(1, 3),
@@ -181,7 +185,7 @@ def test_exocyclic_stereochemistry(device):
     tau = torch.tensor([0.34], device=device)
     chi = torch.zeros(1, device=device)
     ring = build_sugar_ring_closed_form(chi, P, tau, ri)
-    atoms = add_exocyclic_sugar_atoms(ring, restype_indices=ri)
+    atoms = add_exocyclic_sugar_atoms(ring, _template_delta(device, ri), restype_indices=ri)
     tc = _template_tc(device)
     l_o3 = tc['bl_o3_c3'][ri]
     l_c5 = tc['bl_c5_c4'][ri]
@@ -196,26 +200,21 @@ def test_exocyclic_stereochemistry(device):
     assert ch_geo.item() * tc['ring_chiral_triple'][ri].item() > 0
 
 
-def test_o3_depends_only_on_ring_geometry(device):
+def test_o3_follows_predicted_delta_not_template_o3_prior(device):
     ri = torch.tensor([0], device=device)
     P = torch.tensor([0.2], device=device)
     tau = torch.tensor([0.34], device=device)
     chi = torch.tensor([0.1], device=device)
     ring = build_sugar_ring_closed_form(chi, P, tau, ri)
     tc = _template_tc(device)
+    delta = tc['psi_o3'][ri]
     base_atoms = add_exocyclic_sugar_atoms(
-        ring, restype_indices=ri, geometry={'template_tensors': tc},
+        ring, delta, restype_indices=ri, geometry={'template_tensors': tc},
     )
     tc_shifted = {key: value.clone() for key, value in tc.items()}
-    tc_shifted['psi_c5'][ri] = tc_shifted['psi_c5'][ri] + 0.75
+    tc_shifted['psi_o3_ring'][ri] = tc_shifted['psi_o3_ring'][ri] + 0.75
     shifted_atoms = add_exocyclic_sugar_atoms(
-        ring, restype_indices=ri, geometry={'template_tensors': tc_shifted},
-    )
-    assert not torch.allclose(
-        shifted_atoms["C5'"],
-        base_atoms["C5'"],
-        atol=1e-4,
-        rtol=1e-4,
+        ring, delta, restype_indices=ri, geometry={'template_tensors': tc_shifted},
     )
     assert torch.allclose(
         shifted_atoms["O3'"],
@@ -225,13 +224,30 @@ def test_o3_depends_only_on_ring_geometry(device):
     )
 
 
+def test_o3_measured_delta_matches_input(device):
+    ri = torch.tensor([0], device=device)
+    P = torch.tensor([0.2], device=device)
+    tau = torch.tensor([0.34], device=device)
+    chi = torch.tensor([0.1], device=device)
+    ring = build_sugar_ring_closed_form(chi, P, tau, ri)
+    delta = torch.tensor([0.7], device=device)
+    atoms = add_exocyclic_sugar_atoms(ring, delta, restype_indices=ri)
+    delta_meas = dihedral_rad(
+        atoms["C5'"],
+        atoms["C4'"],
+        atoms["C3'"],
+        atoms["O3'"],
+    )
+    assert wrap_dihedral_diff(delta_meas, delta).abs().item() < 0.05
+
+
 def test_gamma_places_o5(device):
     ri = torch.tensor([2], device=device)
     P = torch.tensor([-0.1], device=device)
     tau = torch.tensor([0.32], device=device)
     chi = torch.zeros(1, device=device)
     ring = build_sugar_ring_closed_form(chi, P, tau, ri)
-    atoms = add_exocyclic_sugar_atoms(ring, restype_indices=ri)
+    atoms = add_exocyclic_sugar_atoms(ring, _template_delta(device, ri), restype_indices=ri)
     gam = torch.tensor([0.55], device=device)
     atoms = add_o5_from_gamma(atoms, gam, restype_indices=ri)
     g_meas = dihedral_rad(

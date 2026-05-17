@@ -186,13 +186,14 @@ def test_sugar_ring_from_xy_z_contract(device='cpu'):
     assert torch.isfinite(out).all()
 
 
-def test_closed_form_no_delta_no_sincos():
-    assert N_TORSIONS == 8
-    assert N_LATENT == 9
+def test_closed_form_with_delta_layout_no_sincos():
+    assert N_TORSIONS == 9
+    assert N_LATENT == 10
     assert TORSION_NAMES == (
         'alpha',
         'beta',
         'gamma',
+        'delta',
         'epsilon',
         'zeta',
         'chi',
@@ -207,9 +208,9 @@ def test_closed_form_no_delta_no_sincos():
     assert re.search(r'N_TORSIONS\s*\*\s*2', txt) is None
     assert 'angular_score_target' in txt
     assert 'weighted_score_mse' in txt
-    B = torch.zeros(2, 3, 8)
-    pred = torch.randn(2, 3, 8)
-    m = torch.ones(2, 3, 8, dtype=torch.bool)
+    B = torch.zeros(2, 3, N_TORSIONS)
+    pred = torch.randn(2, 3, N_TORSIONS)
+    m = torch.ones(2, 3, N_TORSIONS, dtype=torch.bool)
     loss = weighted_score_mse(pred, B, m, None, weighting='none')
     assert torch.isfinite(loss)
 

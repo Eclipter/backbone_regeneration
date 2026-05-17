@@ -7,7 +7,13 @@ import torch
 
 from .data import BASE_TO_INDEX, N_CHAIN_END_CLASSES
 from .torsion_constants import LOG_TAU_M_MAX, LOG_TAU_M_MIN, N_LATENT, N_TORSIONS
-from .score_diffusion import decode_torsions, reverse_ve_score_ode_step, ve_sigma_grid, wrap_angle
+from .score_diffusion import (
+    decode_torsions,
+    estimate_latent_from_ve_score,
+    reverse_ve_score_ode_step,
+    ve_sigma_grid,
+    wrap_angle,
+)
 
 
 class OnnxSampler:
@@ -129,6 +135,14 @@ class OnnxSampler:
                 dtype=dtype,
             )
             pred = self.forward_score_network(batch, x_t, log_s, sc)
+            sc = estimate_latent_from_ve_score(
+                x_t[..., :N_TORSIONS],
+                x_t[..., N_TORSIONS:N_LATENT],
+                pred,
+                sigma_cur_th,
+                sigma_cur_tau,
+            ).detach()
+            sc = torch.nan_to_num(sc)
             theta, logt = reverse_ve_score_ode_step(
                 x_t[..., :N_TORSIONS],
                 x_t[..., N_TORSIONS:N_LATENT],
@@ -139,7 +153,6 @@ class OnnxSampler:
                 sigma_next_tau,
             )
             x_t = torch.cat([theta, logt], dim=-1)
-            sc = torch.zeros_like(x_t)
             if not torch.isfinite(x_t).all():
                 x_t = torch.nan_to_num(x_t, nan=0.0, posinf=np.pi, neginf=-np.pi)
                 theta = wrap_angle(x_t[..., :N_TORSIONS])

@@ -15,7 +15,7 @@ from ..torsion_constants import (
     TOR_GAMMA,
     TOR_PSEUDOROTATION_PHASE,
 )
-from .primitives import _dihedral_rad, dihedral_rad
+from .primitives import GEO_EPS_SQ, _dihedral_rad, dihedral_rad
 
 RING_TORSION_DEFS = (
     ("C1'", "C2'", "C3'", "C4'"),
@@ -93,9 +93,8 @@ def bridge_circle_geometry_torch(
     e = axis / d.unsqueeze(-1)
     a = (r_a * r_a - r_b * r_b + d * d) / (2.0 * d)
     center = anchor_a + a.unsqueeze(-1) * e
-    # eps**2 inside sqrt: at degenerate triangles (r_a^2 - a^2 = 0), sqrt'(0) = +inf
-    # propagates to NaN in upstream grads. Additive eps**2 regularises the backward.
-    radius = torch.sqrt((r_a * r_a - a * a).clamp(min=0.0) + eps * eps)
+    # Infeasible/degenerate bridge circles have radius^2 = 0. Keep sqrt backward finite.
+    radius = torch.sqrt((r_a * r_a - a * a).clamp(min=0.0) + GEO_EPS_SQ)
 
     x_axis = torch.zeros_like(e)
     x_axis[..., 0] = 1.0
@@ -148,6 +147,10 @@ def bridge_phase_from_points_torch(
     q = phosphate - center
     x = (q * u).sum(dim=-1)
     y = (q * v).sum(dim=-1)
+    # atan2(0, 0) is finite forward but has undefined backward; use the same guard as dihedral_rad.
+    ok = (x * x + y * y) > GEO_EPS_SQ
+    x = torch.where(ok, x, torch.ones_like(x))
+    y = torch.where(ok, y, torch.zeros_like(y))
     return torch.atan2(y, x)
 
 

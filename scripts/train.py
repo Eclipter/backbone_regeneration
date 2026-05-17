@@ -10,7 +10,7 @@ from pathlib import Path
 
 import lightning.pytorch as pl
 import torch
-from config import BASE, DATASET_MANIFEST, EXPERIMENTS, RUN_NAME, SEED
+from config import BASE, EXPERIMENTS
 from lightning.pytorch.callbacks import (ModelCheckpoint,
                                          StochasticWeightAveraging)
 from lightning.pytorch.loggers import TensorBoardLogger
@@ -88,6 +88,18 @@ def train_one(cfg):
         closure_sigma_bond_a=cfg['CLOSURE_SIGMA_BOND_A'],
         closure_sigma_angle_rad=math.radians(cfg['CLOSURE_SIGMA_ANGLE_DEG']),
         closure_sigma_torsion_rad=cfg['CLOSURE_SIGMA_TORSION_RAD'],
+        closure_sigma_angle_deg=cfg['CLOSURE_SIGMA_ANGLE_DEG'],
+        edge_weight=cfg['EDGE_WEIGHT'],
+        seed=cfg['SEED'],
+        dataset_manifest=cfg['DATASET_MANIFEST'],
+        run_name=cfg['RUN_NAME'],
+        run_version=cfg['RUN_VERSION'],
+        num_epochs=cfg['NUM_EPOCHS'],
+        swa=cfg['SWA'],
+        swa_lr=cfg['SWA_LR'],
+        swa_epoch_start=cfg['SWA_EPOCH_START'],
+        torch_compile=cfg['TORCH_COMPILE'],
+        start_from_last_ckpt=cfg['START_FROM_LAST_CKPT'],
     )
 
     log_dir, run_name, run_version, ckpt_path = _get_run_paths(cfg)
@@ -162,9 +174,6 @@ def main():
 
     for exp in EXPERIMENTS:
         run_cfg = {**BASE, **exp}
-        run_cfg['RUN_NAME'] = RUN_NAME
-        run_cfg['DATASET_MANIFEST'] = DATASET_MANIFEST
-        run_cfg['SEED'] = SEED
         run_cfg['RUN_VERSION'] = _make_run_version(run_cfg, BASE)
         rank_zero_info(f'\n\033[1;38;5;93mRunning experiment: {run_cfg["RUN_VERSION"]}\033[0m')
         train_one(run_cfg)

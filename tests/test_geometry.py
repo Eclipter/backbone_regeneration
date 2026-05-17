@@ -19,7 +19,11 @@ from base2backbone.geometry.backbone import (
     _get_template,
     world_to_local_points,
 )
-from base2backbone.geometry import bridge_phase_from_points
+from base2backbone.geometry import (
+    bridge_circle_geometry_torch,
+    bridge_phase_from_points,
+    bridge_phase_from_points_torch,
+)
 from base2backbone.score_diffusion import decode_torsions, encode_torsions, wrap_angle
 
 
@@ -88,6 +92,37 @@ def test_bridge_phase_roundtrip_from_template():
     )
     d = float(np.arctan2(np.sin(got - bridge_phase), np.cos(got - bridge_phase)))
     assert abs(d) < 0.2
+
+
+def test_bridge_circle_degenerate_backward_is_finite():
+    anchor_a = torch.tensor([[0.0, 0.0, 0.0]], requires_grad=True)
+    anchor_b = torch.tensor([[3.0, 0.0, 0.0]], requires_grad=True)
+    r_a = torch.tensor([1.0])
+    r_b = torch.tensor([1.0])
+
+    center, radius, u, v = bridge_circle_geometry_torch(anchor_a, anchor_b, r_a, r_b)
+    loss = center.square().sum() + radius.square().sum() + u.square().sum() + v.square().sum()
+    assert torch.isfinite(loss)
+
+    loss.backward()
+    assert torch.isfinite(anchor_a.grad).all()
+    assert torch.isfinite(anchor_b.grad).all()
+
+
+def test_bridge_phase_at_circle_center_backward_is_finite():
+    anchor_a = torch.tensor([[0.0, 0.0, 0.0]], requires_grad=True)
+    anchor_b = torch.tensor([[2.0, 0.0, 0.0]], requires_grad=True)
+    phosphate = torch.tensor([[1.0, 0.0, 0.0]], requires_grad=True)
+    r_a = torch.tensor([1.0])
+    r_b = torch.tensor([1.0])
+
+    phase = bridge_phase_from_points_torch(anchor_a, anchor_b, phosphate, r_a, r_b)
+    assert torch.isfinite(phase).all()
+
+    phase.sum().backward()
+    assert torch.isfinite(anchor_a.grad).all()
+    assert torch.isfinite(anchor_b.grad).all()
+    assert torch.isfinite(phosphate.grad).all()
 
 
 def test_tau_m_encode_decode_roundtrip():

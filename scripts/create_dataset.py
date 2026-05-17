@@ -1,7 +1,7 @@
 import sys
 from pathlib import Path
 
-from config import DATASET_MANIFEST, SEED
+from config import BASE
 
 from base2backbone.dataset import prepare_dataset
 
@@ -12,7 +12,7 @@ if str(_SCRIPT_DIR) not in sys.path:
 
 
 def main():
-    prepare_dataset(SEED, DATASET_MANIFEST)
+    prepare_dataset(BASE['SEED'], BASE['DATASET_MANIFEST'])
 
 
 if __name__ == '__main__':

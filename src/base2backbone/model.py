@@ -1,5 +1,5 @@
 import math
-import os.path as osp
+from typing import Any, cast
 
 import lightning.pytorch as pl
 import torch
@@ -105,7 +105,19 @@ class BackboneLightningModule(pl.LightningModule):
         closure_sigma_bond_a: float = CLOSURE_SIGMA_BOND_A,
         closure_sigma_angle_rad: float = CLOSURE_SIGMA_ANGLE_RAD,
         closure_sigma_torsion_rad: float = CLOSURE_SIGMA_TORSION_RAD,
+        closure_sigma_angle_deg: float | None = None,
         log_tau_init_noise_scale: float | None = None,
+        edge_weight: float | None = None,
+        seed: int | None = None,
+        dataset_manifest: str | None = None,
+        run_name: str | None = None,
+        run_version: str | None = None,
+        num_epochs: int | None = None,
+        swa: bool | None = None,
+        swa_lr: float | None = None,
+        swa_epoch_start: int | None = None,
+        torch_compile: bool | None = None,
+        start_from_last_ckpt: bool | None = None,
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -161,16 +173,6 @@ class BackboneLightningModule(pl.LightningModule):
             renamed_state_dict[key_str] = value
         state_dict = renamed_state_dict
         return super().load_state_dict(state_dict, strict=strict)
-
-    def on_test_start(self):
-        if self.trainer is None or not self.trainer.is_global_zero:
-            return
-        logger = self.trainer.logger
-        dm = self.trainer.datamodule  # type: ignore[attr-defined]
-        log_dir = getattr(logger, 'log_dir', None)
-        if log_dir is None or dm is None:
-            return
-        torch.save(dm.test_dataset, osp.join(log_dir, 'test_dataset.pt'))
 
     def _b_ws(self, batch):
         b = batch.num_graphs
@@ -338,33 +340,79 @@ class BackboneLightningModule(pl.LightningModule):
 
     @torch.no_grad()
     def _predict_eval_window(self, batch):
-        sample_data_list = batch.to_data_list()
-        target_samples = []
-        sample_keys: list[tuple[int, int]] = []
-        for graph_idx, data in enumerate(sample_data_list):
-            ws = int(data.nt_origins_world.size(0))
-            for target_idx in range(ws):
-                target_samples.append(self._prepare_target_view(data, target_idx))
-                sample_keys.append((graph_idx, target_idx))
-
-        if not target_samples:
+        eval_batch = batch.to(self.device)
+        b, ws = self._b_ws(eval_batch)
+        if b == 0 or ws == 0:
             raise ValueError('Cannot evaluate an empty batch.')
 
-        pred_batch = Batch.from_data_list(target_samples).to(self.device)
+        dev = eval_batch.torsions.device
+        n_eval = b * ws
+
+        def repeat_nodes(value: torch.Tensor) -> torch.Tensor:
+            tail = value.shape[1:]
+            return (
+                value.reshape(b, ws, *tail)
+                .unsqueeze(1)
+                .expand(b, ws, ws, *tail)
+                .reshape(n_eval * ws, *tail)
+            )
+
+        pred_batch = cast(Any, Batch())
+        pred_batch._num_graphs = n_eval
+        pred_batch.batch = torch.arange(n_eval, device=dev).repeat_interleave(ws)
+        pred_batch.ptr = torch.arange(n_eval + 1, device=dev, dtype=torch.long) * ws
+        for name in (
+            'torsions',
+            'tau_m',
+            'tau_m_mask',
+            'bb_xyz_world',
+            'nt_origins_world',
+            'nt_frames_world',
+            'pair_origins_world',
+            'pair_frames_world',
+            'base_types',
+            'torsion_mask',
+            'has_pair_nt',
+            'chain_end_class',
+        ):
+            setattr(pred_batch, name, repeat_nodes(getattr(eval_batch, name)))
+
+        origins = eval_batch.nt_origins_world.reshape(b, ws, 3)
+        frames = eval_batch.nt_frames_world.reshape(b, ws, 3, 3)
+        pair_origins = eval_batch.pair_origins_world.reshape(b, ws, 3)
+        pair_frames = eval_batch.pair_frames_world.reshape(b, ws, 3, 3)
+        target_idx = torch.arange(ws, device=dev, dtype=torch.long).repeat(b)
+        pred_batch.target_nt_idx = target_idx
+        pred_batch.is_target_nt = (
+            torch.eye(ws, device=dev, dtype=torch.float32)
+            .unsqueeze(0)
+            .expand(b, ws, ws)
+            .reshape(n_eval * ws, 1)
+        )
+        pred_batch.rel_origins = torch.einsum(
+            'btni,btij->btnj',
+            origins.unsqueeze(1) - origins.unsqueeze(2),
+            frames,
+        ).reshape(n_eval * ws, 3).float()
+        pred_batch.rel_frames = torch.einsum(
+            'btji,bnjk->btnik',
+            frames,
+            frames,
+        ).reshape(n_eval * ws, 3, 3).float()
+        pred_batch.pair_rel_origins = torch.einsum(
+            'btni,btij->btnj',
+            pair_origins.unsqueeze(1) - origins.unsqueeze(2),
+            frames,
+        ).reshape(n_eval * ws, 3).float()
+        pred_batch.pair_rel_frames = torch.einsum(
+            'btji,bnjk->btnik',
+            frames,
+            pair_frames,
+        ).reshape(n_eval * ws, 3, 3).float()
+
         pred_theta_all, pred_tau_all = self.sample(pred_batch)
-        eval_batch = batch.to(pred_theta_all.device)
-        theta_w = torch.stack([data.torsions.clone() for data in sample_data_list], dim=0).to(
-            device=pred_theta_all.device,
-            dtype=pred_theta_all.dtype,
-        )
-        tau_w = torch.stack([data.tau_m.clone() for data in sample_data_list], dim=0).to(
-            device=pred_tau_all.device,
-            dtype=pred_tau_all.dtype,
-        )
-        for sample_idx, (graph_idx, target_idx) in enumerate(sample_keys):
-            theta_w[graph_idx, target_idx] = pred_theta_all[sample_idx]
-            tau_w[graph_idx, target_idx] = pred_tau_all[sample_idx]
-        tau_w = tau_w.clamp(min=TAU_M_MIN, max=TAU_M_MAX)
+        theta_w = pred_theta_all.reshape(b, ws, N_TORSIONS)
+        tau_w = pred_tau_all.reshape(b, ws).clamp(min=TAU_M_MIN, max=TAU_M_MAX)
         mask = self._inference_chain_end_mask(eval_batch)
         coords_w = self._build_window_backbone(
             theta_w.float(),

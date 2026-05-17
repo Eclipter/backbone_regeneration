@@ -32,6 +32,9 @@ BASE = dict(
     CLOSURE_SIGMA_BOND_A=0.05,  # (0, +inf) Å
     CLOSURE_SIGMA_ANGLE_DEG=10,  # (0, +inf) deg
     CLOSURE_SIGMA_TORSION_RAD=0.35,  # (0, +inf) rad
+    RUN_NAME='torsions/10',  # Run path under `logs/`
+    DATASET_MANIFEST='thesis_2026-05-17.json',  # Set to None to fetch from RCSB PDB API and save into latest.json
+    SEED=42,
     TORCH_COMPILE=True,
     START_FROM_LAST_CKPT=True,
 )
@@ -42,14 +45,6 @@ EXPERIMENTS = [
     {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.3},
     # WINDOW SIZE 5, 7
 ]
-
-# Run path under `logs/`
-RUN_NAME = 'torsions/10'
-
-# Set to None to fetch from RCSB PDB API and save into latest.json
-DATASET_MANIFEST = 'thesis_2026-05-17.json'
-
-SEED = 42
 
 ######### TO DOs ########
 # MAJOR:

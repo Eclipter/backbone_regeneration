@@ -1,14 +1,6 @@
 from base2backbone.runtime.run_artifacts import load_analysis_run_artifacts
 
 
-class _FakeDataset:
-    def __len__(self):
-        return 5
-
-    central_virtual = [1, 3]
-    edge_virtual = [0, 4]
-
-
 class _FakeModel:
     def __init__(self):
         self.to_calls = []
@@ -39,10 +31,6 @@ def test_load_analysis_run_artifacts_collects_run_state(monkeypatch):
         lambda pattern: ['/tmp/logs/torsions/baseline/events.out.tfevents'],
     )
     monkeypatch.setattr(
-        'base2backbone.runtime.run_artifacts.torch.load',
-        lambda path, weights_only=False: _FakeDataset(),
-    )
-    monkeypatch.setattr(
         'base2backbone.runtime.run_artifacts.torch.cuda.is_available',
         lambda: False,
     )
@@ -56,17 +44,8 @@ def test_load_analysis_run_artifacts_collects_run_state(monkeypatch):
     assert got.run_id == 'torsions/baseline'
     assert got.run_dir == '/tmp/logs/torsions/baseline'
     assert got.ckpt_path == '/tmp/logs/torsions/baseline/checkpoints/best.ckpt'
-    assert got.test_dataset_path == '/tmp/logs/torsions/baseline/test_dataset.pt'
     assert got.event_files == ['/tmp/logs/torsions/baseline/events.out.tfevents']
     assert got.target_modes == ('avg', 'central', 'edge')
-    assert got.test_indices_per_mode == {
-        'avg': [0, 1, 2, 3, 4],
-        'central': [1, 3],
-        'edge': [0, 4],
-    }
-    assert len(got.test_datasets['avg']) == 5
-    assert len(got.test_datasets['central']) == 2
-    assert len(got.test_datasets['edge']) == 2
     assert got.model is fake_model
     assert fake_model.eval_called
     assert fake_model.to_calls == ['cpu']

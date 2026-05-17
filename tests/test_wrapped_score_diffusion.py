@@ -78,6 +78,20 @@ def test_wrapped_normal_score_shape_broadcast():
 test_wrapped_normal_score_broadcast_shape = test_wrapped_normal_score_shape_broadcast
 
 
+def test_weighted_score_mse_ignores_masked_nan_forward_and_backward():
+    pred = torch.tensor([[1.0, float('nan')]], requires_grad=True)
+    target = torch.tensor([[0.0, float('nan')]])
+    mask = torch.tensor([[True, False]])
+    sigma_sq = torch.ones(1)
+
+    loss = weighted_score_mse(pred, target, mask, sigma_sq, weighting='sigma2')
+    assert torch.isfinite(loss)
+
+    loss.backward()
+    assert torch.isfinite(pred.grad).all()
+    assert pred.grad[0, 1].item() == 0.0
+
+
 def test_perturb_torsions_shapes():
     B, W = 3, 4
     theta_0 = torch.randn(B, W, N_TORSIONS)

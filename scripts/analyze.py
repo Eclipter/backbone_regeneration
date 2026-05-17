@@ -23,14 +23,14 @@ import seaborn as sns
 import torch
 from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
-from config import DATASET_MANIFEST
+from config import BASE
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import Batch, Data
 from tqdm import tqdm
 
 from base2backbone.data import BACKBONE_ATOMS, BASE_TO_INDEX, parse_dna
-from base2backbone.dataset import DNADataModule, PyGDataset
+from base2backbone.dataset import DNADataModule
 from base2backbone.eval import (backbone_local_in_target_frame,
                                 backbone_segments_from_local_coords,
                                 bond_segments_from_nt_graph,
@@ -51,18 +51,51 @@ from base2backbone.runtime import (PROGRESS_BAR_COLOR, collect_scalar_history,
 
 IDX_TO_BASE = {v: k for k, v in BASE_TO_INDEX.items()}
 
-# Angle channel order in tensors: α, β, γ, ε, ζ, χ, pseudorotation phase
-# (no backbone δ; τ_m is separate / log τ in latent).
 TOR_NAMES = ['α', 'β', 'γ', 'ε', 'ζ', 'χ', 'phase']
 
-# %% Load model and dataset
+# %% Load prerequisites
 run_id = 'torsions/7/CLOSURE_LOSS_WEIGHT=0.001_CLOSURE_ANGLE_WEIGHT=0.3'
 
 artifacts = load_analysis_run_artifacts(run_id)
 run_dir = artifacts.run_dir
 ckpt_path = artifacts.ckpt_path
 event_files = artifacts.event_files
-test_dataset = artifacts.test_dataset
+model = artifacts.model
+device = artifacts.device
+analysis_hparams = dict(model.hparams)
+_analysis_edge_weight_raw = analysis_hparams.get('edge_weight')
+analysis_edge_weight = (
+    float(_analysis_edge_weight_raw)
+    if _analysis_edge_weight_raw is not None
+    else float(cast(float, BASE['EDGE_WEIGHT']))
+)
+_analysis_seed_raw = analysis_hparams.get('seed')
+analysis_seed = (
+    int(_analysis_seed_raw)
+    if _analysis_seed_raw is not None
+    else int(cast(int, BASE['SEED']))
+)
+_analysis_manifest_raw = (
+    analysis_hparams.get('dataset_manifest')
+    if analysis_hparams.get('dataset_manifest') is not None
+    else BASE['DATASET_MANIFEST']
+)
+analysis_manifest = (
+    None
+    if _analysis_manifest_raw is None
+    else str(_analysis_manifest_raw)
+)
+dm = DNADataModule(
+    batch_size=1,
+    edge_weight=analysis_edge_weight,
+    seed=analysis_seed,
+    dataset_manifest=analysis_manifest,
+)
+dm.setup()
+train_dataset = dm.train_dataset
+val_dataset = dm.val_dataset
+test_dataset = dm.test_dataset
+dataset = train_dataset.base
 target_modes = artifacts.target_modes
 mode_colors = {
     'avg': 'indigo',
@@ -70,8 +103,6 @@ mode_colors = {
     'edge': 'violet',
 }
 mode_linestyles = {'avg': '-', 'central': '--', 'edge': '--'}
-model = artifacts.model
-device = artifacts.device
 print(f'device: {device}')
 
 
@@ -91,8 +122,197 @@ class CheckpointSamplerAdapter:
         )
 
 
+RMSD_SUMMARY_FIELDS = (
+    ('avg_median', 'avg median'),
+    ('avg_mean', 'avg mean'),
+    ('avg_p90', 'avg p90'),
+    ('central_mean', 'central mean'),
+    ('edge_mean', 'edge mean'),
+)
+
+
+def finite_rmsd_values(rmsds, mask=None):
+    values = np.asarray(rmsds, dtype=np.float64)
+    finite_mask = np.isfinite(values)
+    if mask is not None:
+        finite_mask &= np.asarray(mask, dtype=bool)
+    return values[finite_mask]
+
+
+def _rmsd_mean(values):
+    vals = finite_rmsd_values(values)
+    if len(vals) == 0:
+        return None
+    return float(np.mean(vals))
+
+
+def rmsd_summary_metrics(rmsds, is_edge=None):
+    values = np.asarray(rmsds, dtype=np.float64)
+    avg_values = finite_rmsd_values(values)
+    summary = {
+        'avg_median': None,
+        'avg_mean': None,
+        'avg_p90': None,
+        'central_mean': None,
+        'edge_mean': None,
+        'n_finite': int(len(avg_values)),
+        'n_total': int(len(values)),
+    }
+    if len(avg_values) == 0:
+        return summary
+
+    summary.update({
+        'avg_median': float(np.median(avg_values)),
+        'avg_mean': float(np.mean(avg_values)),
+        'avg_p90': float(np.percentile(avg_values, 90)),
+    })
+    if is_edge is None:
+        return summary
+
+    edge_mask = np.asarray(is_edge, dtype=bool)
+    if len(edge_mask) != len(values):
+        raise ValueError('is_edge must have the same length as rmsds')
+    summary['central_mean'] = _rmsd_mean(values[~edge_mask])
+    summary['edge_mean'] = _rmsd_mean(values[edge_mask])
+    return summary
+
+
+def format_rmsd_value(value):
+    if value is None:
+        return 'n/a'
+    return f'{value:.3f} A'
+
+
+def format_rmsd_summary_line(summary):
+    metric_text = [
+        f'{label}={format_rmsd_value(summary[key])}'
+        for key, label in RMSD_SUMMARY_FIELDS
+    ]
+    metric_text.append(f'n={summary["n_finite"]}/{summary["n_total"]}')
+    return '  '.join(metric_text)
+
+
+def print_rmsd_metric_summary(title, summary):
+    print(f'\n{title}')
+    if summary['n_finite'] == 0:
+        print('  no finite RMSDs')
+        return summary
+    for key, label in RMSD_SUMMARY_FIELDS:
+        print(f'  {label:>12}: {format_rmsd_value(summary[key])}')
+    print(f'  {"n":>12}: {summary["n_finite"]}/{summary["n_total"]}')
+    return summary
+
+
+def print_rmsd_summary(title, rmsds, is_edge=None):
+    summary = rmsd_summary_metrics(rmsds, is_edge)
+    return print_rmsd_metric_summary(title, summary)
+
+
+def rmsd_summary_with_suffix(rmsds, is_edge=None, suffix='_rmsd'):
+    summary = rmsd_summary_metrics(rmsds, is_edge)
+    return {
+        f'{key}{suffix}': summary[key]
+        for key, _ in RMSD_SUMMARY_FIELDS
+    } | {
+        'n_finite': summary['n_finite'],
+        'n_total': summary['n_total'],
+    }
+
+
+def empty_prefixed_rmsd_stats(prefix):
+    return {
+        f'{prefix}_{key}_rmsd': None
+        for key, _ in RMSD_SUMMARY_FIELDS
+    }
+
+
+def prefixed_rmsd_stats(summary, prefix):
+    return {
+        f'{prefix}_{key}_rmsd': summary[f'{key}_rmsd']
+        for key, _ in RMSD_SUMMARY_FIELDS
+    }
+
+
+# %% Mean train-torsion baseline on test set
+def mean_target_torsions_and_tau(dataset):
+    first_data = cast(Data, dataset[0])
+    n_torsions = int(first_data.torsions.shape[-1])
+    sin_sums = np.zeros(n_torsions, dtype=np.float64)
+    cos_sums = np.zeros(n_torsions, dtype=np.float64)
+    torsion_counts = np.zeros(n_torsions, dtype=np.int64)
+    tau_sum = 0.0
+    tau_count = 0
+
+    for i in tqdm(
+        range(len(dataset)),
+        desc='mean baseline: train torsions',
+        colour=PROGRESS_BAR_COLOR,
+    ):
+        data = cast(Data, dataset[i])
+        tidx = int(data.target_nt_idx.item())
+        theta = data.torsions[tidx].detach().cpu().numpy()
+        theta_mask = data.torsion_mask[tidx].detach().cpu().numpy().astype(bool)
+        sin_sums[theta_mask] += np.sin(theta[theta_mask])
+        cos_sums[theta_mask] += np.cos(theta[theta_mask])
+        torsion_counts[theta_mask] += 1
+
+        if bool(data.tau_m_mask[tidx].item()):
+            tau_sum += float(data.tau_m[tidx].item())
+            tau_count += 1
+
+    mean_theta = np.zeros(n_torsions, dtype=np.float64)
+    valid_torsions = torsion_counts > 0
+    mean_theta[valid_torsions] = np.arctan2(
+        sin_sums[valid_torsions],
+        cos_sums[valid_torsions],
+    )
+    mean_tau = tau_sum / tau_count
+    return mean_theta, mean_tau, torsion_counts, tau_count
+
+
+def evaluate_mean_torsion_baseline(dataset, mean_theta, mean_tau):
+    pred_theta = torch.as_tensor(
+        mean_theta,
+        device=device,
+        dtype=torch.float32,
+    ).unsqueeze(0)
+    pred_tau = torch.tensor([mean_tau], device=device, dtype=torch.float32)
+    rmsds: list[float] = []
+    is_edge: list[bool] = []
+
+    with torch.no_grad():
+        for i in tqdm(
+            range(len(dataset)),
+            desc='mean baseline: test decode',
+            colour=PROGRESS_BAR_COLOR,
+        ):
+            data = cast(Data, dataset[i].clone())
+            batch = cast(Any, Batch.from_data_list([data])).to(device)
+            rmsd = model._compute_rmsd_per_graph_local(pred_theta, pred_tau, batch)
+
+            rmsds.append(float(rmsd.item()))
+            tidx = int(data.target_nt_idx.item())
+            is_edge.append(bool(data.is_chain_edge_nt[tidx].item()))
+
+    return np.asarray(rmsds, dtype=np.float64), np.asarray(is_edge, dtype=bool)
+
+
+mean_baseline_theta, mean_baseline_tau, mean_baseline_torsion_counts, mean_baseline_tau_count = (
+    mean_target_torsions_and_tau(train_dataset)
+)
+mean_baseline_test_rmsds, mean_baseline_test_is_edge = evaluate_mean_torsion_baseline(
+    test_dataset,
+    mean_baseline_theta,
+    mean_baseline_tau,
+)
+print_rmsd_summary(
+    'Mean train torsion/amplitude baseline test RMSD:',
+    mean_baseline_test_rmsds,
+    mean_baseline_test_is_edge,
+)
+
+
 # %% Show samples from dataset
-dataset = PyGDataset(dataset_manifest=DATASET_MANIFEST)
 rng = np.random.default_rng()
 raw_idx = rng.integers(len(dataset))
 raw_data = cast(Data, dataset[raw_idx])
@@ -320,7 +540,7 @@ fig.update_layout(
 )
 fig.show()
 
-# %% Training
+# %% Training curves and logged metrics
 plt.rcParams['font.family'] = 'Nunito'
 
 
@@ -429,7 +649,7 @@ fig.tight_layout()
 fig.savefig(osp.join(run_dir, 'test.png'), bbox_inches='tight', dpi=300)
 plt.show()
 
-# %% Results
+# %% Visualize one test prediction
 test_pdb_to_local: dict[str, list[int]] = defaultdict(list)
 test_paths = []
 for local_i, (w_idx, _) in enumerate(test_dataset.virtual_entries):
@@ -711,7 +931,7 @@ fig.update_layout(
 )
 fig.show()
 
-# %% Inference
+# %% Run whole-structure inference
 inference_pdb_id = random.choice(sorted(test_pdb_to_local.keys()))
 raw_inference_path = osp.join('..', 'data', 'raw', f'{inference_pdb_id}.cif')
 
@@ -839,6 +1059,11 @@ def central_backbone_local(data):
     return {BACKBONE_ATOMS[j]: local[j] for j in range(len(BACKBONE_ATOMS)) if valid[j]}
 
 
+def central_backbone_is_edge(data):
+    ci = data.bb_xyz_world.shape[0] // 2
+    return bool(data.is_chain_edge_nt[ci].item())
+
+
 _window_cache: dict = {}  # populated in phase 2 by worker processes
 
 
@@ -850,6 +1075,7 @@ def experimental_rmsd_windows(pdb_id1, pdb_id2):
     idx1 = window_index_for_pdb(pdb_id1)
     idx2 = window_index_for_pdb(pdb_id2)
     values = []
+    is_edge = []
     for key in set(idx1) & set(idx2):
         atoms1 = central_backbone_local(idx1[key])
         atoms2 = central_backbone_local(idx2[key])
@@ -859,7 +1085,8 @@ def experimental_rmsd_windows(pdb_id1, pdb_id2):
         pos1 = np.array([atoms1[n] for n in shared])
         pos2 = np.array([atoms2[n] for n in shared])
         values.append(float(np.sqrt(np.mean(np.sum((pos1 - pos2) ** 2, axis=1)))))
-    return values
+        is_edge.append(central_backbone_is_edge(idx1[key]))
+    return values, is_edge
 
 
 def _collect_partners(pdb_id):
@@ -908,17 +1135,25 @@ print(f'Indexed {len(_window_cache)} PDB structures')
 
 # Phase 3: compute RMSDs (everything is already cached, this is CPU-bound)
 rmsd_values = []
+rmsd_is_edge = []
 for pdb_id, partners in partner_map.items():
     for pid in partners:
         try:
-            wv = experimental_rmsd_windows(pdb_id, pid)
+            wv, wv_is_edge = experimental_rmsd_windows(pdb_id, pid)
             if wv:
                 rmsd_values.extend(wv)
-                print(f'{pdb_id} vs {pid}: median={np.median(wv):.2f} Å  n={len(wv)}')
+                rmsd_is_edge.extend(wv_is_edge)
+                pair_summary = rmsd_summary_metrics(wv, wv_is_edge)
+                print(f'{pdb_id} vs {pid}: {format_rmsd_summary_line(pair_summary)}')
         except Exception:
             pass
 
-# %%
+# %% Plot dataset-noise RMSD distribution
+noise_rmsd_summary = print_rmsd_summary(
+    'Experimental structure-pair RMSD:',
+    rmsd_values,
+    rmsd_is_edge,
+)
 fig, ax = plt.subplots(figsize=(7, 4))
 ax.hist(rmsd_values, bins=50, color='skyblue', edgecolor='white')
 for mode, color in mode_colors.items():
@@ -929,14 +1164,15 @@ for mode, color in mode_colors.items():
         linewidth=2,
         label=f'валидационный RMSD, {validation_labels[mode]} ({val:.2f} Å)',
     )
-noise_median = float(np.median(rmsd_values))
-ax.axvline(
-    noise_median,
-    color='red',
-    linestyle='--',
-    linewidth=2,
-    label=f'медиана по экспериментальным структурам ({noise_median:.2f} Å)',
-)
+noise_median = noise_rmsd_summary['avg_median']
+if noise_median is not None:
+    ax.axvline(
+        noise_median,
+        color='red',
+        linestyle='--',
+        linewidth=2,
+        label=f'медиана по экспериментальным структурам ({noise_median:.2f} Å)',
+    )
 ax.set_xlim(0, 3)
 ax.set_xlabel('RMSD (Å)', fontsize=13)
 ax.set_ylabel('Количество структур', fontsize=13)
@@ -960,6 +1196,7 @@ inter_run_indices = rng.choice(
 ).tolist()
 
 inter_run_rmsds: list[float] = []
+inter_run_is_edge: list[bool] = []
 sample_medians: list[float] = []
 
 with torch.no_grad():
@@ -970,6 +1207,7 @@ with torch.no_grad():
     ):
         data = cast(Any, test_dataset[wi].clone())
         tidx = int(data.target_nt_idx.item())
+        sample_is_edge = bool(data.is_chain_edge_nt[tidx].item())
         restype = idx_to_base[int(data.base_types[tidx].argmax().item())]
         o3_ir = None
         if bool(data.o3_prev_valid[tidx].item()):
@@ -1007,17 +1245,24 @@ with torch.no_grad():
         pair_rmsds = rmsds_mat[r1, r2].tolist()
 
         inter_run_rmsds.extend(pair_rmsds)
+        inter_run_is_edge.extend([sample_is_edge] * len(pair_rmsds))
         sample_medians.append(float(np.median(pair_rmsds)))
 
-# %%
+# %% Plot stochastic-spread RMSD distribution
 
-med = float(np.median(inter_run_rmsds))
+inter_run_rmsd_summary = print_rmsd_summary(
+    'Inter-run RMSD:',
+    inter_run_rmsds,
+    inter_run_is_edge,
+)
+inter_run_median = inter_run_rmsd_summary['avg_median']
 
 fig, ax = plt.subplots(figsize=(7, 4))
 ax.hist(inter_run_rmsds, color='mediumpurple', edgecolor='white')
-ax.axvline(med, color='black', linestyle='--', linewidth=2,
-           label=f'медиана: {med:.1f} Å')
-if rmsd_values:
+if inter_run_median is not None:
+    ax.axvline(inter_run_median, color='black', linestyle='--', linewidth=2,
+               label=f'медиана: {inter_run_median:.1f} Å')
+if rmsd_values and noise_median is not None:
     ax.axvline(noise_median, color='red', linestyle='--', linewidth=2,
                label=f'экспериментальный порог: {noise_median:.1f} Å')
 ax.set_xlabel('RMSD (Å)', fontsize=13)
@@ -1028,12 +1273,8 @@ fig.tight_layout()
 fig.savefig(osp.join(run_dir, 'inter_run_rmsd.png'), dpi=300, bbox_inches='tight')
 plt.show()
 
-# %% Compare with kNN baseline
+# %% Prepare kNN baseline
 
-dm = DNADataModule(batch_size=1, dataset_manifest=DATASET_MANIFEST)
-dm.setup()
-train_dataset = dm.train_dataset
-val_dataset = dm.val_dataset
 knn_base_dataset = train_dataset.base
 
 
@@ -1214,21 +1455,6 @@ def candidate_allowed(query_meta, ref_meta, allow_same_sample):
     return True
 
 
-def print_knn_summary(title, rmsds, is_edge):
-    print(f'\n{title}')
-    for label, mask in [
-        ('avg', np.ones(len(rmsds), dtype=bool)),
-        ('central', ~is_edge),
-        ('edge', is_edge),
-    ]:
-        vals = rmsds[mask & np.isfinite(rmsds)]
-        if len(vals):
-            print(
-                f'  {label:>10}: median={np.median(vals):.3f}  '
-                f'mean={np.mean(vals):.3f}  n={len(vals)}'
-            )
-
-
 def run_knn_protocol(name, query_feats, query_locals, query_metas, ref_feats, ref_locals, ref_metas,
                      allow_same_sample):
     scaler, ref_indices_by_base, nn_by_base = fit_knn_indices(ref_feats, ref_metas)
@@ -1265,7 +1491,7 @@ def run_knn_protocol(name, query_feats, query_locals, query_metas, ref_feats, re
         is_edge.append(meta['is_edge'])
     rmsds_arr = np.asarray(rmsds, dtype=np.float64)
     is_edge_arr = np.asarray(is_edge, dtype=bool)
-    print_knn_summary(
+    print_rmsd_summary(
         f'kNN backbone RMSD (local frame) [{name}]',
         rmsds_arr,
         is_edge_arr,
@@ -1316,7 +1542,7 @@ def select_feature_columns(feats, feat_slices, feature_names):
     )
 
 
-# %%
+# %% Run kNN feature-set comparison
 for feature_set_name, feature_names in feature_sets:
     test_subset_feats = select_feature_columns(test_feats, test_feat_slices, feature_names)
     train_subset_feats = select_feature_columns(train_feats, train_feat_slices, feature_names)
@@ -1330,35 +1556,32 @@ for feature_set_name, feature_names in feature_sets:
         train_metas,
         allow_same_sample=False,
     )
-# %%
-print('\nModel test RMSD:')
+# %% Compare logged model RMSD and oracle decoder RMSD
 wide_per_mode = globals().get('wide_per_mode')
 if wide_per_mode is None:
     print('  unavailable: run the training-metrics cell first')
 else:
-    for label in ('avg', 'central', 'edge'):
+    logged_model_test_summary: dict[str, float | int | None] = {
+        key: None
+        for key, _ in RMSD_SUMMARY_FIELDS
+    }
+    logged_model_test_n_finite = 0
+    for label, summary_key in [
+        ('avg', 'avg_mean'),
+        ('central', 'central_mean'),
+        ('edge', 'edge_mean'),
+    ]:
         w = wide_per_mode.get(label)
         if w is None:
             continue
         if 'test/rmsd' in w.columns:
-            v = float(w['test/rmsd'].dropna().iloc[-1])
-            print(f'  {label:>10}: {v:.3f} Å')
-
-
-def print_stats_by_mode(rmsds, is_edge):
-    for label, mask in [
-        ('avg', np.isfinite(rmsds)),
-        ('central', (~is_edge) & np.isfinite(rmsds)),
-        ('edge', is_edge & np.isfinite(rmsds)),
-    ]:
-        vals = rmsds[mask]
-        if len(vals):
-            print(
-                f'  {label:>10}: median={np.median(vals):.3f}  '
-                f'mean={np.mean(vals):.3f}  '
-                f'p90={np.percentile(vals, 90):.3f}  '
-                f'n={len(vals)}'
-            )
+            values = w['test/rmsd'].dropna()
+            if len(values):
+                logged_model_test_summary[summary_key] = float(values.iloc[-1])
+                logged_model_test_n_finite += 1
+    logged_model_test_summary['n_finite'] = logged_model_test_n_finite
+    logged_model_test_summary['n_total'] = 3
+    print_rmsd_metric_summary('Logged model test RMSD:', logged_model_test_summary)
 
 
 def accumulate_per_atom_errors(
@@ -1450,8 +1673,7 @@ def summarize_per_atom_errors(atom_sq_sums, atom_counts, atom_max_errs):
         plt.show()
 
 
-# %%
-print('\nOracle decoder RMSD:')
+# %% Decode oracle torsions
 oracle_rmsds_list: list[float] = []
 oracle_is_edge_list: list[bool] = []
 oracle_atom_sq_sums: defaultdict[str, float] = defaultdict(float)
@@ -1504,14 +1726,14 @@ with torch.no_grad():
 
 oracle_rmsds = np.asarray(oracle_rmsds_list, dtype=np.float64)
 oracle_is_edge = np.asarray(oracle_is_edge_list, dtype=bool)
-print_stats_by_mode(oracle_rmsds, oracle_is_edge)
+print_rmsd_summary('Oracle decoder RMSD:', oracle_rmsds, oracle_is_edge)
 summarize_per_atom_errors(
     oracle_atom_sq_sums,
     oracle_atom_counts,
     oracle_atom_max_errs,
 )
 
-# %% Compare PHENIX run time with our model
+# %% Compare PHENIX run time with Base2Backbone
 
 NUM_TIMESTEPS_LIST = [5, 10, 15, 30, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
 
@@ -2062,9 +2284,12 @@ def collect_backbone_local_arrays(ref_chain_records, *position_maps):
                 if np.isnan(origin_world).any() or np.isnan(frame_world).any():
                     continue
 
-                local_arrays.append(tuple(
-                    backbone_local_array(atoms, origin_world, frame_world)
-                    for atoms in atoms_per_map
+                local_arrays.append((
+                    tuple(
+                        backbone_local_array(atoms, origin_world, frame_world)
+                        for atoms in atoms_per_map
+                    ),
+                    bool(data.is_chain_edge_nt[nt_idx].item()),
                 ))
     return local_arrays
 
@@ -2086,30 +2311,39 @@ def compute_structure_vs_ref_backbone_rmsd(
         output_positions,
     )
     rmsds = []
-    for ref_local, output_local in local_arrays:
+    rmsd_is_edge = []
+    for (ref_local, output_local), is_edge in local_arrays:
         rmsd = local_backbone_rmsd(output_local, ref_local)
         if np.isfinite(rmsd):
             rmsds.append(float(rmsd))
+            rmsd_is_edge.append(is_edge)
 
     if not rmsds:
+        empty_summary = rmsd_summary_with_suffix([])
         return {
             'success': False,
             'n_residues': 0,
             'mean_rmsd': None,
             'median_rmsd': None,
+            'p90_rmsd': None,
+            **empty_summary,
         }
 
     rmsd_arr = np.asarray(rmsds, dtype=np.float64)
+    rmsd_is_edge_arr = np.asarray(rmsd_is_edge, dtype=bool)
+    rmsd_summary = rmsd_summary_with_suffix(rmsd_arr, rmsd_is_edge_arr)
     return {
         'success': True,
-        'n_residues': int(len(rmsd_arr)),
-        'mean_rmsd': float(np.mean(rmsd_arr)),
-        'median_rmsd': float(np.median(rmsd_arr)),
+        'n_residues': int(rmsd_summary['n_finite']),
+        'mean_rmsd': rmsd_summary['avg_mean_rmsd'],
+        'median_rmsd': rmsd_summary['avg_median_rmsd'],
+        'p90_rmsd': rmsd_summary['avg_p90_rmsd'],
+        **rmsd_summary,
     }
 
 
 def summarize_structure_vs_ref_backbone_rmsd(label, rows, window_size=3):
-    per_structure_medians = []
+    per_structure_summaries = []
     for row in rows:
         if not row['success'] or not row['output_pdb']:
             continue
@@ -2121,22 +2355,72 @@ def summarize_structure_vs_ref_backbone_rmsd(label, rows, window_size=3):
             )
         except Exception:
             continue
-        if rmsd_stats['median_rmsd'] is not None:
-            per_structure_medians.append(rmsd_stats['median_rmsd'])
+        if rmsd_stats['avg_median_rmsd'] is not None:
+            per_structure_summaries.append(rmsd_stats)
 
-    if not per_structure_medians:
+    if not per_structure_summaries:
         print(f'No successful {label}/ref RMSD pairs were available.')
         return {
             'n_rmsd_compared': 0,
             'median_backbone_rmsd': None,
+            **{
+                f'{key}_backbone_rmsd': None
+                for key, _ in RMSD_SUMMARY_FIELDS
+            },
         }
 
+    metric_means = {}
+    for key, _ in RMSD_SUMMARY_FIELDS:
+        vals = [
+            stats[f'{key}_rmsd']
+            for stats in per_structure_summaries
+            if stats[f'{key}_rmsd'] is not None
+        ]
+        metric_means[f'{key}_backbone_rmsd'] = (
+            float(np.mean(np.asarray(vals, dtype=np.float64)))
+            if vals else None
+        )
+
     summary = {
-        'n_rmsd_compared': len(per_structure_medians),
-        'median_backbone_rmsd': float(np.median(np.asarray(per_structure_medians, dtype=np.float64))),
+        'n_rmsd_compared': len(per_structure_summaries),
+        'median_backbone_rmsd': float(np.median(np.asarray(
+            [
+                stats['avg_median_rmsd']
+                for stats in per_structure_summaries
+                if stats['avg_median_rmsd'] is not None
+            ],
+            dtype=np.float64,
+        ))),
+        **metric_means,
     }
-    print(f'Median {label} RMSD: {summary["median_backbone_rmsd"]:.3f} A')
+    print(f'\n{label}/ref backbone RMSD:')
+    for key, metric_label in RMSD_SUMMARY_FIELDS:
+        print(
+            f'  {metric_label:>12}: '
+            f'{format_rmsd_value(summary[f"{key}_backbone_rmsd"])}'
+        )
+    print(f'  {"n":>12}: {summary["n_rmsd_compared"]}')
     return summary
+
+
+def empty_runtime_rmsd_stats(prefix):
+    return {
+        'success': False,
+        'n_residues': 0,
+        f'{prefix}_mean_rmsd': None,
+        f'{prefix}_median_rmsd': None,
+        **empty_prefixed_rmsd_stats(prefix),
+    }
+
+
+def runtime_rmsd_stats_for_prefix(stats, prefix):
+    return {
+        'success': stats['success'],
+        'n_residues': stats['n_residues'],
+        f'{prefix}_mean_rmsd': stats['mean_rmsd'],
+        f'{prefix}_median_rmsd': stats['median_rmsd'],
+        **prefixed_rmsd_stats(stats, prefix),
+    }
 
 
 def summarize_runtime_comparison(model_rows, phenix_rows, window_size=3):
@@ -2150,18 +2434,8 @@ def summarize_runtime_comparison(model_rows, phenix_rows, window_size=3):
         model_time = model_row['wall_time_s']
         phenix_time = phenix_row['wall_time_s']
         speedup = ''
-        model_rmsd_stats = {
-            'success': False,
-            'n_residues': 0,
-            'model_vs_ref_mean_rmsd': None,
-            'model_vs_ref_median_rmsd': None,
-        }
-        phenix_rmsd_stats = {
-            'success': False,
-            'n_residues': 0,
-            'phenix_vs_ref_mean_rmsd': None,
-            'phenix_vs_ref_median_rmsd': None,
-        }
+        model_rmsd_stats = empty_runtime_rmsd_stats('model_vs_ref')
+        phenix_rmsd_stats = empty_runtime_rmsd_stats('phenix_vs_ref')
         if (
             model_row['success']
             and phenix_row['success']
@@ -2175,40 +2449,24 @@ def summarize_runtime_comparison(model_rows, phenix_rows, window_size=3):
                     model_row['output_pdb'],
                     window_size=window_size,
                 )
-                model_rmsd_stats = {
-                    'success': model_stats['success'],
-                    'n_residues': model_stats['n_residues'],
-                    'model_vs_ref_mean_rmsd': model_stats['mean_rmsd'],
-                    'model_vs_ref_median_rmsd': model_stats['median_rmsd'],
-                }
+                model_rmsd_stats = runtime_rmsd_stats_for_prefix(
+                    model_stats,
+                    'model_vs_ref',
+                )
                 phenix_stats = compute_structure_vs_ref_backbone_rmsd(
                     phenix_row['input_path'],
                     phenix_row['output_pdb'],
                     window_size=window_size,
                 )
-                phenix_rmsd_stats = {
-                    'success': phenix_stats['success'],
-                    'n_residues': phenix_stats['n_residues'],
-                    'phenix_vs_ref_mean_rmsd': phenix_stats['mean_rmsd'],
-                    'phenix_vs_ref_median_rmsd': phenix_stats['median_rmsd'],
-                }
+                phenix_rmsd_stats = runtime_rmsd_stats_for_prefix(
+                    phenix_stats,
+                    'phenix_vs_ref',
+                )
             except Exception as e:
-                model_rmsd_stats = {
-                    'success': False,
-                    'n_residues': 0,
-                    'model_vs_ref_mean_rmsd': None,
-                    'model_vs_ref_median_rmsd': None,
-                    'error': repr(e),
-                }
-                phenix_rmsd_stats = {
-                    'success': False,
-                    'n_residues': 0,
-                    'phenix_vs_ref_mean_rmsd': None,
-                    'phenix_vs_ref_median_rmsd': None,
-                    'error': repr(e),
-                }
+                model_rmsd_stats = empty_runtime_rmsd_stats('model_vs_ref') | {'error': repr(e)}
+                phenix_rmsd_stats = empty_runtime_rmsd_stats('phenix_vs_ref') | {'error': repr(e)}
 
-        comparison_rows.append({
+        comparison_row = {
             'id': pdb_id,
             'model_success': model_row['success'],
             'model_wall_time_s': model_time,
@@ -2221,7 +2479,15 @@ def summarize_runtime_comparison(model_rows, phenix_rows, window_size=3):
             'model_vs_ref_backbone_median_rmsd': model_rmsd_stats['model_vs_ref_median_rmsd'],
             'phenix_vs_ref_backbone_mean_rmsd': phenix_rmsd_stats['phenix_vs_ref_mean_rmsd'],
             'phenix_vs_ref_backbone_median_rmsd': phenix_rmsd_stats['phenix_vs_ref_median_rmsd'],
-        })
+        }
+        for key, _ in RMSD_SUMMARY_FIELDS:
+            comparison_row[f'model_vs_ref_backbone_{key}_rmsd'] = (
+                model_rmsd_stats[f'model_vs_ref_{key}_rmsd']
+            )
+            comparison_row[f'phenix_vs_ref_backbone_{key}_rmsd'] = (
+                phenix_rmsd_stats[f'phenix_vs_ref_{key}_rmsd']
+            )
+        comparison_rows.append(comparison_row)
 
     valid_rows = [
         row
@@ -2237,6 +2503,14 @@ def summarize_runtime_comparison(model_rows, phenix_rows, window_size=3):
             'n_rmsd_compared': 0,
             'median_model_vs_ref_backbone_rmsd': None,
             'median_phenix_vs_ref_backbone_rmsd': None,
+            **{
+                f'model_vs_ref_backbone_{key}_rmsd': None
+                for key, _ in RMSD_SUMMARY_FIELDS
+            },
+            **{
+                f'phenix_vs_ref_backbone_{key}_rmsd': None
+                for key, _ in RMSD_SUMMARY_FIELDS
+            },
         }
         print('No successful model/PHENIX pairs were available.')
         return comparison_rows, summary
@@ -2269,6 +2543,25 @@ def summarize_runtime_comparison(model_rows, phenix_rows, window_size=3):
             if rmsd_rows else None
         ),
     }
+    for key, _ in RMSD_SUMMARY_FIELDS:
+        model_vals = [
+            row[f'model_vs_ref_backbone_{key}_rmsd']
+            for row in rmsd_rows
+            if row[f'model_vs_ref_backbone_{key}_rmsd'] is not None
+        ]
+        phenix_vals = [
+            row[f'phenix_vs_ref_backbone_{key}_rmsd']
+            for row in rmsd_rows
+            if row[f'phenix_vs_ref_backbone_{key}_rmsd'] is not None
+        ]
+        summary[f'model_vs_ref_backbone_{key}_rmsd'] = (
+            float(np.mean(np.asarray(model_vals, dtype=np.float64)))
+            if model_vals else None
+        )
+        summary[f'phenix_vs_ref_backbone_{key}_rmsd'] = (
+            float(np.mean(np.asarray(phenix_vals, dtype=np.float64)))
+            if phenix_vals else None
+        )
     model_line = f'Median model time: {summary["model_median_wall_time_s"]:.3f}s'
     if summary['median_model_vs_ref_backbone_rmsd'] is not None:
         model_line += (
@@ -2280,6 +2573,27 @@ def summarize_runtime_comparison(model_rows, phenix_rows, window_size=3):
     print(f'Median PHENIX time: {summary["phenix_median_wall_time_s"]:.3f}s')
 
     print(f'Median speedup: {summary["median_phenix_over_model_speedup"]:.2f}x')
+    if rmsd_rows:
+        print_rmsd_metric_summary(
+            'Base2Backbone/ref backbone RMSD:',
+            {
+                key: summary[f'model_vs_ref_backbone_{key}_rmsd']
+                for key, _ in RMSD_SUMMARY_FIELDS
+            } | {
+                'n_finite': len(rmsd_rows),
+                'n_total': len(rmsd_rows),
+            },
+        )
+        print_rmsd_metric_summary(
+            'PHENIX/ref backbone RMSD:',
+            {
+                key: summary[f'phenix_vs_ref_backbone_{key}_rmsd']
+                for key, _ in RMSD_SUMMARY_FIELDS
+            } | {
+                'n_finite': len(rmsd_rows),
+                'n_total': len(rmsd_rows),
+            },
+        )
     return comparison_rows, summary
 
 

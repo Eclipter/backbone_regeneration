@@ -179,17 +179,23 @@ def weighted_score_mse(
     """Masked MSE with optional σ² scaling per score matching practice."""
     if weighting not in ('none', 'sigma2'):
         raise ValueError(f'unknown score_loss_weighting: {weighting!r}')
-    diff_sq = (pred - target) ** 2
+    m = mask
+    while m.ndim < pred.ndim:
+        m = m.unsqueeze(-1)
+    m_bool = m.bool()
+    zero = torch.zeros((), device=pred.device, dtype=pred.dtype)
+    # IEEE-754: NaN * 0 = NaN, and backward through `square` can still do 0 * NaN.
+    # Replace masked pred/target before arithmetic so masked undefined torsions never enter the graph.
+    pred_safe = torch.where(m_bool, pred, zero)
+    target_safe = torch.where(m_bool, target, zero)
+    diff_sq = (pred_safe - target_safe) ** 2
     if weighting == 'sigma2':
         assert sigma_sq_weight is not None
         w = sigma_sq_weight
         while w.ndim < diff_sq.ndim:
             w = w.unsqueeze(-1)
         diff_sq = diff_sq * w
-    m = mask
-    while m.ndim < diff_sq.ndim:
-        m = m.unsqueeze(-1)
-    num = (diff_sq * m).sum()
+    num = diff_sq.sum()
     den = m.sum().clamp(min=1.0)
     return num / den
 

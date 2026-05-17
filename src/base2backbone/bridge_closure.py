@@ -319,6 +319,18 @@ def compute_bridge_closure_loss(
     ri_next = restype_indices[:, 1:].long()
     ri_prev = restype_indices[:, :-1].long()
 
+    valid_xyz = bridge_ok.unsqueeze(-1)
+    zero_xyz = torch.zeros((), device=device, dtype=dtype)
+    # Chain ends intentionally leave some bridge atoms as NaN. Sanitize before geometry ops:
+    # masking after `norm`/`acos`/`atan2` is too late because backward may still see 0 * NaN.
+    c4_p = torch.where(valid_xyz, c4_p, zero_xyz)
+    c3_p = torch.where(valid_xyz, c3_p, zero_xyz)
+    o3_p = torch.where(valid_xyz, o3_p, zero_xyz)
+    p_n = torch.where(valid_xyz, p_n, zero_xyz)
+    o5_n = torch.where(valid_xyz, o5_n, zero_xyz)
+    c5_n = torch.where(valid_xyz, c5_n, zero_xyz)
+    c4_n = torch.where(valid_xyz, c4_n, zero_xyz)
+
     tc = get_template_tensors(str(device))
     d0_o3p = tc['bond_p_o3_inter'][ri_next]
     d0_po5 = tc['bond_p_o5'][ri_next]
@@ -350,7 +362,8 @@ def compute_bridge_closure_loss(
         d0_po5,
         eps=eps,
     )
-    e_phase = wrap_dihedral_diff(phase_pred, tgt_curr[..., TOR_BRIDGE_PHASE])
+    target_phase = torch.where(bridge_ok, tgt_curr[..., TOR_BRIDGE_PHASE], zero_xyz)
+    e_phase = wrap_dihedral_diff(phase_pred, target_phase)
     torsion_sq = (e_phase / (sigma_t + eps)) ** 2
 
     if valid_pair_mask is not None:
@@ -395,9 +408,13 @@ def compute_bridge_closure_loss(
         }
 
     m = bridge_ok.float()
-    bond_mean = (bond_sq * m).sum() / (m.sum() + eps)
-    angle_mean = (angle_sq * m).sum() / (m.sum() + eps)
-    torsion_mean = (torsion_sq * m).sum() / (m.sum() + eps)
+    bond_sq_safe    = torch.where(bridge_ok, bond_sq,    zero_xyz)
+    angle_sq_safe   = torch.where(bridge_ok, angle_sq,   zero_xyz)
+    torsion_sq_safe = torch.where(bridge_ok, torsion_sq, zero_xyz)
+
+    bond_mean = bond_sq_safe.sum() / (m.sum() + eps)
+    angle_mean = angle_sq_safe.sum() / (m.sum() + eps)
+    torsion_mean = torsion_sq_safe.sum() / (m.sum() + eps)
 
     closure = wb * bond_mean + wa * angle_mean + wt * torsion_mean
 
@@ -405,6 +422,9 @@ def compute_bridge_closure_loss(
     ang_mae = (a1 - ar_angle1).abs() + (a2 - ar_angle2).abs() + (a3 - ar_angle3).abs()
     ang_mae = ang_mae / 3.0
     tor_mae = e_phase.abs()
+    bond_mae = torch.where(bridge_ok, bond_mae, zero_xyz)
+    ang_mae  = torch.where(bridge_ok, ang_mae,  zero_xyz)
+    tor_mae  = torch.where(bridge_ok, tor_mae,  zero_xyz)
 
     valid_frac = n_ok / bb_xyz_world.new_tensor(n_br)
     fail_rate = viol.float().sum() / (n_ok + eps)

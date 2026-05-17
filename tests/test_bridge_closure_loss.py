@@ -62,6 +62,26 @@ def test_bridge_closure_loss_zero_or_low_on_reference_geometry():
     assert float(out['closure_loss']) < 1e-2
 
 
+def test_bridge_closure_loss_ignores_invalid_nan_bridge_backward():
+    bb_valid, tors_valid, mask_valid, _valid, ri_valid = _ideal_bridge_bb_and_targets(dtype=torch.float32)
+    bb = bb_valid.repeat(2, 1, 1, 1).detach()
+    tors = tors_valid.repeat(2, 1, 1).detach()
+    mask = mask_valid.repeat(2, 1, 1).detach()
+    ri = ri_valid.repeat(2, 1).detach()
+
+    # Invalid row mimics chain-edge phosphate atoms: NaN coordinates but bridge mask is false.
+    j_p = BACKBONE_ATOMS.index('P')
+    bb[1, 1, j_p] = float('nan')
+    mask[1, 1, TOR_BRIDGE_PHASE] = False
+    bb.requires_grad_(True)
+
+    out = compute_bridge_closure_loss(bb, tors, mask, ri)
+    assert torch.isfinite(out['closure_loss'])
+
+    out['closure_loss'].backward()
+    assert torch.isfinite(bb.grad).all()
+
+
 def test_bridge_closure_loss_penalizes_broken_bond():
     bb, tors, mask, _, ri = _ideal_bridge_bb_and_targets()
     base = compute_bridge_closure_loss(bb, tors, mask, ri)

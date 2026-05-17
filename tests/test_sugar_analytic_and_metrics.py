@@ -187,15 +187,12 @@ def test_sugar_ring_from_xy_z_contract(device='cpu'):
 
 
 def test_closed_form_with_delta_layout_no_sincos():
-    assert N_TORSIONS == 9
-    assert N_LATENT == 10
+    assert N_TORSIONS == 6
+    assert N_LATENT == 7
     assert TORSION_NAMES == (
-        'alpha',
-        'beta',
+        'bridge_phase',
         'gamma',
         'delta',
-        'epsilon',
-        'zeta',
         'chi',
         'pseudorotation_phase',
         'eta_p',

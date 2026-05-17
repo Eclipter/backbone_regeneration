@@ -126,7 +126,7 @@ def test_score_target_differs_from_naive_gaussian_score_when_wrapping_matters():
 
 
 def test_no_sincos_latent_constants():
-    assert N_LATENT == 10 and N_TORSIONS == 9
+    assert N_LATENT == 7 and N_TORSIONS == 6
     assert 'delta' in TORSION_NAMES
 
 
@@ -319,5 +319,5 @@ def test_torsion_score_network_out_features_is_packed_latent():
         closure_torsion_weight=1.0,
     )
     pl_mod = BackboneLightningModule(**cast(Any, hp)).float()
-    assert pl_mod.score_network.out.out_features == N_LATENT == 10
+    assert pl_mod.score_network.out.out_features == N_LATENT == 7
     assert pl_mod.score_network.out.out_features != N_TORSIONS * 2 + 1

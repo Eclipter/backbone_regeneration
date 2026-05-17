@@ -9,15 +9,12 @@ import torch
 
 from ..torsion_constants import (
     N_TORSIONS,
-    TOR_ALPHA,
-    TOR_BETA,
+    TOR_BRIDGE_PHASE,
     TOR_CHI,
     TOR_DELTA,
-    TOR_EPS,
     TOR_ETA_P,
     TOR_GAMMA,
     TOR_PSEUDOROTATION_PHASE,
-    TOR_ZETA,
 )
 from .primitives import (
     _bond_angle,
@@ -33,6 +30,7 @@ from .primitives import (
 from .torsions import (
     RING_TORSION_DEFS as _RING_TORSION_DEFS,
     _PSEUDOROTATION_OFFSETS,
+    phosphate_from_bridge_phase_torch,
     nucleotide_torsions,
     nus_rad_from_phase_and_amplitude,
     phase_and_amplitude_to_nus,
@@ -42,7 +40,6 @@ from .torsions import (
 )
 
 _GEO_EPS = 1e-8
-_PHI_PHOS_GRID = 128
 _HALF_PI = math.pi / 2.0
 
 
@@ -446,22 +443,6 @@ def _scalar_constant(
     return torch.tensor(value, device=torch.device(device_str), dtype=dtype)
 
 
-@functools.lru_cache(maxsize=None)
-def _phi_grid(
-    device_str: str,
-    dtype: torch.dtype,
-    n_grid: int,
-) -> torch.Tensor:
-    return torch.linspace(
-        0.0,
-        2.0 * math.pi,
-        n_grid,
-        device=torch.device(device_str),
-        dtype=dtype,
-    )
-
-
-@functools.lru_cache(maxsize=None)
 def _planar_sugar_spec_tensors(
     device_str: str,
     dtype: torch.dtype,
@@ -883,41 +864,17 @@ def add_o5_from_gamma(
 def close_phosphate_bridge_multi(
     prev_atoms: dict[str, torch.Tensor],
     next_atoms: dict[str, torch.Tensor],
-    epsilon_prev: torch.Tensor,
-    zeta_prev: torch.Tensor,
-    alpha_next: torch.Tensor,
-    beta_next: torch.Tensor,
+    bridge_phase: torch.Tensor,
     *,
     geometry: Optional[dict] = None,
-    weight_epsilon: torch.Tensor | float = 1.0,
-    weight_zeta: torch.Tensor | float = 1.0,
-    weight_alpha: torch.Tensor | float = 1.0,
-    weight_beta: torch.Tensor | float = 1.0,
 ) -> dict[str, torch.Tensor]:
-    """Place P on the O3'prev–O5'next circle; scan φ to match up to four target dihedrals."""
+    """Place P on the decoder's ideal O3'prev–O5'next bridge circle from a predicted phase."""
     g = geometry or {}
-    device = epsilon_prev.device
-    dtype = epsilon_prev.dtype
+    device = bridge_phase.device
+    dtype = bridge_phase.dtype
     device_str = str(device)
-
-    def _broadcast_bridge_weight(w, batch_sz: int) -> torch.Tensor:
-        """Scalar or per-batch weight column [B, 1] for loss grid broadcast."""
-        if isinstance(w, torch.Tensor):
-            t = w.reshape(-1).to(device=device, dtype=dtype)
-            if t.numel() == 1:
-                t = t.expand(batch_sz)
-            elif t.numel() != batch_sz:
-                raise ValueError(
-                    f'Bridge weight tensor must have 1 or B={batch_sz} elements, got {t.numel()}',
-                )
-            return t.reshape(batch_sz, 1)
-        return torch.full((batch_sz, 1), float(w), device=device, dtype=dtype)
     o3p = prev_atoms["O3'"]
-    c3p = prev_atoms["C3'"]
-    c4p = prev_atoms["C4'"]
     o5n = next_atoms["O5'"]
-    c5n = next_atoms["C5'"]
-    c4n = next_atoms["C4'"]
 
     ri = g.get('restype_indices_next')
     if ri is None:
@@ -930,117 +887,24 @@ def close_phosphate_bridge_multi(
         tc = _get_template_tensors(device_str)
     r_o3p = _template_select(tc, 'bond_p_o3_inter', ri, dtype=dtype)
     l_po5 = _template_select(tc, 'bond_p_o5', ri, dtype=dtype)
-
-    d_vec = o5n - o3p
-    d_o3_o5 = d_vec.norm(dim=-1).clamp(min=_GEO_EPS)
-    axis, v1, v2 = _orthonormal_basis_from_axis(d_vec, eps=_GEO_EPS)
-
-    sum_l = r_o3p + l_po5
-    diff_l = (r_o3p - l_po5).abs()
-    feasible = (d_o3_o5 >= diff_l - 1e-6) & (d_o3_o5 <= sum_l + 1e-6)
-
-    a_coef = (r_o3p * r_o3p - l_po5 * l_po5 + d_o3_o5 * d_o3_o5) / (2.0 * d_o3_o5)
-    h_sq = (r_o3p * r_o3p - a_coef * a_coef).clamp(min=0.0)
-    # `sqrt(h_sq + eps^2)`: at degenerate (infeasible) triangles `h_sq=0` and `sqrt'(0) = +inf`,
-    # which then propagates to NaN in upstream grads. Tiny additive eps regularises backward.
-    h_val = torch.sqrt(h_sq + 1e-12)
-
-    midpoint = o3p + a_coef.unsqueeze(-1) * axis
-
-    n_grid = int(g.get('n_phi', _PHI_PHOS_GRID))
-    ts = _phi_grid(device_str, dtype, n_grid)
-    if o3p.ndim >= 2:
-        B = int(o3p.shape[0])
-    else:
-        B = 1
+    squeeze = False
+    if o3p.ndim == 1:
         o3p = o3p.unsqueeze(0)
-        c3p = c3p.unsqueeze(0)
-        c4p = c4p.unsqueeze(0)
         o5n = o5n.unsqueeze(0)
-        c5n = c5n.unsqueeze(0)
-        c4n = c4n.unsqueeze(0)
-        epsilon_prev = epsilon_prev.reshape(1)
-        zeta_prev = zeta_prev.reshape(1)
-        alpha_next = alpha_next.reshape(1)
-        beta_next = beta_next.reshape(1)
+        bridge_phase = bridge_phase.reshape(1)
         r_o3p = r_o3p.reshape(1)
         l_po5 = l_po5.reshape(1)
-        d_o3_o5 = d_o3_o5.reshape(1)
-        feasible = feasible.reshape(1)
-        a_coef = a_coef.reshape(1)
-        h_val = h_val.reshape(1)
-        midpoint = midpoint.unsqueeze(0)
-        axis = axis.unsqueeze(0)
-        v1 = v1.unsqueeze(0)
-        v2 = v2.unsqueeze(0)
         ri = ri.reshape(1)
+        squeeze = True
 
-    B = int(o3p.shape[0])
-    p_cands = (
-        midpoint.unsqueeze(1)
-        + h_val.unsqueeze(1).unsqueeze(-1)
-        * (
-            torch.cos(ts).view(1, -1, 1) * v1.unsqueeze(1)
-            + torch.sin(ts).view(1, -1, 1) * v2.unsqueeze(1)
-        )
+    p_pick = phosphate_from_bridge_phase_torch(
+        o3p,
+        o5n,
+        bridge_phase,
+        r_o3p,
+        l_po5,
+        eps=_GEO_EPS,
     )
-
-    c4p_g = c4p.unsqueeze(1).expand(-1, n_grid, -1)
-    c3p_g = c3p.unsqueeze(1).expand(-1, n_grid, -1)
-    o3p_g = o3p.unsqueeze(1).expand(-1, n_grid, -1)
-    o5n_g = o5n.unsqueeze(1).expand(-1, n_grid, -1)
-    c5n_g = c5n.unsqueeze(1).expand(-1, n_grid, -1)
-    c4n_g = c4n.unsqueeze(1).expand(-1, n_grid, -1)
-    eps_m = dihedral_rad(
-        c4p_g.reshape(-1, 3),
-        c3p_g.reshape(-1, 3),
-        o3p_g.reshape(-1, 3),
-        p_cands.reshape(-1, 3),
-    ).reshape(B, n_grid)
-
-    ze_m = dihedral_rad(
-        c3p_g.reshape(-1, 3),
-        o3p_g.reshape(-1, 3),
-        p_cands.reshape(-1, 3),
-        o5n_g.reshape(-1, 3),
-    ).reshape(B, n_grid)
-
-    al_m = dihedral_rad(
-        o3p_g.reshape(-1, 3),
-        p_cands.reshape(-1, 3),
-        o5n_g.reshape(-1, 3),
-        c5n_g.reshape(-1, 3),
-    ).reshape(B, n_grid)
-
-    be_m = dihedral_rad(
-        p_cands.reshape(-1, 3),
-        o5n_g.reshape(-1, 3),
-        c5n_g.reshape(-1, 3),
-        c4n_g.reshape(-1, 3),
-    ).reshape(B, n_grid)
-
-    we = _broadcast_bridge_weight(weight_epsilon, B)
-    wz = _broadcast_bridge_weight(weight_zeta, B)
-    wa = _broadcast_bridge_weight(weight_alpha, B)
-    wb = _broadcast_bridge_weight(weight_beta, B)
-
-    loss = (
-        we * wrap_dihedral_diff(eps_m, epsilon_prev.unsqueeze(-1)) ** 2
-        + wz * wrap_dihedral_diff(ze_m, zeta_prev.unsqueeze(-1)) ** 2
-        + wa * wrap_dihedral_diff(al_m, alpha_next.unsqueeze(-1)) ** 2
-        + wb * wrap_dihedral_diff(be_m, beta_next.unsqueeze(-1)) ** 2
-    )
-
-    best = loss.argmin(dim=-1)
-    idx = torch.arange(B, device=device, dtype=torch.long)
-    p_pick = p_cands[idx, best]
-
-    # Infeasible: midpoint along axis (deterministic fallback)
-    not_feas = ~feasible
-    if not_feas.any():
-        sum_l = (r_o3p + l_po5).unsqueeze(-1).clamp(min=_GEO_EPS)
-        fb = o3p + (o5n - o3p) * (r_o3p.unsqueeze(-1) / sum_l)
-        p_pick = torch.where(not_feas.unsqueeze(-1), fb, p_pick)
 
     half_pi = _scalar_constant(_HALF_PI, device_str, dtype)
     bl_op1 = _template_select(tc, 'bl_op1', ri, dtype=dtype)
@@ -1054,7 +918,7 @@ def close_phosphate_bridge_multi(
     op2 = nerf_place(o3p, o5n, p_pick, bl_op2, ang_op2, psi_op2 - half_pi)
 
     out = {'P': p_pick, 'OP1': op1, 'OP2': op2}
-    if B == 1 and epsilon_prev.ndim == 0:
+    if squeeze:
         out = {k: v.squeeze(0) for k, v in out.items()}
     return out
 
@@ -1088,8 +952,7 @@ def build_backbone_from_torsions(
 ) -> dict[str, torch.Tensor]:
     """Batched decoder: deterministic sugar ring closure, stereo exocyclic O3′/C5′, γ→O5′.
 
-    Phosphate uses ``close_phosphate_bridge_multi``; without prior-nucleotide ε/ζ in this API,
-    only α and β targets are weighted (incoming bridge from o3_prev in target frame).
+    Phosphate uses a single predicted bridge phase on the decoder's ideal O3′–P–O5′ circle.
     """
     ri = restype_indices.long()
     geometry = {'template_tensors': _get_template_tensors(str(torsions.device))}
@@ -1097,10 +960,7 @@ def build_backbone_from_torsions(
     P = torsions[:, TOR_PSEUDOROTATION_PHASE]
     gamma = torsions[:, TOR_GAMMA]
     delta = torsions[:, TOR_DELTA]
-    alpha = torsions[:, TOR_ALPHA]
-    beta = torsions[:, TOR_BETA]
-    eps_lat = torsions[:, TOR_EPS]
-    zet_lat = torsions[:, TOR_ZETA]
+    bridge_phase = torsions[:, TOR_BRIDGE_PHASE]
     ring = build_sugar_ring_closed_form(chi, P, tau_m, ri, geometry=geometry)
     atoms = add_exocyclic_sugar_atoms(ring, delta, restype_indices=ri, geometry=geometry)
     atoms = add_o5_from_gamma(atoms, gamma, restype_indices=ri, geometry=geometry)
@@ -1133,18 +993,11 @@ def build_backbone_from_torsions(
     phosph = close_phosphate_bridge_multi(
         prev_atoms,
         next_atoms,
-        eps_lat,
-        zet_lat,
-        alpha,
-        beta,
+        bridge_phase,
         geometry={
             'restype_indices_next': ri,
             'template_tensors': geometry['template_tensors'],
         },
-        weight_epsilon=0.0,
-        weight_zeta=0.0,
-        weight_alpha=1.0,
-        weight_beta=1.0,
     )
     out['P'] = phosph['P']
     # Place OP1/OP2 using predicted eta_p = dihedral(C5', O5', P, OP1)
@@ -1177,8 +1030,8 @@ def build_batch_window_backbone_from_torsions(
 ) -> torch.Tensor:
     """World backbone ``[B, W, n_bb, 3]``; atom order matches ``_BACKBONE_ATOM_ORDER``.
 
-    For each window position ``k>=1`` and batch row ``b``, place ``P_k``/``OP*`` using ε,ζ from
-    residue ``k−1`` and α,β from ``k`` (per-sample mask when ``torsion_mask`` is set).
+    For each window position ``k>=1`` and batch row ``b``, place ``P_k``/``OP*`` using the
+    predicted bridge phase stored on residue ``k``.
     """
     if torsions.dim() != 3 or torsions.shape[-1] != N_TORSIONS:
         raise ValueError(
@@ -1252,37 +1105,38 @@ def build_batch_window_backbone_from_torsions(
             nm: next_local[:, atom_idx]
             for atom_idx, nm in enumerate(_BRIDGE_NEXT_ATOM_ORDER)
         }
-        next_loc['_ri'] = restype_indices[idx, k]
-
-        nv = int(idx.shape[0])
-        if torsion_mask is None:
-            we = torch.ones(nv, device=device, dtype=dtype)
-            wz = torch.ones(nv, device=device, dtype=dtype)
-            wa = torch.ones(nv, device=device, dtype=dtype)
-            wb = torch.ones(nv, device=device, dtype=dtype)
+        if torsion_mask is not None:
+            bridge_ok = torsion_mask[idx, k, TOR_BRIDGE_PHASE]
+            if not bool(bridge_ok.any().item()):
+                continue
+            idx = idx[bridge_ok]
+            ok = ok[bridge_ok]
+            Rk = Rk[bridge_ok]
+            prev_local = prev_local[bridge_ok]
+            next_local = next_local[bridge_ok]
+            ri_k = restype_indices[idx, k]
         else:
-            we = torsion_mask[idx, k - 1, TOR_EPS].to(dtype=dtype)
-            wz = torsion_mask[idx, k - 1, TOR_ZETA].to(dtype=dtype)
-            wa = torsion_mask[idx, k, TOR_ALPHA].to(dtype=dtype)
-            wb = torsion_mask[idx, k, TOR_BETA].to(dtype=dtype)
+            ri_k = restype_indices[idx, k]
+
+        prev_loc = {
+            nm: prev_local[:, atom_idx]
+            for atom_idx, nm in enumerate(_BRIDGE_PREV_ATOM_ORDER)
+        }
+        next_loc = {
+            nm: next_local[:, atom_idx]
+            for atom_idx, nm in enumerate(_BRIDGE_NEXT_ATOM_ORDER)
+        }
+        next_loc['_ri'] = ri_k
 
         tc_bb = geometry['template_tensors']
-        ri_k = restype_indices[idx, k]
         phosph = close_phosphate_bridge_multi(
             prev_loc,
             next_loc,
-            torsions[idx, k - 1, TOR_EPS],
-            torsions[idx, k - 1, TOR_ZETA],
-            torsions[idx, k, TOR_ALPHA],
-            torsions[idx, k, TOR_BETA],
+            torsions[idx, k, TOR_BRIDGE_PHASE],
             geometry={
                 'restype_indices_next': ri_k,
                 'template_tensors': tc_bb,
             },
-            weight_epsilon=we,
-            weight_zeta=wz,
-            weight_alpha=wa,
-            weight_beta=wb,
         )
         # Re-place OP1/OP2 using predicted eta_p = dihedral(C5', O5', P, OP1).
         eta_p_k = torsions[idx, k, TOR_ETA_P]

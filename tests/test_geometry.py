@@ -9,10 +9,7 @@ from base2backbone.geometry.primitives import dihedral_rad_coords, nerf_place_co
 from base2backbone.torsion_constants import TAU_M_MAX, TAU_M_MIN
 from base2backbone.geometry.backbone import (
     N_TORSIONS,
-    TOR_ALPHA,
-    TOR_BETA,
-    TOR_EPS,
-    TOR_ZETA,
+    TOR_BRIDGE_PHASE,
     TOR_GAMMA,
     TOR_CHI,
     TOR_PSEUDOROTATION_PHASE,
@@ -22,6 +19,7 @@ from base2backbone.geometry.backbone import (
     _get_template,
     world_to_local_points,
 )
+from base2backbone.geometry import bridge_phase_from_points
 from base2backbone.score_diffusion import decode_torsions, encode_torsions, wrap_angle
 
 
@@ -42,10 +40,7 @@ def _apply_inf_mask(sample_data: Data):
     for i in range(WINDOW_SIZE):
         ce = sample_data.chain_end_class[i]
         if ce[CHAIN_END_CLASS_5_PRIME].item():
-            pos_mask[i, TOR_ALPHA] = False
-        if ce[CHAIN_END_CLASS_3_PRIME].item():
-            pos_mask[i, TOR_EPS] = False
-            pos_mask[i, TOR_ZETA] = False
+            pos_mask[i, TOR_BRIDGE_PHASE] = False
     sample_data.torsion_mask = pos_mask
 
 
@@ -62,35 +57,37 @@ def _shifted_neighbor_tpl(restype: str):
     return tpl, xyz_prev, xyz_next
 
 
-def test_alpha_roundtrip_from_template():
+def test_bridge_phase_roundtrip_from_template():
     restype = 'G'
     xyz_cur, xyz_prev, xyz_next = _shifted_neighbor_tpl(restype)
     t, mask, tau_m_val, tau_m_valid = nucleotide_torsions(
         xyz_cur, xyz_prev, xyz_next, restype,
     )
-    alpha = float(t[TOR_ALPHA])
-    beta = float(t[TOR_BETA])
+    bridge_phase = float(t[TOR_BRIDGE_PHASE])
     gamma = float(t[TOR_GAMMA])
-    eps = float(t[TOR_EPS])
-    zeta = float(t[TOR_ZETA])
     chi = float(t[TOR_CHI])
     p_rad = float(t[TOR_PSEUDOROTATION_PHASE])
 
-    ma, mb = bool(mask[TOR_ALPHA]), bool(mask[TOR_BETA])
+    mb = bool(mask[TOR_BRIDGE_PHASE])
     mg = bool(mask[TOR_GAMMA])
-    me, mz = bool(mask[TOR_EPS]), bool(mask[TOR_ZETA])
     mx, mp = bool(mask[TOR_CHI]), bool(mask[TOR_PSEUDOROTATION_PHASE])
-    assert ma and mb and mg and me and mz and mx and mp
+    assert mb and mg and mx and mp
     assert tau_m_valid
     assert tau_m_val > 0.0
-    assert all(np.isfinite((alpha, beta, gamma, eps, zeta, chi, p_rad)))
+    assert all(np.isfinite((bridge_phase, gamma, chi, p_rad)))
 
     o3_prev_local = np.asarray(xyz_prev["O3'"], dtype=np.float64).reshape(3)
     bb = build_backbone_local(t, restype, o3_prev_local=o3_prev_local, tau_m=None)
-    got = float(dihedral_rad_coords(o3_prev_local, bb['P'], bb["O5'"], bb["C5'"]).item())
-    d = float(np.arctan2(np.sin(got - alpha), np.cos(got - alpha)))
-    # Differentiable phosphate closure can disagree with the legacy numpy circle scan by ~π on stressed fixtures.
-    assert abs(d) < 3.0
+    r_bridge = float(np.linalg.norm(xyz_cur['P'] - xyz_cur["O5'"]))
+    got = bridge_phase_from_points(
+        o3_prev_local,
+        bb["O5'"],
+        bb['P'],
+        r_bridge,
+        r_bridge,
+    )
+    d = float(np.arctan2(np.sin(got - bridge_phase), np.cos(got - bridge_phase)))
+    assert abs(d) < 0.2
 
 
 def test_tau_m_encode_decode_roundtrip():
@@ -123,10 +120,8 @@ def test_inference_positional_mask():
     internal_expected = [True] * N_TORSIONS
 
     expected_5p = internal_expected.copy()
-    expected_5p[TOR_ALPHA] = False
+    expected_5p[TOR_BRIDGE_PHASE] = False
     expected_3p = internal_expected.copy()
-    expected_3p[TOR_EPS] = False
-    expected_3p[TOR_ZETA] = False
 
     assert row_5prime == expected_5p
     assert row_internal == internal_expected
@@ -140,32 +135,20 @@ def _consistent_neighbor_tpl(restype: str):
     return tpl, xyz_prev, xyz_next
 
 
-def test_beta_gamma_paths_close_on_canonical_template():
-    """γ and β are two consistent ways to place O5′ when the correct sign (+ HP) is used on β.
-
-    On the canonical template, NeRF from (C3′, C4′, C5′) with γ − HP matches NeRF from
-    (C4′, C5′, P) with β + HP in position and dihedral tolerances. Production O5′ placement
-    uses the γ-path only; this test does not exercise β − HP.
-    """
+def test_gamma_path_matches_template_on_canonical_template():
     restype = 'C'
     tpl, xyz_prev, xyz_next = _consistent_neighbor_tpl(restype)
     t, mask, tau_m_val, tau_m_valid = nucleotide_torsions(tpl, xyz_prev, xyz_next, restype)
-    alpha = float(t[TOR_ALPHA])
-    beta = float(t[TOR_BETA])
     gamma = float(t[TOR_GAMMA])
-    eps = float(t[TOR_EPS])
-    zeta = float(t[TOR_ZETA])
     chi = float(t[TOR_CHI])
     p_rad = float(t[TOR_PSEUDOROTATION_PHASE])
 
-    ma, mb = bool(mask[TOR_ALPHA]), bool(mask[TOR_BETA])
+    mb = bool(mask[TOR_BRIDGE_PHASE])
     mg = bool(mask[TOR_GAMMA])
-    me, mz = bool(mask[TOR_EPS]), bool(mask[TOR_ZETA])
     mx, mp = bool(mask[TOR_CHI]), bool(mask[TOR_PSEUDOROTATION_PHASE])
-    assert ma and mb and mg and me and mz and mx and mp
+    assert mb and mg and mx and mp
     assert tau_m_valid and tau_m_val > 0.0
-    assert all(np.isfinite((alpha, beta, gamma, eps, zeta, chi, p_rad)))
-    p_b = tpl['P'].copy()
+    assert all(np.isfinite((gamma, chi, p_rad)))
     HP = np.pi / 2.0
     c3, c4, c5 = tpl["C3'"].copy(), tpl["C4'"].copy(), tpl["C5'"].copy()
 
@@ -181,20 +164,11 @@ def test_beta_gamma_paths_close_on_canonical_template():
     ang_c5 = _ba(tpl["C4'"], tpl["C5'"], tpl["O5'"])
     o5_ga = nerf_place_coords(c3, c4, c5, r_o5_c5, ang_c5, gamma - HP).cpu().numpy()
 
-    r_o5_p = _blen(tpl["O5'"], tpl['P'])
-    ang_p = _ba(tpl["C5'"], tpl['P'], tpl["O5'"])
-    o5_beta = nerf_place_coords(c4, c5, p_b, r_o5_p, ang_p, beta + HP).cpu().numpy()
-
     g_meas = float(dihedral_rad_coords(c3, c4, c5, o5_ga).item())
     dg = float(np.arctan2(np.sin(g_meas - gamma), np.cos(g_meas - gamma)))
     assert abs(dg) < 0.06
-
-    b_meas_loose = float(dihedral_rad_coords(p_b, o5_beta, c5, c4).item())
-    db_loose = float(np.arctan2(np.sin(b_meas_loose - beta), np.cos(b_meas_loose - beta)))
-    assert abs(db_loose) < 0.25
-
-    d_geom = float(np.linalg.norm(o5_ga - o5_beta))
-    assert d_geom <= 0.5 + 1e-6
+    d_geom = float(np.linalg.norm(o5_ga - tpl["O5'"]))
+    assert d_geom <= 0.1 + 1e-6
 
 
 def test_world_local_roundtrip():

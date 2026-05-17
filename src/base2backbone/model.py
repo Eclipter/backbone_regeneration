@@ -20,8 +20,8 @@ from .score_diffusion import (decode_torsions, encode_torsions,
                               reverse_ve_score_ode_step, sigma_schedule,
                               ve_sigma_grid, weighted_score_mse, wrap_angle)
 from .torsion_constants import (LOG_TAU_M_MAX, LOG_TAU_M_MIN, N_LATENT,
-                                N_TORSIONS, TAU_M_MAX, TAU_M_MIN, TOR_ALPHA,
-                                TOR_EPS, TOR_ZETA)
+                                N_TORSIONS, TAU_M_MAX, TAU_M_MIN,
+                                TOR_BRIDGE_PHASE)
 
 # Same dimension constant name as in ONNX companion JSON (`N_TORSIONS_LATENT`).
 N_TORSIONS_LATENT = N_LATENT
@@ -313,10 +313,7 @@ class BackboneLightningModule(pl.LightningModule):
         mask = torch.ones((b, ws, N_TORSIONS), dtype=torch.bool, device=batch.torsions.device)
         ce = batch.chain_end_class.view(b, ws, N_CHAIN_END_CLASSES)
         is_5prime = ce[..., CHAIN_END_CLASS_5_PRIME] > 0
-        is_3prime = ce[..., CHAIN_END_CLASS_3_PRIME] > 0
-        mask[..., TOR_ALPHA] &= ~is_5prime
-        mask[..., TOR_EPS] &= ~is_3prime
-        mask[..., TOR_ZETA] &= ~is_3prime
+        mask[..., TOR_BRIDGE_PHASE] &= ~is_5prime
         return mask
 
     def _build_window_backbone(

@@ -20,8 +20,8 @@ _MODEL_PY = _SRC / 'model.py'
 
 
 def test_torsion_counts():
-    assert N_TORSIONS == 9
-    assert N_LATENT == 10
+    assert N_TORSIONS == 6
+    assert N_LATENT == 7
     assert N_TORSIONS_LATENT == N_LATENT
 
 

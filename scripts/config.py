@@ -44,7 +44,7 @@ EXPERIMENTS = [
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'torsions/9'
+RUN_NAME = 'torsions/10'
 
 # Set to None to fetch from RCSB PDB API and save into latest.json
 DATASET_MANIFEST = 'thesis_2026-05-17.json'

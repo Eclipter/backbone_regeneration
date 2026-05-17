@@ -107,7 +107,7 @@ def test_validation_step_source_always_logs_val_closure():
 
 
 def test_tl_latent_width_matches_torch_geometry():
-    assert N_LATENT == 10
+    assert N_LATENT == 7
 
 
 def test_p_sample_loop_finite_shapes_with_stub_scores(monkeypatch):

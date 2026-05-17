@@ -16,6 +16,7 @@ from base2backbone.geometry.backbone import (
     close_phosphate_bridge_multi, dihedral_rad,
     nucleotide_torsions, nus_rad_from_phase_and_amplitude,
     wrap_dihedral_diff)
+from base2backbone.geometry import bridge_phase_from_points_torch
 
 
 def _assert_window_bb_finiteness_design(bb: torch.Tensor) -> None:
@@ -257,9 +258,8 @@ def test_gamma_places_o5(device):
     assert err < 0.05
 
 
-def test_phosphate_bridge_uses_all_four_torsions(device):
-    # Single isolated template has O3'–O5' span >> r_O3'+l_PO5 ⇒ no phosphate circle ⇒ φ scan ineffective.
-    # Use a contiguous C–C pair so the inter-residue chord is chemically feasible for ``close_phosphate_bridge_multi``.
+def test_phosphate_bridge_uses_predicted_bridge_phase(device):
+    # Use a contiguous C–C pair so the inter-residue chord is chemically feasible for bridge placement.
     rest = 'C'
     prev_np, next_np = canonical_two_residue_bridge_positions(rest, rest)
 
@@ -277,59 +277,37 @@ def test_phosphate_bridge_uses_all_four_torsions(device):
     c4n = _pv(next_np, "C4'")
     p_gt = _pv(next_np, 'P')
 
-    # Targets match the phosphate decoder's χ definitions for this aligned geometry (ground-truth bridge P).
-    e_t = float(
-        dihedral_rad(c4p.squeeze(0), c3p.squeeze(0), o3p.squeeze(0), p_gt.squeeze(0)).item(),
+    tc = _template_tc(dev)
+    phase_t = bridge_phase_from_points_torch(
+        o3p,
+        o5n,
+        p_gt,
+        tc['bond_p_o3_inter'][ri],
+        tc['bond_p_o5'][ri],
     )
-    z_t = float(
-        dihedral_rad(c3p.squeeze(0), o3p.squeeze(0), p_gt.squeeze(0), o5n.squeeze(0)).item(),
-    )
-    a_t = float(dihedral_rad(o3p.squeeze(0), p_gt.squeeze(0), o5n.squeeze(0), c5n.squeeze(0)).item())
-    b_t = float(dihedral_rad(p_gt.squeeze(0), o5n.squeeze(0), c5n.squeeze(0), c4n.squeeze(0)).item())
 
     prev_atoms = {"O3'": o3p, "C3'": c3p, "C4'": c4p}
     next_atoms = {"O5'": o5n, "C5'": c5n, "C4'": c4n, '_ri': ri}
-    et = torch.tensor([e_t], device=dev)
-    zt = torch.tensor([z_t], device=dev)
-    at = torch.tensor([a_t], device=dev)
-    bt = torch.tensor([b_t], device=dev)
     out = close_phosphate_bridge_multi(
         prev_atoms,
         next_atoms,
-        et,
-        zt,
-        at,
-        bt,
+        phase_t,
         geometry={'restype_indices_next': ri},
-        weight_epsilon=1.0,
-        weight_zeta=1.0,
-        weight_alpha=1.0,
-        weight_beta=1.0,
     )
     p = out['P'].squeeze(0)
-    tc = _template_tc(dev)
     target_len = tc['bond_p_o3_inter'][ri].item()
     d_po3 = float(torch.linalg.vector_norm(p - o3p.squeeze(0)).item())
     assert abs(d_po3 - target_len) < 0.12
 
-    eps_m = dihedral_rad(c4p.squeeze(0), c3p.squeeze(0), o3p.squeeze(0), p)
-    ze_m = dihedral_rad(c3p.squeeze(0), o3p.squeeze(0), p, o5n.squeeze(0))
-    al_m = dihedral_rad(o3p.squeeze(0), p, o5n.squeeze(0), c5n.squeeze(0))
-    be_m = dihedral_rad(p, o5n.squeeze(0), c5n.squeeze(0), c4n.squeeze(0))
-    for name, m, target in zip(
-        ('eps', 'zeta', 'alpha', 'beta'),
-        (eps_m, ze_m, al_m, be_m),
-        (e_t, z_t, a_t, b_t),
-    ):
-        err = abs(
-            float(
-                wrap_dihedral_diff(
-                    m.reshape(1),
-                    torch.tensor([target], device=dev),
-                ).item(),
-            ),
-        )
-        assert err < 0.25, name
+    phase_m = bridge_phase_from_points_torch(
+        o3p,
+        o5n,
+        p.unsqueeze(0),
+        tc['bond_p_o3_inter'][ri],
+        tc['bond_p_o5'][ri],
+    )
+    err = abs(float(wrap_dihedral_diff(phase_m, phase_t).item()))
+    assert err < 1e-4
 
 
 def test_ground_truth_torsions_from_disk():

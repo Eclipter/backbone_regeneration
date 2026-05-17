@@ -21,8 +21,8 @@ from .geometry import build_batch_window_backbone_from_torsions
 from .io import default_atoms_provider, inference_atoms_provider
 from .onnx_inference import OnnxSampler
 from .runtime import MODEL_DIR, PROGRESS_BAR_COLOR
-from .torsion_constants import (N_TORSIONS, TAU_M_MAX, TAU_M_MIN, TOR_ALPHA,
-                                TOR_EPS, TOR_ZETA)
+from .torsion_constants import (N_TORSIONS, TAU_M_MAX, TAU_M_MIN,
+                                TOR_BRIDGE_PHASE)
 
 WINDOW_SIZE = 3
 
@@ -150,19 +150,12 @@ def _predict_full_window_predictions_dict(model, sample_data, device) -> dict[An
 
 
 def _inference_chain_end_mask_tensor(sample_data):
-    """Boolean mask over window torsions: chain terminals disable α (5′) / ε ζ (3′).
-
-    Used with window-level inference so phosphate bridges consume predicted ε ζ / α β on
-    both sides rather than pretending base-only placeholders are trustworthy.
-    """
+    """Boolean mask over window torsions: 5′ terminals have no incoming phosphate bridge."""
     pos_mask = torch.ones(WINDOW_SIZE, N_TORSIONS, dtype=torch.bool)
     for i in range(WINDOW_SIZE):
         ce = sample_data.chain_end_class[i]
         if ce[CHAIN_END_CLASS_5_PRIME].item():
-            pos_mask[i, TOR_ALPHA] = False
-        if ce[CHAIN_END_CLASS_3_PRIME].item():
-            pos_mask[i, TOR_EPS] = False
-            pos_mask[i, TOR_ZETA] = False
+            pos_mask[i, TOR_BRIDGE_PHASE] = False
     return pos_mask
 
 

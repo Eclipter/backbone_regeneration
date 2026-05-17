@@ -9,10 +9,13 @@ import torch
 from base2backbone.bridge_closure import (
     canonical_two_residue_bridge_bb_tensor, compute_bridge_closure_loss)
 from base2backbone.data import BACKBONE_ATOMS
-from base2backbone.geometry.backbone import (N_TORSIONS, TOR_ALPHA, TOR_BETA,
-                                             TOR_EPS, TOR_ZETA,
-                                             _get_template_tensors,
-                                             dihedral_rad, wrap_dihedral_diff)
+from base2backbone.geometry.backbone import (
+    N_TORSIONS,
+    TOR_BRIDGE_PHASE,
+    _get_template_tensors,
+    wrap_dihedral_diff,
+)
+from base2backbone.geometry import bridge_phase_from_points_torch
 
 
 def _ideal_bridge_bb_and_targets(dtype=torch.float64, device='cpu'):
@@ -23,34 +26,28 @@ def _ideal_bridge_bb_and_targets(dtype=torch.float64, device='cpu'):
     bb = bb2.unsqueeze(0)
 
     j_c4, j_c3, j_o3 = nj["C4'"], nj["C3'"], nj["O3'"]
-    j_p, j_o5, j_c5 = nj['P'], nj["O5'"], nj["C5'"]
+    j_p, j_o5 = nj['P'], nj["O5'"]
 
     c4_p = bb[:, 0, j_c4]
     c3_p = bb[:, 0, j_c3]
     o3_p = bb[:, 0, j_o3]
     p_n = bb[:, 1, j_p]
     o5_n = bb[:, 1, j_o5]
-    c5_n = bb[:, 1, j_c5]
-    c4_n = bb[:, 1, j_c4]
-
-    eps = dihedral_rad(c4_p, c3_p, o3_p, p_n)
-    ze = dihedral_rad(c3_p, o3_p, p_n, o5_n)
-    al = dihedral_rad(o3_p, p_n, o5_n, c5_n)
-    be = dihedral_rad(p_n, o5_n, c5_n, c4_n)
+    tc = _get_template_tensors(str(bb.device))
+    ri = torch.zeros((B, W), dtype=torch.long, device=device)
+    phase = bridge_phase_from_points_torch(
+        o3_p,
+        o5_n,
+        p_n,
+        tc['bond_p_o3_inter'][ri[:, 1]],
+        tc['bond_p_o5'][ri[:, 1]],
+    )
 
     tors = torch.zeros(B, W, N_TORSIONS, dtype=dtype, device=device)
-    tors[:, 0, TOR_EPS] = eps
-    tors[:, 0, TOR_ZETA] = ze
-    tors[:, 1, TOR_ALPHA] = al
-    tors[:, 1, TOR_BETA] = be
+    tors[:, 1, TOR_BRIDGE_PHASE] = phase
 
     mask = torch.zeros(B, W, N_TORSIONS, dtype=torch.bool, device=device)
-    mask[:, 0, TOR_EPS] = True
-    mask[:, 0, TOR_ZETA] = True
-    mask[:, 1, TOR_ALPHA] = True
-    mask[:, 1, TOR_BETA] = True
-
-    ri = torch.zeros((B, W), dtype=torch.long, device=device)
+    mask[:, 1, TOR_BRIDGE_PHASE] = True
     valid = torch.ones(B, W, dtype=torch.bool, device=device)
     return bb, tors, mask, valid, ri
 

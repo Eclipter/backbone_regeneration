@@ -8,15 +8,12 @@ import torch
 
 from ..torsion_constants import (
     N_TORSIONS,
-    TOR_ALPHA,
-    TOR_BETA,
+    TOR_BRIDGE_PHASE,
     TOR_CHI,
     TOR_DELTA,
-    TOR_EPS,
     TOR_ETA_P,
     TOR_GAMMA,
     TOR_PSEUDOROTATION_PHASE,
-    TOR_ZETA,
 )
 from .primitives import _dihedral_rad, dihedral_rad
 
@@ -31,6 +28,7 @@ _RING_ANGLES = 2.0 * 2.0 * math.pi * np.arange(5, dtype=np.float64) / 5.0
 _PSEUDOROTATION_OFFSETS = (
     np.array([0.0, 4.0, 8.0, 2.0, 6.0], dtype=np.float64) * (math.pi / 5.0)
 )
+_TEMPLATE_RENAMES = {'O1P': 'OP1', 'O2P': 'OP2', 'O1A': 'OP1', 'O2A': 'OP2'}
 
 
 def pseudorotation_phase_rad_from_nus(nu_deg):
@@ -54,6 +52,120 @@ def _chi_quads(base_one_letter):
     if base_one_letter in ('A', 'G'):
         return ("O4'", "C1'", 'N9', 'C4')
     return ("O4'", "C1'", 'N1', 'C2')
+
+
+@functools.lru_cache(maxsize=None)
+def _bridge_template_bond_lengths(base_one_letter: str) -> tuple[float, float]:
+    from pynamod.atomic_analysis.nucleotides_parser import get_base_u  # lazy import
+
+    template: dict[str, np.ndarray] = {}
+    for atom in get_base_u(base_one_letter):  # type: ignore[union-attr]
+        raw_name = getattr(atom, 'name', None)
+        if raw_name is None:
+            continue
+        atom_name = (
+            _TEMPLATE_RENAMES[raw_name]
+            if raw_name in _TEMPLATE_RENAMES
+            else raw_name.rstrip('AB')
+        )
+        if 'H' in atom_name or getattr(atom, 'element', None) in {'H', 'D'}:
+            continue
+        template[atom_name] = np.asarray(atom.position, dtype=np.float64)
+    r_b = float(np.linalg.norm(template['P'] - template["O5'"]))
+    r_a = r_b
+    return r_a, r_b
+
+
+def _safe_normalize_torch(v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    return v / v.norm(dim=-1, keepdim=True).clamp(min=eps)
+
+
+def bridge_circle_geometry_torch(
+    anchor_a: torch.Tensor,
+    anchor_b: torch.Tensor,
+    r_a: torch.Tensor,
+    r_b: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    axis = anchor_b - anchor_a
+    d = axis.norm(dim=-1).clamp(min=eps)
+    e = axis / d.unsqueeze(-1)
+    a = (r_a * r_a - r_b * r_b + d * d) / (2.0 * d)
+    center = anchor_a + a.unsqueeze(-1) * e
+    # eps**2 inside sqrt: at degenerate triangles (r_a^2 - a^2 = 0), sqrt'(0) = +inf
+    # propagates to NaN in upstream grads. Additive eps**2 regularises the backward.
+    radius = torch.sqrt((r_a * r_a - a * a).clamp(min=0.0) + eps * eps)
+
+    x_axis = torch.zeros_like(e)
+    x_axis[..., 0] = 1.0
+    y_axis = torch.zeros_like(e)
+    y_axis[..., 1] = 1.0
+    ref = torch.where(e[..., 0].abs().unsqueeze(-1) >= 0.9, y_axis, x_axis)
+    u = _safe_normalize_torch(torch.linalg.cross(ref, e, dim=-1), eps=eps)
+    v = torch.linalg.cross(e, u, dim=-1)
+    return center, radius, u, v
+
+
+def phosphate_from_bridge_phase_torch(
+    anchor_a: torch.Tensor,
+    anchor_b: torch.Tensor,
+    phase: torch.Tensor,
+    r_a: torch.Tensor,
+    r_b: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    center, radius, u, v = bridge_circle_geometry_torch(
+        anchor_a,
+        anchor_b,
+        r_a,
+        r_b,
+        eps=eps,
+    )
+    return center + radius.unsqueeze(-1) * (
+        torch.cos(phase).unsqueeze(-1) * u
+        + torch.sin(phase).unsqueeze(-1) * v
+    )
+
+
+def bridge_phase_from_points_torch(
+    anchor_a: torch.Tensor,
+    anchor_b: torch.Tensor,
+    phosphate: torch.Tensor,
+    r_a: torch.Tensor,
+    r_b: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    center, _radius, u, v = bridge_circle_geometry_torch(
+        anchor_a,
+        anchor_b,
+        r_a,
+        r_b,
+        eps=eps,
+    )
+    q = phosphate - center
+    x = (q * u).sum(dim=-1)
+    y = (q * v).sum(dim=-1)
+    return torch.atan2(y, x)
+
+
+def bridge_phase_from_points(
+    anchor_a: np.ndarray,
+    anchor_b: np.ndarray,
+    phosphate: np.ndarray,
+    r_a: float,
+    r_b: float,
+) -> float:
+    phase = bridge_phase_from_points_torch(
+        torch.as_tensor(anchor_a, dtype=torch.float64).reshape(1, 3),
+        torch.as_tensor(anchor_b, dtype=torch.float64).reshape(1, 3),
+        torch.as_tensor(phosphate, dtype=torch.float64).reshape(1, 3),
+        torch.tensor([r_a], dtype=torch.float64),
+        torch.tensor([r_b], dtype=torch.float64),
+    )
+    return float(phase.item())
 
 
 def nucleotide_torsions(xyz_by_name_cur, xyz_by_name_prev, xyz_by_name_next, base_one_letter):
@@ -82,12 +194,12 @@ def nucleotide_torsions(xyz_by_name_cur, xyz_by_name_prev, xyz_by_name_next, bas
             torsions[idx] = _dihedral_rad(*pts)
             mask[idx] = True
 
-    _set(TOR_ALPHA, o3_prev, p_cur, o5, c5)
-    _set(TOR_BETA,  p_cur, o5, c5, c4)
     _set(TOR_GAMMA, o5, c5, c4, c3)
     _set(TOR_DELTA, c5, c4, c3, o3_cur)
-    _set(TOR_EPS,   c4, c3, o3_cur, p_next)
-    _set(TOR_ZETA,  c3, o3_cur, p_next, o5_next)
+    if o3_prev is not None and p_cur is not None and o5 is not None:
+        r_a, r_b = _bridge_template_bond_lengths(base_one_letter)
+        torsions[TOR_BRIDGE_PHASE] = bridge_phase_from_points(o3_prev, o5, p_cur, r_a, r_b)
+        mask[TOR_BRIDGE_PHASE] = True
 
     op1 = g(xyz_by_name_cur, 'OP1')
     _set(TOR_ETA_P, c5, o5, p_cur, op1)  # dihedral(C5', O5', P, OP1)

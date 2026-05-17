@@ -1,4 +1,4 @@
-"""Phosphate bridge closure loss: O3′_i – P_{i+1} – O5′_{i+1} (bonds, angles, wrapped torsions)."""
+"""Phosphate bridge closure loss: O3′_i – P_{i+1} – O5′_{i+1} (bonds, angles, wrapped bridge phase)."""
 
 import functools
 import math
@@ -8,10 +8,11 @@ import numpy as np
 import torch
 
 from .data import BACKBONE_ATOMS
-from .geometry import (bond_angle, dihedral_rad, get_template,
-                       get_template_tensors, wrap_dihedral_diff)
+from .geometry import (bond_angle, bridge_phase_from_points_torch,
+                       dihedral_rad, get_template, get_template_tensors,
+                       wrap_dihedral_diff)
 from .geometry.primitives import _bond_angle, nerf_place_coords
-from .torsion_constants import TOR_ALPHA, TOR_BETA, TOR_EPS, TOR_ZETA
+from .torsion_constants import TOR_BRIDGE_PHASE
 
 _BASE_LETTERS = ('A', 'C', 'G', 'T')
 
@@ -197,7 +198,7 @@ def compute_bridge_closure_loss(
     bb_xyz_world
         ``[B, W, n_bb, 3]`` world coordinates (order matches ``base2backbone.data.BACKBONE_ATOMS``).
     target_torsions
-        ``[B, W, N_TORSIONS]`` reference torsions (ε, ζ on residue i; α, β on i+1).
+        ``[B, W, N_TORSIONS]`` reference torsions with ``bridge_phase`` stored on residue ``i+1``.
     torsion_mask
         ``[B, W, N_TORSIONS]`` boolean observability mask.
     restype_indices
@@ -283,18 +284,8 @@ def compute_bridge_closure_loss(
             )
         pair_gate = pair_gate & valid_pair_mask
 
-    tor_obs = (
-        prev_tm[..., TOR_EPS]
-        & prev_tm[..., TOR_ZETA]
-        & curr_tm[..., TOR_ALPHA]
-        & curr_tm[..., TOR_BETA]
-    )
-    tor_fin = (
-        torch.isfinite(tgt_prev[..., TOR_EPS])
-        & torch.isfinite(tgt_prev[..., TOR_ZETA])
-        & torch.isfinite(tgt_curr[..., TOR_ALPHA])
-        & torch.isfinite(tgt_curr[..., TOR_BETA])
-    )
+    tor_obs = curr_tm[..., TOR_BRIDGE_PHASE]
+    tor_fin = torch.isfinite(tgt_curr[..., TOR_BRIDGE_PHASE])
 
     atoms_fin = (
         torch.isfinite(bb[:, :-1, j_c4]).all(dim=-1)
@@ -351,22 +342,16 @@ def compute_bridge_closure_loss(
         + ((a3 - ar_angle3) / (sigma_a + eps)) ** 2
     )
 
-    eps_pred = dihedral_rad(c4_p, c3_p, o3_p, p_n)
-    ze_pred = dihedral_rad(c3_p, o3_p, p_n, o5_n)
-    al_pred = dihedral_rad(o3_p, p_n, o5_n, c5_n)
-    be_pred = dihedral_rad(p_n, o5_n, c5_n, c4_n)
-
-    e_eps = wrap_dihedral_diff(eps_pred, tgt_prev[..., TOR_EPS])
-    e_ze = wrap_dihedral_diff(ze_pred, tgt_prev[..., TOR_ZETA])
-    e_al = wrap_dihedral_diff(al_pred, tgt_curr[..., TOR_ALPHA])
-    e_be = wrap_dihedral_diff(be_pred, tgt_curr[..., TOR_BETA])
-
-    torsion_sq = (
-        (e_eps / (sigma_t + eps)) ** 2
-        + (e_ze / (sigma_t + eps)) ** 2
-        + (e_al / (sigma_t + eps)) ** 2
-        + (e_be / (sigma_t + eps)) ** 2
+    phase_pred = bridge_phase_from_points_torch(
+        o3_p,
+        o5_n,
+        p_n,
+        d0_o3p,
+        d0_po5,
+        eps=eps,
     )
+    e_phase = wrap_dihedral_diff(phase_pred, tgt_curr[..., TOR_BRIDGE_PHASE])
+    torsion_sq = (e_phase / (sigma_t + eps)) ** 2
 
     if valid_pair_mask is not None:
         n_br = float(max(valid_pair_mask.float().sum().item(), 1.0))
@@ -385,11 +370,7 @@ def compute_bridge_closure_loss(
         ),
         (a3 - ar_angle3).abs() / (sigma_a + eps),
     )
-    tor_abs = torch.maximum(
-        torch.maximum(e_eps.abs(), e_ze.abs()),
-        torch.maximum(e_al.abs(), e_be.abs()),
-    )
-    torsion_norm = tor_abs / (sigma_t + eps)
+    torsion_norm = e_phase.abs() / (sigma_t + eps)
 
     viol = (
         (bond_norm > thr_b)
@@ -423,7 +404,7 @@ def compute_bridge_closure_loss(
     bond_mae = ((d1 - d0_o3p).abs() + (d2 - d0_po5).abs()) * 0.5
     ang_mae = (a1 - ar_angle1).abs() + (a2 - ar_angle2).abs() + (a3 - ar_angle3).abs()
     ang_mae = ang_mae / 3.0
-    tor_mae = (e_eps.abs() + e_ze.abs() + e_al.abs() + e_be.abs()) / 4.0
+    tor_mae = e_phase.abs()
 
     valid_frac = n_ok / bb_xyz_world.new_tensor(n_br)
     fail_rate = viol.float().sum() / (n_ok + eps)

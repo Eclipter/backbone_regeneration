@@ -1,4 +1,5 @@
 # %% Imports
+import os
 import os.path as osp
 import random
 import shlex
@@ -44,10 +45,9 @@ from base2backbone.inference import \
     _build_output_universe as build_output_universe
 from base2backbone.inference import \
     _predict_backbone_from_chain_records as predict_backbone_from_chain_records
-from base2backbone.inference import predict_backbone, write_structure
+from base2backbone.inference import write_structure
 from base2backbone.io import default_atoms_provider
-from base2backbone.runtime import (MODEL_DIR, PROGRESS_BAR_COLOR,
-                                   collect_scalar_history,
+from base2backbone.runtime import (PROGRESS_BAR_COLOR, collect_scalar_history,
                                    load_analysis_run_artifacts)
 from base2backbone.torsion_constants import (TOR_CHI, TOR_GAMMA,
                                              TOR_PSEUDOROTATION_PHASE)
@@ -59,7 +59,7 @@ IDX_TO_BASE = {v: k for k, v in BASE_TO_INDEX.items()}
 TOR_NAMES = ['α', 'β', 'γ', 'ε', 'ζ', 'χ', 'phase']
 
 # %% Load model and dataset
-run_id = 'torsions/6/CLOSURE_LOSS_WEIGHT=0.001_CLOSURE_ANGLE_WEIGHT=0.1'
+run_id = 'torsions/7/CLOSURE_LOSS_WEIGHT=0.001_CLOSURE_ANGLE_WEIGHT=0.3'
 
 artifacts = load_analysis_run_artifacts(run_id)
 run_dir = artifacts.run_dir
@@ -76,6 +76,23 @@ mode_linestyles = {'avg': '-', 'central': '--', 'edge': '--'}
 model = artifacts.model
 device = artifacts.device
 print(f'device: {device}')
+
+
+class CheckpointSamplerAdapter:
+    """Wrap checkpoint ``sample``; ``num_timesteps=None`` uses ``model.hparams`` default."""
+
+    def __init__(self, checkpoint_model, num_timesteps: int | None):
+        self.checkpoint_model = checkpoint_model
+        self.num_timesteps = num_timesteps
+
+    def sample(self, batch):
+        if self.num_timesteps is None:
+            return self.checkpoint_model.sample(batch)
+        return self.checkpoint_model.sample(
+            batch,
+            num_timesteps=self.num_timesteps,
+        )
+
 
 # %% Show samples from dataset
 dataset = PyGDataset()
@@ -337,7 +354,7 @@ def plot_metric(ax, table, column, color, label, linestyle='-'):
         values.index.to_numpy(),
         values.to_numpy(),
         color=color,
-        linewidth=3,
+        linewidth=2,
         label=label,
         linestyle=linestyle,
     )[0]
@@ -346,7 +363,7 @@ def plot_metric(ax, table, column, color, label, linestyle='-'):
 validation_labels = {
     'avg': 'все нуклеотиды',
     'central': 'центральные нуклеотиды',
-    'edge': 'краевые нуклеотиды',
+    'edge': 'крайние нуклеотиды',
 }
 
 
@@ -354,7 +371,7 @@ fig, ax = plt.subplots(figsize=(7, 4))
 ax.tick_params(axis='both', labelsize=15)
 if 'train_noise_rmse' in wide.columns:
     plot_metric(ax, wide, 'train_noise_rmse', 'indigo', 'train_rmse')
-swa_epoch = 80
+swa_epoch = 100
 ax.axvline(swa_epoch, color='red', linewidth=3, linestyle='--')
 ax.text(
     swa_epoch + 0.5,
@@ -386,7 +403,6 @@ for mode in target_modes:
             validation_labels[mode],
             mode_linestyles[mode],
         )
-ax.set_yscale('log')
 ax.set_xlabel('Эпоха', fontsize=18)
 ax.set_ylabel('RMSD остова (Å)', fontsize=18)
 ax.legend(fontsize=14)
@@ -408,7 +424,7 @@ bars = ax.barh(
     color=[mode_colors[mode] for mode in target_modes],
 )
 ax.bar_label(bars, labels=[f'{value:.2f}' for value in test_values], fontsize=14, padding=4)
-ax.set_ylabel('RMSD (Å)', fontsize=18)
+ax.set_xlabel('RMSD остова (Å)', fontsize=18)
 sns.despine(ax=ax, top=True, right=True)
 fig.tight_layout()
 fig.savefig(osp.join(run_dir, 'test.png'), bbox_inches='tight', dpi=300)
@@ -584,7 +600,7 @@ if target_base_pts:
             symbol='circle',
             line=dict(width=1.0, color='rgba(20, 20, 20, 0.65)'),
         ),
-        name='Исходное: целевой нуклеотид, основание',
+        name='Исходное основание целевого нуклеотида, ',
     ))
 
 fig.add_trace(go.Scatter3d(
@@ -616,7 +632,7 @@ if side_base_pts:
             symbol='circle',
             line=dict(width=1.4, color='rgba(15, 55, 10, 0.95)'),
         ),
-        name='Исходное: окружение, основание',
+        name='Исходное основание контекстного нуклеотида',
     ))
 
 pred_bb_segments = ordered_backbone_segments(pred_local)
@@ -699,23 +715,29 @@ fig.show()
 # %% Inference
 inference_pdb_id = random.choice(sorted(test_pdb_to_local.keys()))
 raw_inference_path = osp.join('..', 'data', 'raw', f'{inference_pdb_id}.cif')
-print(f'Generating backbone for {inference_pdb_id}...')
 
 generated_pdb_path = osp.join(run_dir, f'generated_backbone_{inference_pdb_id}.pdb')
-generated_universe = predict_backbone(
+_window_sz = int(test_dataset.base.window_size)
+_inference_sampler = CheckpointSamplerAdapter(model, None)
+_, chain_records_inference = parse_dna(
     raw_inference_path,
-    MODEL_DIR,
-    device=device,
-    show_progress=True,
+    use_full_nucleotide=False,
+    window_size=_window_sz,
 )
-
+_predictions_inference = predict_backbone_from_chain_records(
+    [chain_records_inference],
+    _inference_sampler,
+    device,
+    show_progress=True,
+)[0]
 with warnings.catch_warnings():
     warnings.simplefilter('ignore', PDBConstructionWarning)
     _, full_chain_records = parse_dna(
         raw_inference_path,
         use_full_nucleotide=True,
-        window_size=test_dataset.base.window_size,
+        window_size=_window_sz,
     )
+generated_universe = build_output_universe(full_chain_records, _predictions_inference)
 
 original_preds = {}
 for _, chain, _ in full_chain_records:
@@ -732,9 +754,6 @@ write_structure(
     build_output_universe(full_chain_records, original_preds),
     original_pdb_path,
 )
-assert generated_universe.atoms is not None
-print(f'Wrote {generated_pdb_path}  ({generated_universe.atoms.n_atoms} backbone atoms)')
-print(f'Wrote {original_pdb_path}  ({len(original_preds)} backbone atoms)')
 
 with open(generated_pdb_path) as f:
     pdb_str_generated = f.read()
@@ -792,10 +811,7 @@ def similar_entries(seq):
 def parsed_chain_records(pdb_id):
     path = osp.join('..', 'data', 'raw', f'{pdb_id}.cif')
     if not osp.exists(path):
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        Path(path).write_bytes(requests.get(
-            f'https://files.rcsb.org/download/{pdb_id}.cif', timeout=60
-        ).content)
+        raise FileNotFoundError(f'No local CIF for {pdb_id}')
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', PDBConstructionWarning)
         _, chain_records = parse_dna(
@@ -825,9 +841,16 @@ def central_backbone_local(data):
     return {BACKBONE_ATOMS[j]: local[j] for j in range(len(BACKBONE_ATOMS)) if valid[j]}
 
 
+_window_cache: dict = {}  # populated in phase 2 by worker processes
+
+
+def window_index_for_pdb(pdb_id):
+    return _window_cache[pdb_id]
+
+
 def experimental_rmsd_windows(pdb_id1, pdb_id2):
-    idx1 = central_window_index(parsed_chain_records(pdb_id1))
-    idx2 = central_window_index(parsed_chain_records(pdb_id2))
+    idx1 = window_index_for_pdb(pdb_id1)
+    idx2 = window_index_for_pdb(pdb_id2)
     values = []
     for key in set(idx1) & set(idx2):
         atoms1 = central_backbone_local(idx1[key])
@@ -841,20 +864,20 @@ def experimental_rmsd_windows(pdb_id1, pdb_id2):
     return values
 
 
-def noise_pairs_for_pdb(pdb_id):
-    values = []
+def _collect_partners(pdb_id):
     try:
-        partners = {e for seq in dna_seqs(pdb_id) for e in similar_entries(seq)} - {pdb_id}
-        for pid in sorted(partners):
-            try:
-                w = experimental_rmsd_windows(pdb_id, pid)
-                if w:
-                    values.append((pdb_id, pid, w))
-            except Exception:
-                pass
+        return pdb_id, sorted(
+            {e for seq in dna_seqs(pdb_id) for e in similar_entries(seq)} - {pdb_id}
+        )
     except Exception:
-        pass
-    return values
+        return pdb_id, []
+
+
+def _parse_and_index(pdb_id):
+    try:
+        return pdb_id, central_window_index(parsed_chain_records(pdb_id))
+    except Exception:
+        return pdb_id, None
 
 
 test_pdb_ids = sorted({
@@ -862,13 +885,40 @@ test_pdb_ids = sorted({
     for w_idx, _ in test_dataset.virtual_entries
 })
 
-rmsd_values = []
+# Phase 1: collect all partner lists via parallel API calls
+print(f'Collecting partners for {len(test_pdb_ids)} PDB IDs...')
 with ThreadPoolExecutor(max_workers=8) as executor:
-    futures = [executor.submit(noise_pairs_for_pdb, pid) for pid in test_pdb_ids]
-    for future in as_completed(futures):
-        for pdb_id, pid, wv in future.result():
-            rmsd_values.extend(wv)
-            print(f'{pdb_id} vs {pid}: median={np.median(wv):.2f} Å  n={len(wv)}')
+    partner_map = dict(executor.map(_collect_partners, test_pdb_ids))
+n_pairs = sum(len(v) for v in partner_map.values())
+print(f'Found {n_pairs} pairs across {len(partner_map)} PDB IDs')
+
+# Phase 2: parse + index CIF files in parallel (ThreadPoolExecutor avoids fork+PyTorch issues)
+_raw_dir = osp.join('..', 'data', 'raw')
+all_needed_ids = {pid for partners in partner_map.values() for pid in partners} | set(test_pdb_ids)
+available_ids = sorted(pid for pid in all_needed_ids if osp.exists(osp.join(_raw_dir, f'{pid}.cif')))
+
+with ThreadPoolExecutor(max_workers=8) as executor:
+    for pdb_id, idx in tqdm(
+            executor.map(_parse_and_index, available_ids),
+            total=len(available_ids),
+            desc=f'Parsing CIF files ({len(available_ids)} / {len(all_needed_ids)})',
+            colour=PROGRESS_BAR_COLOR,
+    ):
+        if idx is not None:
+            _window_cache[pdb_id] = idx
+print(f'Indexed {len(_window_cache)} PDB structures')
+
+# Phase 3: compute RMSDs (everything is already cached, this is CPU-bound)
+rmsd_values = []
+for pdb_id, partners in partner_map.items():
+    for pid in partners:
+        try:
+            wv = experimental_rmsd_windows(pdb_id, pid)
+            if wv:
+                rmsd_values.extend(wv)
+                print(f'{pdb_id} vs {pid}: median={np.median(wv):.2f} Å  n={len(wv)}')
+        except Exception:
+            pass
 
 # %%
 fig, ax = plt.subplots(figsize=(7, 4))
@@ -895,6 +945,7 @@ ax.set_ylabel('Количество структур', fontsize=13)
 ax.legend(fontsize=11)
 sns.despine(ax=ax)
 fig.tight_layout()
+fig.savefig(osp.join(run_dir, 'experimental_rmsd.png'), dpi=300, bbox_inches='tight')
 plt.show()
 
 # %% Measure stochastic spread across independent diffusion runs on the same input
@@ -963,11 +1014,6 @@ with torch.no_grad():
 # %%
 
 med = float(np.median(inter_run_rmsds))
-mean = float(np.mean(inter_run_rmsds))
-p25, p75 = np.percentile(inter_run_rmsds, [25, 75])
-print(f'Inter-run RMSD  K={K}  N={len(sample_medians)} samples  '
-      f'({K * (K - 1) // 2 * len(sample_medians)} pairs):')
-print(f'  median={med:.3f}  mean={mean:.3f}  p25={p25:.3f}  p75={p75:.3f} Å')
 
 fig, ax = plt.subplots(figsize=(7, 4))
 ax.hist(inter_run_rmsds, color='mediumpurple', edgecolor='white')
@@ -986,8 +1032,6 @@ plt.show()
 
 # %% Compare with kNN baseline
 
-
-# Reconstruct train split with the same fixed seed used during training
 dm = DNADataModule(batch_size=1)
 dm.setup()
 train_dataset = dm.train_dataset
@@ -1690,15 +1734,15 @@ def run_phenix_geometry_minimization(
 def run_base2backbone_inference(
     input_path: str | Path,
     output_dir: str | Path,
-    model_path: str | Path = MODEL_DIR,
+    checkpoint_model,
     device: str | None = None,
     window_size: int | None = None,
+    num_timesteps: int | None = None,
 ) -> dict:
     """
-    Run end-to-end base2backbone inference and write a reconstructed backbone PDB.
+    Run end-to-end inference from a Lightning checkpoint and write a backbone PDB.
 
-    Timing includes model load and output serialization to mirror PHENIX's
-    end-to-end single-structure latency.
+    Timing includes inference and output serialization to mirror PHENIX latency.
     """
 
     input_path = Path(input_path).resolve()
@@ -1707,20 +1751,36 @@ def run_base2backbone_inference(
 
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    model_path = str(model_path)
+    if window_size is None:
+        window_size_i = int(getattr(test_dataset.base, 'window_size', 3))
+    else:
+        window_size_i = int(window_size)
 
     output_pdb = output_dir / f'{input_path.stem}_base2backbone.pdb'
     t0 = time.perf_counter()
+    input_path_str = str(input_path)
 
     try:
-        output_universe = predict_backbone(
-            str(input_path),
-            model_path,
-            device=device,
-            show_progress=False,
+        adapter = CheckpointSamplerAdapter(checkpoint_model, num_timesteps)
+        _, chain_records = parse_dna(
+            input_path_str,
+            use_full_nucleotide=False,
+            window_size=window_size_i,
         )
-        # Older builds only accept positional arguments (keyword names differ).
-        write_structure(output_universe, output_pdb)
+        predictions = predict_backbone_from_chain_records(
+            [chain_records],
+            adapter,
+            device,
+            show_progress=False,
+        )[0]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', PDBConstructionWarning)
+            _, full_chain_records = parse_dna(
+                input_path_str,
+                use_full_nucleotide=True,
+                window_size=window_size_i,
+            )
+        write_structure(build_output_universe(full_chain_records, predictions), output_pdb)
     except Exception as e:
         return {
             'success': False,
@@ -1739,18 +1799,6 @@ def run_base2backbone_inference(
         'stdout': '',
         'stderr': '',
     }
-
-
-class CheckpointSamplerAdapter:
-    def __init__(self, checkpoint_model, num_timesteps: int):
-        self.checkpoint_model = checkpoint_model
-        self.num_timesteps = int(num_timesteps)
-
-    def sample(self, batch):
-        return self.checkpoint_model.sample(
-            batch,
-            num_timesteps=self.num_timesteps,
-        )
 
 
 def run_base2backbone_checkpoint_inference(
@@ -2415,8 +2463,9 @@ def benchmark_timesteps_vs_phenix_on_subset(
 def compare_model_vs_phenix_on_test_dataset(
     output_dir,
     phenix_max_workers=4,
-    model_path=None,
+    checkpoint_model=None,
     model_device=None,
+    num_timesteps=None,
     require_standard_monomers=True,
 ):
     input_paths = collect_test_dataset_raw_paths(test_dataset)
@@ -2430,9 +2479,10 @@ def compare_model_vs_phenix_on_test_dataset(
         run_base2backbone_inference,
         label='base2backbone',
         max_workers=1,
-        model_path=MODEL_DIR if model_path is None else model_path,
+        checkpoint_model=model if checkpoint_model is None else checkpoint_model,
         device=device if model_device is None else model_device,
         window_size=test_dataset.base.window_size,
+        num_timesteps=num_timesteps,
     )
     phenix_rows = run_structure_benchmark(
         input_paths,

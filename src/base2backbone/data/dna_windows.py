@@ -1,7 +1,9 @@
 """DNA parsing and sliding-window materialization for training and inference."""
 
+import json
 import os
 from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 import requests
@@ -28,9 +30,32 @@ from .vocab import (
     N_CHAIN_END_CLASSES,
 )
 
+REPO_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_DATASET_MANIFEST = 'manifests/latest.json'
 
-def get_pdb_ids():
+
+def _resolve_manifest_path(dataset_manifest):
+    manifest_path = Path(dataset_manifest)
+    if manifest_path.is_absolute():
+        return manifest_path
+    if manifest_path.parent == Path('.'):
+        return REPO_ROOT / 'manifests' / manifest_path
+    return REPO_ROOT / manifest_path
+
+
+def _write_latest_manifest(manifest_path, pdb_ids):
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(pdb_ids, indent=2) + '\n', encoding='utf-8')
+
+
+def get_pdb_ids(dataset_manifest=None):
     """Get PDB IDs from the RCSB PDB API with resolution ≤3 Å and DNA (≥3 residues)."""
+    if dataset_manifest is not None:
+        manifest_path = _resolve_manifest_path(dataset_manifest)
+        return json.loads(manifest_path.read_text(encoding='utf-8'))
+
+    manifest_path = _resolve_manifest_path(DEFAULT_DATASET_MANIFEST)
+
     query = {
         'query': {
             'type': 'group',
@@ -111,7 +136,9 @@ def get_pdb_ids():
     )
     response.raise_for_status()
     data = response.json()
-    return [item['identifier'] for item in data.get('result_set', [])]
+    pdb_ids = [item['identifier'] for item in data.get('result_set', [])]
+    _write_latest_manifest(manifest_path, pdb_ids)
+    return pdb_ids
 
 
 def _neighbor_xyz_for_torsions(window, nucleotide_idx):

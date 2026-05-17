@@ -10,7 +10,7 @@ from pathlib import Path
 
 import lightning.pytorch as pl
 import torch
-from config import BASE, EXPERIMENTS, RUN_NAME, SEED
+from config import BASE, DATASET_MANIFEST, EXPERIMENTS, RUN_NAME, SEED
 from lightning.pytorch.callbacks import (ModelCheckpoint,
                                          StochasticWeightAveraging)
 from lightning.pytorch.loggers import TensorBoardLogger
@@ -61,6 +61,7 @@ def train_one(cfg):
         batch_size=cfg['BATCH_SIZE'],
         edge_weight=cfg['EDGE_WEIGHT'],
         seed=cfg['SEED'],
+        dataset_manifest=cfg['DATASET_MANIFEST'],
     )
     pl_module = BackboneLightningModule(
         hidden_dim=cfg['HIDDEN_DIM'],
@@ -162,6 +163,7 @@ def main():
     for exp in EXPERIMENTS:
         run_cfg = {**BASE, **exp}
         run_cfg['RUN_NAME'] = RUN_NAME
+        run_cfg['DATASET_MANIFEST'] = DATASET_MANIFEST
         run_cfg['SEED'] = SEED
         run_cfg['RUN_VERSION'] = _make_run_version(run_cfg, BASE)
         rank_zero_info(f'\n\033[1;38;5;93mRunning experiment: {run_cfg["RUN_VERSION"]}\033[0m')

@@ -1,5 +1,4 @@
 # %% Imports
-import os
 import os.path as osp
 import random
 import shlex
@@ -24,6 +23,7 @@ import seaborn as sns
 import torch
 from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
+from config import DATASET_MANIFEST
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import Batch, Data
@@ -95,7 +95,7 @@ class CheckpointSamplerAdapter:
 
 
 # %% Show samples from dataset
-dataset = PyGDataset()
+dataset = PyGDataset(dataset_manifest=DATASET_MANIFEST)
 rng = np.random.default_rng()
 raw_idx = rng.integers(len(dataset))
 raw_data = cast(Data, dataset[raw_idx])
@@ -329,6 +329,7 @@ plt.rcParams['font.family'] = 'Nunito'
 
 metric_tags = {
     'train/loss':                          ('avg',     'train/loss'),
+    'diagnostics/train/score_loss':        ('avg',     'diagnostics/train/score_loss'),
     'val/rmsd/avg':                        ('avg',     'val/rmsd'),
     'val/rmsd/central':                    ('central', 'val/rmsd'),
     'val/rmsd/edge':                       ('edge',    'val/rmsd'),
@@ -344,8 +345,9 @@ wide_per_mode = {
     for mode in target_modes
 }
 wide = wide_per_mode['avg']
-if 'train/loss' in wide.columns:
-    wide['train_noise_rmse'] = np.sqrt(wide['train/loss'].clip(lower=0))
+train_score_loss_col = 'diagnostics/train/score_loss' if 'diagnostics/train/score_loss' in wide.columns else 'train/loss'
+if train_score_loss_col in wide.columns:
+    wide['train_noise_rmse'] = np.sqrt(wide[train_score_loss_col].clip(lower=0))
 
 
 def plot_metric(ax, table, column, color, label, linestyle='-'):
@@ -1032,7 +1034,7 @@ plt.show()
 
 # %% Compare with kNN baseline
 
-dm = DNADataModule(batch_size=1)
+dm = DNADataModule(batch_size=1, dataset_manifest=DATASET_MANIFEST)
 dm.setup()
 train_dataset = dm.train_dataset
 val_dataset = dm.val_dataset

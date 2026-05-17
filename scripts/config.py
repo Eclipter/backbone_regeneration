@@ -39,12 +39,15 @@ BASE = dict(
 # One entry = one experiment. Put ONLY the overrides from BASE here
 EXPERIMENTS = [
     # {},  # baseline (matches BASE)
-    {'CLOSURE_LOSS_WEIGHT': 1e-3},
+    {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.3},
     # WINDOW SIZE 5, 7
 ]
 
 # Run path under `logs/`
-RUN_NAME = 'torsions/8'
+RUN_NAME = 'torsions/9'
+
+# Set to None to fetch from RCSB PDB API and save into latest.json
+DATASET_MANIFEST = 'thesis_2026-05-17.json'
 
 SEED = 42
 
@@ -53,7 +56,6 @@ SEED = 42
 # Consider bridge-matching
 
 # MINOR:
-# Decrease batch size
 # Experiment with large window sizes
 # Experiment with edge weight
 # Distillate like in paper: https://openreview.net/forum?id=8NuN5UzXLC

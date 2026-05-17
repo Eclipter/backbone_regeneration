@@ -511,7 +511,11 @@ class BackboneLightningModule(pl.LightningModule):
         cw = float(self.hparams.get('closure_loss_weight', 0.0))
         loss = mse if cw == 0.0 else mse + cw * cl
         self.log(
-            'train/loss', mse,
+            'train/loss', loss,
+            on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
+        )
+        self.log(
+            'diagnostics/train/score_loss', mse,
             on_step=False, on_epoch=True, sync_dist=True, batch_size=b, logger=False,
         )
         self.log(

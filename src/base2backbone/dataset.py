@@ -60,12 +60,13 @@ def _build_target_payload(data, tidx: int) -> dict[str, torch.Tensor]:
 
 
 class PyGDataset(Dataset):
-    def __init__(self, cache_in_ram: bool = True):
+    def __init__(self, cache_in_ram: bool = True, dataset_manifest: str | None = None):
         self.window_size = 3
         self.cache_in_ram = cache_in_ram
+        self.dataset_manifest = dataset_manifest
         self._cache: dict[int, BaseData] | None = {} if cache_in_ram else None
 
-        self.pdb_ids = get_pdb_ids()
+        self.pdb_ids = get_pdb_ids(self.dataset_manifest)
 
         root_path = osp.join(osp.dirname(osp.abspath(__file__)), '..', '..', 'data')
         super().__init__(root_path)
@@ -262,10 +263,10 @@ class PyGDataset(Dataset):
         return edge_paths
 
 
-def prepare_dataset(seed: int) -> None:
+def prepare_dataset(seed: int, dataset_manifest: str | None = None) -> None:
     """Download/process raw mmCIF data into `data/`."""
     pl.seed_everything(seed, workers=True, verbose=False)
-    PyGDataset()
+    PyGDataset(dataset_manifest=dataset_manifest)
 
 
 class WindowTargetDataset(torch.utils.data.Dataset):
@@ -359,7 +360,7 @@ class EdgeCentralTargetSampler(Sampler[int]):
 
 class DNADataModule(pl.LightningDataModule):
     def __init__(self, batch_size, train_ratio=0.7, val_ratio=0.2,
-                 edge_weight=0.3, seed=42):
+                 edge_weight=0.3, seed=42, dataset_manifest: str | None = None):
         super().__init__()
 
         self.batch_size = batch_size
@@ -367,6 +368,7 @@ class DNADataModule(pl.LightningDataModule):
         self.val_ratio = val_ratio
         self.edge_weight = edge_weight
         self.seed = seed
+        self.dataset_manifest = dataset_manifest
 
         self.num_workers = min(len(os.sched_getaffinity(0)), 16)
         self.train_generator = torch.Generator().manual_seed(seed)
@@ -386,7 +388,7 @@ class DNADataModule(pl.LightningDataModule):
         return kwargs
 
     def prepare_data(self):
-        PyGDataset()
+        PyGDataset(dataset_manifest=self.dataset_manifest)
 
     def _load_edge_paths(self, dataset: 'PyGDataset') -> set[str]:
         cache_path = osp.join(dataset.processed_dir, EDGE_CACHE_NAME)
@@ -420,7 +422,7 @@ class DNADataModule(pl.LightningDataModule):
         return None
 
     def setup(self, stage: Optional[str] = None):
-        dataset = PyGDataset()
+        dataset = PyGDataset(dataset_manifest=self.dataset_manifest)
         edge_paths = self._load_edge_paths(dataset)
 
         # Deposit-wise split: structures from the same deposit group must stay

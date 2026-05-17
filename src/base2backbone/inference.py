@@ -186,7 +186,7 @@ def _window_tidx_for_chain_index(chain_len: int, j: int):
     return int(w_cent), int(c)
 
 
-def _batched_window_predictions(model, chain_records_by_structure, device, show_progress, window_batch_size):
+def _batched_window_predictions(model, chain_records_by_structure, device, window_batch_size):
     jobs = []
     for structure_idx, chain_records in enumerate(chain_records_by_structure):
         for chain_key, _chain, windows in chain_records:
@@ -232,14 +232,12 @@ def _predict_backbone_from_chain_records(
     chain_records_by_structure,
     model,
     device,
-    show_progress: bool = False,
     window_batch_size: int | None = None,
 ):
     cached_window_predictions = _batched_window_predictions(
         model,
         chain_records_by_structure,
         device,
-        show_progress,
         window_batch_size,
     )
     return _assemble_predictions(chain_records_by_structure, cached_window_predictions)
@@ -276,7 +274,6 @@ def _predict_backbone_outputs(
     input_path,
     model_path=MODEL_DIR,
     device='cuda',
-    show_progress: bool = False,
 ) -> Tuple[dict, Any]:
     _, chain_records = parse_dna(
         input_path,
@@ -287,8 +284,7 @@ def _predict_backbone_outputs(
     predictions = _predict_backbone_from_chain_records(
         [chain_records],
         model,
-        device,
-        show_progress=show_progress,
+        device
     )[0]
     return predictions, chain_records
 
@@ -297,14 +293,12 @@ def predict_backbone(
     input_path,
     model_path=MODEL_DIR,
     device='cuda',
-    show_progress: bool = False,
     generate_5prime_phosphate: bool = False,
 ):
     predictions, chain_records = _predict_backbone_outputs(
         input_path,
         model_path=model_path,
-        device=device,
-        show_progress=show_progress,
+        device=device
     )
     return _build_output_universe(
         chain_records,
@@ -317,7 +311,6 @@ def _predict_backbone_trajectory_outputs(
     universe,
     model_path=MODEL_DIR,
     device='cuda',
-    show_progress: bool = False,
     window_batch_size: int | None = None,
 ) -> Tuple[list[dict[Any, Any]], list[Any]]:
     """Predict backbone atoms for every frame of an MDAnalysis trajectory."""
@@ -326,7 +319,6 @@ def _predict_backbone_trajectory_outputs(
         universe.trajectory,
         desc='Trajectory parsing',
         leave=False,
-        disable=not show_progress,
         colour=PROGRESS_BAR_COLOR,
     ):
         _, chain_records = parse_dna_universe(
@@ -341,7 +333,6 @@ def _predict_backbone_trajectory_outputs(
         chain_records_by_structure,
         model,
         device,
-        show_progress=show_progress,
         window_batch_size=window_batch_size,
     )
     return predictions_by_structure, chain_records_by_structure
@@ -351,7 +342,6 @@ def predict_backbone_trajectory(
     universe,
     model_path=MODEL_DIR,
     device='cuda',
-    show_progress: bool = False,
     window_batch_size: int | None = None,
     generate_5prime_phosphate: bool = False,
 ):
@@ -359,7 +349,6 @@ def predict_backbone_trajectory(
         universe,
         model_path=model_path,
         device=device,
-        show_progress=show_progress,
         window_batch_size=window_batch_size,
     )
     frame_universes = [

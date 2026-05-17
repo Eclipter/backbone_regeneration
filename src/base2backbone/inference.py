@@ -12,21 +12,17 @@ from Bio.PDB.mmcifio import MMCIFIO
 from Bio.PDB.PDBParser import PDBParser
 from MDAnalysis.coordinates.memory import MemoryReader
 from torch_geometric.data import Batch
+from tqdm import tqdm
 
-from .data import (
-    BACKBONE_ATOMS,
-    CHAIN_END_CLASS_3_PRIME,
-    CHAIN_END_CLASS_5_PRIME,
-    FIVE_PRIME_PHOSPHATE_ATOMS,
-    parse_dna,
-    parse_dna_universe,
-)
+from .data import (BACKBONE_ATOMS, CHAIN_END_CLASS_3_PRIME,
+                   CHAIN_END_CLASS_5_PRIME, FIVE_PRIME_PHOSPHATE_ATOMS,
+                   parse_dna, parse_dna_universe)
 from .geometry import build_batch_window_backbone_from_torsions
 from .io import default_atoms_provider, inference_atoms_provider
 from .onnx_inference import OnnxSampler
 from .runtime import MODEL_DIR, PROGRESS_BAR_COLOR
-from .torsion_constants import N_TORSIONS, TAU_M_MAX, TAU_M_MIN, TOR_ALPHA, TOR_EPS, TOR_ZETA
-from tqdm import tqdm
+from .torsion_constants import (N_TORSIONS, TAU_M_MAX, TAU_M_MIN, TOR_ALPHA,
+                                TOR_EPS, TOR_ZETA)
 
 WINDOW_SIZE = 3
 
@@ -205,14 +201,7 @@ def _batched_window_predictions(model, chain_records_by_structure, device, show_
 
     cached: dict[tuple[int, str, int], dict[Any, Any]] = {}
     chunk_starts = range(0, len(jobs), window_batch_size)
-    for start in tqdm(
-        chunk_starts,
-        total=(len(jobs) + window_batch_size - 1) // window_batch_size,
-        desc='Backbone inference',
-        leave=False,
-        disable=not show_progress,
-        colour=PROGRESS_BAR_COLOR,
-    ):
+    for start in chunk_starts:
         chunk = jobs[start:start + window_batch_size]
         cached.update(_predict_full_window_predictions_dicts(model, chunk, device))
     return cached

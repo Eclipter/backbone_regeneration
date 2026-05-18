@@ -20,9 +20,10 @@ from base2backbone.geometry.backbone import (
     world_to_local_points,
 )
 from base2backbone.geometry import (
-    bridge_circle_geometry_torch,
-    bridge_phase_from_points,
+    bridge_circle_geometry,
+    bridge_phase_from_points_numpy,
     bridge_phase_from_points_torch,
+    phosphate_from_bridge_phase,
 )
 from base2backbone.score_diffusion import decode_torsions, encode_torsions, wrap_angle
 
@@ -53,7 +54,11 @@ def _shifted_neighbor_tpl(restype: str):
     tpl = _get_template(restype)
     vec = tpl['P'] - tpl["O3'"]
     scale = 1.001
-    xyz_prev = {"O3'": tpl["O3'"] - vec * scale}
+    xyz_prev = {
+        "O3'": tpl["O3'"] - vec * scale,
+        "C3'": tpl["C3'"] - vec * scale,
+        "C4'": tpl["C4'"] - vec * scale,
+    }
     xyz_next = {
         'P': tpl['P'] + vec * scale,
         "O5'": tpl["O5'"] + vec * scale,
@@ -62,45 +67,101 @@ def _shifted_neighbor_tpl(restype: str):
 
 
 def test_bridge_phase_roundtrip_from_template():
-    restype = 'G'
-    xyz_cur, xyz_prev, xyz_next = _shifted_neighbor_tpl(restype)
-    t, mask, tau_m_val, tau_m_valid = nucleotide_torsions(
-        xyz_cur, xyz_prev, xyz_next, restype,
-    )
-    bridge_phase = float(t[TOR_BRIDGE_PHASE])
-    gamma = float(t[TOR_GAMMA])
-    chi = float(t[TOR_CHI])
-    p_rad = float(t[TOR_PSEUDOROTATION_PHASE])
+    o3_prev = np.array([0.0, 0.0, 0.0], dtype=np.float64)
+    o5_cur = np.array([2.0, 0.0, 0.0], dtype=np.float64)
+    c3_prev = np.array([0.0, 1.0, 0.2], dtype=np.float64)
+    c4_prev = np.array([0.0, 0.2, 1.0], dtype=np.float64)
+    r_bridge = 1.6
+    phase = 0.43
 
-    mb = bool(mask[TOR_BRIDGE_PHASE])
-    mg = bool(mask[TOR_GAMMA])
-    mx, mp = bool(mask[TOR_CHI]), bool(mask[TOR_PSEUDOROTATION_PHASE])
-    assert mb and mg and mx and mp
-    assert tau_m_valid
-    assert tau_m_val > 0.0
-    assert all(np.isfinite((bridge_phase, gamma, chi, p_rad)))
-
-    o3_prev_local = np.asarray(xyz_prev["O3'"], dtype=np.float64).reshape(3)
-    bb = build_backbone_local(t, restype, o3_prev_local=o3_prev_local, tau_m=None)
-    r_bridge = float(np.linalg.norm(xyz_cur['P'] - xyz_cur["O5'"]))
-    got = bridge_phase_from_points(
-        o3_prev_local,
-        bb["O5'"],
-        bb['P'],
+    p_roundtrip = phosphate_from_bridge_phase(
+        torch.as_tensor(o3_prev, dtype=torch.float64).reshape(1, 3),
+        torch.as_tensor(o5_cur, dtype=torch.float64).reshape(1, 3),
+        torch.as_tensor(c3_prev, dtype=torch.float64).reshape(1, 3),
+        torch.tensor([phase], dtype=torch.float64),
+        torch.tensor([r_bridge], dtype=torch.float64),
+        torch.tensor([r_bridge], dtype=torch.float64),
+        torch.as_tensor(c4_prev, dtype=torch.float64).reshape(1, 3),
+    ).squeeze(0).cpu().numpy()
+    phase_back = bridge_phase_from_points_numpy(
+        o3_prev,
+        o5_cur,
+        c3_prev,
+        p_roundtrip,
         r_bridge,
         r_bridge,
+        c4_prev,
     )
-    d = float(np.arctan2(np.sin(got - bridge_phase), np.cos(got - bridge_phase)))
-    assert abs(d) < 0.2
+    d = float(np.arctan2(np.sin(phase_back - phase), np.cos(phase_back - phase)))
+    assert abs(d) < 1e-6
+
+
+def test_bridge_phase_is_rigid_transform_invariant():
+    tpl, xyz_prev, _xyz_next = _shifted_neighbor_tpl('A')
+    o3 = np.asarray(xyz_prev["O3'"], dtype=np.float64)
+    c3 = np.asarray(xyz_prev["C3'"], dtype=np.float64)
+    c4 = np.asarray(xyz_prev["C4'"], dtype=np.float64)
+    o5 = np.asarray(tpl["O5'"], dtype=np.float64)
+    p = np.asarray(tpl['P'], dtype=np.float64)
+    r_bridge = float(np.linalg.norm(p - o5))
+    phase = bridge_phase_from_points_numpy(o3, o5, c3, p, r_bridge, r_bridge, c4)
+
+    axis = np.array([0.3, -0.4, 0.5], dtype=np.float64)
+    axis = axis / np.linalg.norm(axis)
+    angle = 0.71
+    kx, ky, kz = axis
+    K = np.array([
+        [0.0, -kz, ky],
+        [kz, 0.0, -kx],
+        [-ky, kx, 0.0],
+    ])
+    R = np.eye(3) + np.sin(angle) * K + (1.0 - np.cos(angle)) * (K @ K)
+    t = np.array([1.2, -0.8, 0.4], dtype=np.float64)
+
+    def _rt(x):
+        return R @ x + t
+
+    phase_rt = bridge_phase_from_points_numpy(
+        _rt(o3),
+        _rt(o5),
+        _rt(c3),
+        _rt(p),
+        r_bridge,
+        r_bridge,
+        _rt(c4),
+    )
+    d = float(np.arctan2(np.sin(phase_rt - phase), np.cos(phase_rt - phase)))
+    assert abs(d) < 1e-5
+
+
+def test_bridge_decoder_uses_reference_atom():
+    anchor_a = torch.tensor([[0.0, 0.0, 0.0]], dtype=torch.float64)
+    anchor_b = torch.tensor([[2.0, 0.0, 0.0]], dtype=torch.float64)
+    ref_y = torch.tensor([[0.0, 1.0, 0.0]], dtype=torch.float64)
+    ref_z = torch.tensor([[0.0, 0.0, 1.0]], dtype=torch.float64)
+    phase = torch.tensor([0.37], dtype=torch.float64)
+    r_a = torch.tensor([1.6], dtype=torch.float64)
+    r_b = torch.tensor([1.6], dtype=torch.float64)
+
+    p_y = phosphate_from_bridge_phase(anchor_a, anchor_b, ref_y, phase, r_a, r_b)
+    p_z = phosphate_from_bridge_phase(anchor_a, anchor_b, ref_z, phase, r_a, r_b)
+    center, _radius, _u, _v = bridge_circle_geometry(anchor_a, anchor_b, ref_y, r_a, r_b)
+    rot_x_90 = torch.tensor(
+        [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0], [0.0, 1.0, 0.0]],
+        dtype=torch.float64,
+    )
+    expected = center + (p_y - center) @ rot_x_90.T
+    assert torch.allclose(p_z, expected, atol=1e-6, rtol=1e-6)
 
 
 def test_bridge_circle_degenerate_backward_is_finite():
     anchor_a = torch.tensor([[0.0, 0.0, 0.0]], requires_grad=True)
     anchor_b = torch.tensor([[3.0, 0.0, 0.0]], requires_grad=True)
+    ref_atom = torch.tensor([[0.0, 1.0, 0.0]])
     r_a = torch.tensor([1.0])
     r_b = torch.tensor([1.0])
 
-    center, radius, u, v = bridge_circle_geometry_torch(anchor_a, anchor_b, r_a, r_b)
+    center, radius, u, v = bridge_circle_geometry(anchor_a, anchor_b, ref_atom, r_a, r_b)
     loss = center.square().sum() + radius.square().sum() + u.square().sum() + v.square().sum()
     assert torch.isfinite(loss)
 
@@ -112,11 +173,12 @@ def test_bridge_circle_degenerate_backward_is_finite():
 def test_bridge_phase_at_circle_center_backward_is_finite():
     anchor_a = torch.tensor([[0.0, 0.0, 0.0]], requires_grad=True)
     anchor_b = torch.tensor([[2.0, 0.0, 0.0]], requires_grad=True)
+    ref_atom = torch.tensor([[0.0, 1.0, 0.0]])
     phosphate = torch.tensor([[1.0, 0.0, 0.0]], requires_grad=True)
     r_a = torch.tensor([1.0])
     r_b = torch.tensor([1.0])
 
-    phase = bridge_phase_from_points_torch(anchor_a, anchor_b, phosphate, r_a, r_b)
+    phase = bridge_phase_from_points_torch(anchor_a, anchor_b, ref_atom, phosphate, r_a, r_b)
     assert torch.isfinite(phase).all()
 
     phase.sum().backward()
@@ -165,7 +227,11 @@ def test_inference_positional_mask():
 
 def _consistent_neighbor_tpl(restype: str):
     tpl = _get_template(restype)
-    xyz_prev = {"O3'": tpl["O3'"].copy()}
+    xyz_prev = {
+        "O3'": tpl["O3'"].copy(),
+        "C3'": tpl["C3'"].copy(),
+        "C4'": tpl["C4'"].copy(),
+    }
     xyz_next = {'P': tpl['P'].copy(), "O5'": tpl["O5'"].copy()}
     return tpl, xyz_prev, xyz_next
 
@@ -233,12 +299,28 @@ def test_chi_changes_sugar_coordinates():
     t, mask, tau_m_val, ok = nucleotide_torsions(tpl, xyz_prev, xyz_next, 'A')
     assert ok
     o3_prev = np.asarray(xyz_prev["O3'"], dtype=np.float64)
+    c3_prev = np.asarray(xyz_prev["C3'"], dtype=np.float64)
+    c4_prev = np.asarray(xyz_prev["C4'"], dtype=np.float64)
     t_lo = np.array(t, copy=True)
     t_hi = np.array(t, copy=True)
     t_lo[TOR_CHI] = -1.2
     t_hi[TOR_CHI] = 1.2
-    b_lo = build_backbone_local(t_lo, 'A', o3_prev_local=o3_prev, tau_m=tau_m_val)
-    b_hi = build_backbone_local(t_hi, 'A', o3_prev_local=o3_prev, tau_m=tau_m_val)
+    b_lo = build_backbone_local(
+        t_lo,
+        'A',
+        o3_prev_local=o3_prev,
+        c3_prev_local=c3_prev,
+        c4_prev_local=c4_prev,
+        tau_m=tau_m_val,
+    )
+    b_hi = build_backbone_local(
+        t_hi,
+        'A',
+        o3_prev_local=o3_prev,
+        c3_prev_local=c3_prev,
+        c4_prev_local=c4_prev,
+        tau_m=tau_m_val,
+    )
     d = float(np.linalg.norm(b_lo["C4'"] - b_hi["C4'"]))
     assert d > 1e-3
 
@@ -249,7 +331,16 @@ def test_measured_chi_purine_matches_input():
     t, mask, tau_m_val, ok = nucleotide_torsions(tpl, xyz_prev, xyz_next, restype)
     assert ok
     o3_prev = np.asarray(xyz_prev["O3'"], dtype=np.float64)
-    bb = build_backbone_local(t, restype, o3_prev_local=o3_prev, tau_m=tau_m_val)
+    c3_prev = np.asarray(xyz_prev["C3'"], dtype=np.float64)
+    c4_prev = np.asarray(xyz_prev["C4'"], dtype=np.float64)
+    bb = build_backbone_local(
+        t,
+        restype,
+        o3_prev_local=o3_prev,
+        c3_prev_local=c3_prev,
+        c4_prev_local=c4_prev,
+        tau_m=tau_m_val,
+    )
     tpl_b = _get_template(restype)
     m = float(dihedral_rad_coords(bb["O4'"], bb["C1'"], tpl_b['N9'], tpl_b['C4']).item())
     d = float(np.arctan2(np.sin(m - t[TOR_CHI]), np.cos(m - t[TOR_CHI])))
@@ -262,7 +353,16 @@ def test_measured_chi_pyrimidine_matches_input():
     t, mask, tau_m_val, ok = nucleotide_torsions(tpl, xyz_prev, xyz_next, restype)
     assert ok
     o3_prev = np.asarray(xyz_prev["O3'"], dtype=np.float64)
-    bb = build_backbone_local(t, restype, o3_prev_local=o3_prev, tau_m=tau_m_val)
+    c3_prev = np.asarray(xyz_prev["C3'"], dtype=np.float64)
+    c4_prev = np.asarray(xyz_prev["C4'"], dtype=np.float64)
+    bb = build_backbone_local(
+        t,
+        restype,
+        o3_prev_local=o3_prev,
+        c3_prev_local=c3_prev,
+        c4_prev_local=c4_prev,
+        tau_m=tau_m_val,
+    )
     tpl_b = _get_template(restype)
     m = float(dihedral_rad_coords(bb["O4'"], bb["C1'"], tpl_b['N1'], tpl_b['C2']).item())
     d = float(np.arctan2(np.sin(m - t[TOR_CHI]), np.cos(m - t[TOR_CHI])))

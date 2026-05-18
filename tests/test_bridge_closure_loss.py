@@ -38,9 +38,11 @@ def _ideal_bridge_bb_and_targets(dtype=torch.float64, device='cpu'):
     phase = bridge_phase_from_points_torch(
         o3_p,
         o5_n,
+        c3_p,
         p_n,
         tc['bond_p_o3_inter'][ri[:, 1]],
         tc['bond_p_o5'][ri[:, 1]],
+        c4_p,
     )
 
     tors = torch.zeros(B, W, N_TORSIONS, dtype=dtype, device=device)

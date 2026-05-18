@@ -30,11 +30,11 @@ def test_predict_merges_target_residue_only_from_cached_window():
 
 def test_predict_has_full_window_inference_for_default_path():
     text = Path(pred_mod.__file__).read_text()
-    assert '_predict_full_window_predictions_dict' in text
+    assert '_predict_full_window_predictions_dicts' in text
 
 
 def test_predict_module_full_window_builder():
-    src = inspect.getsource(pred_mod._predict_full_window_predictions_dict)
+    src = inspect.getsource(pred_mod._predict_full_window_predictions_dicts)
     assert 'build_batch_window_backbone_from_torsions' in src
 
 

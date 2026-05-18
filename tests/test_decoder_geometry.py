@@ -281,9 +281,11 @@ def test_phosphate_bridge_uses_predicted_bridge_phase(device):
     phase_t = bridge_phase_from_points_torch(
         o3p,
         o5n,
+        c3p,
         p_gt,
         tc['bond_p_o3_inter'][ri],
         tc['bond_p_o5'][ri],
+        c4p,
     )
 
     prev_atoms = {"O3'": o3p, "C3'": c3p, "C4'": c4p}
@@ -302,9 +304,11 @@ def test_phosphate_bridge_uses_predicted_bridge_phase(device):
     phase_m = bridge_phase_from_points_torch(
         o3p,
         o5n,
+        c3p,
         p.unsqueeze(0),
         tc['bond_p_o3_inter'][ri],
         tc['bond_p_o5'][ri],
+        c4p,
     )
     err = abs(float(wrap_dihedral_diff(phase_m, phase_t).item()))
     assert err < 1e-4

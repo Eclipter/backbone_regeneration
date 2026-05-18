@@ -357,9 +357,11 @@ def compute_bridge_closure_loss(
     phase_pred = bridge_phase_from_points_torch(
         o3_p,
         o5_n,
+        c3_p,
         p_n,
         d0_o3p,
         d0_po5,
+        c4_p,
         eps=eps,
     )
     target_phase = torch.where(bridge_ok, tgt_curr[..., TOR_BRIDGE_PHASE], zero_xyz)

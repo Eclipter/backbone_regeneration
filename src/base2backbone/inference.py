@@ -14,10 +14,11 @@ from MDAnalysis.coordinates.memory import MemoryReader
 from torch_geometric.data import Batch
 from tqdm import tqdm
 
-from .data import (BACKBONE_ATOMS, CHAIN_END_CLASS_3_PRIME,
+from .data import (BACKBONE_ATOMS, BASE_TO_INDEX, CHAIN_END_CLASS_3_PRIME,
                    CHAIN_END_CLASS_5_PRIME, FIVE_PRIME_PHOSPHATE_ATOMS,
                    parse_dna, parse_dna_universe)
 from .geometry import build_batch_window_backbone_from_torsions
+from .geometry.templates import get_template
 from .io import default_atoms_provider, inference_atoms_provider
 from .onnx_inference import OnnxSampler
 from .runtime import MODEL_DIR, PROGRESS_BAR_COLOR
@@ -132,21 +133,6 @@ def _predict_full_window_predictions_dicts(model, window_jobs, device) -> dict[t
             coords_all[job_idx],
         )
     return cached
-
-
-@torch.no_grad()
-def _predict_full_window_predictions_dict(model, sample_data, device) -> dict[Any, Any]:
-    """Backwards-compatible single-window wrapper over the batched inference path."""
-    window = getattr(sample_data, '_window_ref', None)
-    if window is None:
-        return {}
-    # Keep the legacy helper name while routing through build_batch_window_backbone_from_torsions.
-    cached = _predict_full_window_predictions_dicts(
-        model,
-        [(0, '', 0, window, sample_data)],
-        device,
-    )
-    return cached[(0, '', 0)]
 
 
 def _inference_chain_end_mask_tensor(sample_data):
@@ -358,6 +344,66 @@ def predict_backbone_trajectory(
 def _element_of(atom_name):
     first = atom_name.lstrip('0123456789')[:1]
     return first.upper() if first else ' '
+
+
+def _template_base_letter(restype: str) -> str:
+    letter = str(restype).strip()[-1].upper()
+    if letter not in BASE_TO_INDEX:
+        raise ValueError(f'Unsupported nucleotide restype: {restype!r}')
+    return letter
+
+
+def template_backbone_predictions_from_structure(structure, chain_records) -> dict:
+    """Place PyNAMod canonical backbone atoms in each nucleotide reference frame."""
+    origins_all = structure.dna.nucleotides.origins
+    ref_frames_all = structure.dna.nucleotides.ref_frames
+    predictions: dict[Any, Any] = {}
+    for _, chain, _ in chain_records:
+        for nucleotide in chain:
+            base_letter = _template_base_letter(nucleotide.restype)
+            tpl = get_template(base_letter)
+            origin = np.asarray(origins_all[nucleotide.ind], dtype=np.float64).reshape(3)
+            frame = np.asarray(ref_frames_all[nucleotide.ind], dtype=np.float64).reshape(3, 3)
+            if not np.isfinite(origin).all() or not np.isfinite(frame).all():
+                continue
+            segid = nucleotide.segid
+            resid = int(nucleotide.resid)
+            for atom_name in BACKBONE_ATOMS:
+                local_xyz = tpl.get(atom_name)
+                if local_xyz is None:
+                    continue
+                local = np.asarray(local_xyz, dtype=np.float64).reshape(3)
+                predictions[(segid, resid, atom_name)] = (local @ frame.T + origin).astype(np.float32)
+    return predictions
+
+
+def build_phenix_hybrid_universe(structure, chain_records):
+    """Experimental base atoms with template backbone coordinates (PyNAMod frames)."""
+    predictions = template_backbone_predictions_from_structure(structure, chain_records)
+    if not predictions:
+        raise RuntimeError('No template backbone atoms could be placed.')
+    return _build_output_universe(
+        chain_records,
+        predictions,
+        generate_5prime_phosphate=True,
+    )
+
+
+def write_phenix_hybrid_structure(
+    input_path: str | os.PathLike,
+    output_path: str | os.PathLike,
+    *,
+    window_size: int = WINDOW_SIZE,
+    use_full_nucleotide: bool = True,
+) -> str:
+    """Parse DNA with PyNAMod and write bases from experiment + template backbone."""
+    structure, chain_records = parse_dna(
+        str(input_path),
+        use_full_nucleotide=use_full_nucleotide,
+        window_size=window_size,
+    )
+    universe = build_phenix_hybrid_universe(structure, chain_records)
+    return write_structure(universe, output_path)
 
 
 def _five_prime_keys(chain_records):

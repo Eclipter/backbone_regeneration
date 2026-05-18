@@ -9,11 +9,18 @@ from torch_geometric.data import Batch, Data
 import base2backbone.model as model_module
 from base2backbone.data import BACKBONE_ATOMS
 from base2backbone.model import BackboneLightningModule
-from base2backbone.torsion_constants import N_LATENT, N_TORSIONS, TAU_M_MAX
 from base2backbone.score_diffusion import encode_torsions
+from base2backbone.torsion_constants import N_LATENT, N_TORSIONS, TAU_M_MAX
 
 
-def _minimal_train_batch(ws: int = 3, *, device=torch.device('cpu')) -> Batch:
+class _MinimalTrainBatch(Batch):
+    torsions: torch.Tensor
+    target_nt_idx: torch.Tensor
+    bb_xyz_world: torch.Tensor
+    is_target_nt: torch.Tensor
+
+
+def _minimal_train_batch(ws: int = 3, *, device=torch.device('cpu')) -> _MinimalTrainBatch:
     n_bb = len(BACKBONE_ATOMS)
     nt_o = torch.zeros(ws, 3, dtype=torch.float32, device=device)
     nt_f = torch.eye(3, dtype=torch.float32, device=device).unsqueeze(0).expand(ws, 3, 3).contiguous()
@@ -53,7 +60,7 @@ def _minimal_train_batch(ws: int = 3, *, device=torch.device('cpu')) -> Batch:
         pair_rel_frames=prel_f.reshape(ws, 9),
     )
     d.is_target_nt = is_target.unsqueeze(-1)
-    return Batch.from_data_list([d])
+    return cast(_MinimalTrainBatch, Batch.from_data_list([d]))
 
 
 def test_bridge_closure_metrics_returns_finite_dict():
@@ -109,7 +116,7 @@ def test_validation_step_source_always_logs_val_closure():
 def test_test_step_source_collects_test_closure():
     src = inspect.getsource(BackboneLightningModule.test_step)
     assert '_bridge_closure_metrics_full_window' in src
-    assert '_test_closure_values.setdefault(key, []).append' in src.replace(' ', '')
+    assert '_test_closure_values.setdefault(key,[]).append' in src.replace(' ', '')
 
 
 def test_tl_latent_width_matches_torch_geometry():

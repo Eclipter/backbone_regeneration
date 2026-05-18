@@ -6,7 +6,7 @@ BASE = dict(
     NUM_HEADS=8,
     NUM_LAYERS=3,
     NUM_TIMESTEPS=200,
-    BATCH_SIZE=50000,
+    BATCH_SIZE=30000,
     LR=1e-3,
     WEIGHT_DECAY=0.01,
     EDGE_WEIGHT=0.3,  # from 0 (for central-only), to 1 (for edge-only)
@@ -17,7 +17,7 @@ BASE = dict(
     SWA=True,
     SWA_LR=0.1,
     SWA_EPOCH_START=100,
-    NUM_EPOCHS=200,
+    NUM_EPOCHS=300,
     ANGULAR_SIGMA_MIN=0.01*pi,  # from 0 (no noise), to ANGULAR_SIGMA_MAX
     ANGULAR_SIGMA_MAX=pi,  # from ANGULAR_SIGMA_MIN, to pi (wrapped angles ~ uniform)
     TAU_SIGMA_MIN=0.01,  # from 0 (no noise), to TAU_SIGMA_MAX
@@ -32,10 +32,10 @@ BASE = dict(
     CLOSURE_SIGMA_BOND_A=0.05,  # (0, +inf) Å
     CLOSURE_SIGMA_ANGLE_DEG=10,  # (0, +inf) deg
     CLOSURE_SIGMA_TORSION_RAD=0.35,  # (0, +inf) rad
-    RUN_NAME='torsions/10',  # Run path under `logs/`
+    RUN_NAME='torsions/11',  # Run path under `logs/`
     DATASET_MANIFEST='thesis_2026-05-17.json',  # Set to None to fetch from RCSB PDB API and save into latest.json
     SEED=42,
-    TORCH_COMPILE=False,
+    TORCH_COMPILE=True,
     START_FROM_LAST_CKPT=True,
 )
 
@@ -43,15 +43,8 @@ BASE = dict(
 EXPERIMENTS = [
     # {},  # baseline (matches BASE)
     {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.3},
-    # WINDOW SIZE 5, 7
 ]
 
 ######### TO DOs ########
-# MAJOR:
 # Consider bridge-matching
-
-# MINOR:
-# Experiment with large window sizes
-# Experiment with edge weight
-# Distillate like in paper: https://openreview.net/forum?id=8NuN5UzXLC
 ########################

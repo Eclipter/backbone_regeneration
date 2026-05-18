@@ -30,7 +30,7 @@ from .primitives import (
 from .torsions import (
     RING_TORSION_DEFS as _RING_TORSION_DEFS,
     _PSEUDOROTATION_OFFSETS,
-    phosphate_from_bridge_phase_torch,
+    phosphate_from_bridge_phase,
     nucleotide_torsions,
     nus_rad_from_phase_and_amplitude,
     phase_and_amplitude_to_nus,
@@ -874,6 +874,8 @@ def close_phosphate_bridge_multi(
     dtype = bridge_phase.dtype
     device_str = str(device)
     o3p = prev_atoms["O3'"]
+    c3p = prev_atoms["C3'"]
+    c4p = prev_atoms.get("C4'")
     o5n = next_atoms["O5'"]
 
     ri = g.get('restype_indices_next')
@@ -890,6 +892,9 @@ def close_phosphate_bridge_multi(
     squeeze = False
     if o3p.ndim == 1:
         o3p = o3p.unsqueeze(0)
+        c3p = c3p.unsqueeze(0)
+        if c4p is not None:
+            c4p = c4p.unsqueeze(0)
         o5n = o5n.unsqueeze(0)
         bridge_phase = bridge_phase.reshape(1)
         r_o3p = r_o3p.reshape(1)
@@ -897,12 +902,14 @@ def close_phosphate_bridge_multi(
         ri = ri.reshape(1)
         squeeze = True
 
-    p_pick = phosphate_from_bridge_phase_torch(
+    p_pick = phosphate_from_bridge_phase(
         o3p,
         o5n,
+        c3p,
         bridge_phase,
         r_o3p,
         l_po5,
+        c4p,
         eps=_GEO_EPS,
     )
 
@@ -949,6 +956,8 @@ def build_backbone_from_torsions(
     tau_m: 'torch.Tensor',
     restype_indices: 'torch.Tensor',
     o3_prev_local: Optional[torch.Tensor] = None,
+    c3_prev_local: Optional[torch.Tensor] = None,
+    c4_prev_local: Optional[torch.Tensor] = None,
 ) -> dict[str, torch.Tensor]:
     """Batched decoder: deterministic sugar ring closure, stereo exocyclic O3′/C5′, γ→O5′.
 
@@ -981,8 +990,8 @@ def build_backbone_from_torsions(
 
     prev_atoms = {
         "O3'": o3_prev_local,
-        "C3'": out["C3'"],
-        "C4'": out["C4'"],
+        "C3'": c3_prev_local if c3_prev_local is not None else out["C3'"],
+        "C4'": c4_prev_local if c4_prev_local is not None else out["C4'"],
     }
     next_atoms: dict[str, torch.Tensor] = {
         "O5'": out["O5'"],
@@ -1243,6 +1252,8 @@ def build_backbone_local(
     restype: str,
     *,
     o3_prev_local: Optional[np.ndarray] = None,
+    c3_prev_local: Optional[np.ndarray] = None,
+    c4_prev_local: Optional[np.ndarray] = None,
     tau_m: Optional[float] = None,
 ) -> dict[str, np.ndarray]:
     """Single residue on CPU: numpy torsion vector → numpy atom dict (scripts / tests)."""
@@ -1253,9 +1264,26 @@ def build_backbone_local(
     theta = torch.from_numpy(np.asarray(torsions, dtype=np.float64)).unsqueeze(0).float()
     tm = torch.tensor([tm_val], dtype=torch.float32)
     o3_t = None
+    c3_t = None
+    c4_t = None
     if o3_prev_local is not None:
         o3_t = torch.from_numpy(
             np.asarray(o3_prev_local, dtype=np.float64).reshape(1, 3),
         ).float()
-    bb_t = build_backbone_from_torsions(theta, tm, ri, o3_prev_local=o3_t)
+    if c3_prev_local is not None:
+        c3_t = torch.from_numpy(
+            np.asarray(c3_prev_local, dtype=np.float64).reshape(1, 3),
+        ).float()
+    if c4_prev_local is not None:
+        c4_t = torch.from_numpy(
+            np.asarray(c4_prev_local, dtype=np.float64).reshape(1, 3),
+        ).float()
+    bb_t = build_backbone_from_torsions(
+        theta,
+        tm,
+        ri,
+        o3_prev_local=o3_t,
+        c3_prev_local=c3_t,
+        c4_prev_local=c4_t,
+    )
     return {k: v.squeeze(0).detach().cpu().numpy() for k, v in bb_t.items()}

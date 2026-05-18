@@ -76,15 +76,62 @@ def _bridge_template_bond_lengths(base_one_letter: str) -> tuple[float, float]:
     return r_a, r_b
 
 
-def _safe_normalize_torch(v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+def _safe_normalize(v: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
     return v / v.norm(dim=-1, keepdim=True).clamp(min=eps)
 
 
-def bridge_circle_geometry_torch(
+def _deterministic_bridge_basis(
+    axis: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    x_axis = torch.zeros_like(axis)
+    x_axis[..., 0] = 1.0
+    y_axis = torch.zeros_like(axis)
+    y_axis[..., 1] = 1.0
+    ref = torch.where(axis[..., 0].abs().unsqueeze(-1) >= 0.9, y_axis, x_axis)
+    u = _safe_normalize(torch.linalg.cross(ref, axis, dim=-1), eps=eps)
+    v = _safe_normalize(torch.linalg.cross(axis, u, dim=-1), eps=eps)
+    return u, v
+
+
+def _chemical_bridge_basis(
     anchor_a: torch.Tensor,
     anchor_b: torch.Tensor,
+    ref_atom: torch.Tensor,
+    fallback_ref_atom: torch.Tensor | None = None,
+    *,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    axis_vec = anchor_b - anchor_a
+    axis = _safe_normalize(axis_vec, eps=eps)
+
+    def _project(ref_point: torch.Tensor) -> torch.Tensor:
+        ref = ref_point - anchor_a
+        return ref - (ref * axis).sum(dim=-1, keepdim=True) * axis
+
+    u_seed = _project(ref_atom)
+    if fallback_ref_atom is not None:
+        fallback_seed = _project(fallback_ref_atom)
+        use_fallback = u_seed.norm(dim=-1, keepdim=True) < eps
+        u_seed = torch.where(use_fallback, fallback_seed, u_seed)
+
+    det_u, _det_v = _deterministic_bridge_basis(axis, eps=eps)
+    use_det = u_seed.norm(dim=-1, keepdim=True) < eps
+    u = torch.where(use_det, det_u, u_seed)
+    u = _safe_normalize(u, eps=eps)
+    v = _safe_normalize(torch.linalg.cross(axis, u, dim=-1), eps=eps)
+    u = _safe_normalize(torch.linalg.cross(v, axis, dim=-1), eps=eps)
+    return axis, u, v
+
+
+def chemical_bridge_circle_geometry(
+    anchor_a: torch.Tensor,
+    anchor_b: torch.Tensor,
+    ref_atom: torch.Tensor,
     r_a: torch.Tensor,
     r_b: torch.Tensor,
+    fallback_ref_atom: torch.Tensor | None = None,
     *,
     eps: float = 1e-8,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -95,31 +142,55 @@ def bridge_circle_geometry_torch(
     center = anchor_a + a.unsqueeze(-1) * e
     # Infeasible/degenerate bridge circles have radius^2 = 0. Keep sqrt backward finite.
     radius = torch.sqrt((r_a * r_a - a * a).clamp(min=0.0) + GEO_EPS_SQ)
-
-    x_axis = torch.zeros_like(e)
-    x_axis[..., 0] = 1.0
-    y_axis = torch.zeros_like(e)
-    y_axis[..., 1] = 1.0
-    ref = torch.where(e[..., 0].abs().unsqueeze(-1) >= 0.9, y_axis, x_axis)
-    u = _safe_normalize_torch(torch.linalg.cross(ref, e, dim=-1), eps=eps)
-    v = torch.linalg.cross(e, u, dim=-1)
+    _axis, u, v = _chemical_bridge_basis(
+        anchor_a,
+        anchor_b,
+        ref_atom,
+        fallback_ref_atom,
+        eps=eps,
+    )
     return center, radius, u, v
 
 
-def phosphate_from_bridge_phase_torch(
+def bridge_circle_geometry(
     anchor_a: torch.Tensor,
     anchor_b: torch.Tensor,
+    ref_atom: torch.Tensor,
+    r_a: torch.Tensor,
+    r_b: torch.Tensor,
+    fallback_ref_atom: torch.Tensor | None = None,
+    *,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return chemical_bridge_circle_geometry(
+        anchor_a,
+        anchor_b,
+        ref_atom,
+        r_a,
+        r_b,
+        fallback_ref_atom,
+        eps=eps,
+    )
+
+
+def chemical_phosphate_from_bridge_phase(
+    anchor_a: torch.Tensor,
+    anchor_b: torch.Tensor,
+    ref_atom: torch.Tensor,
     phase: torch.Tensor,
     r_a: torch.Tensor,
     r_b: torch.Tensor,
+    fallback_ref_atom: torch.Tensor | None = None,
     *,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    center, radius, u, v = bridge_circle_geometry_torch(
+    center, radius, u, v = chemical_bridge_circle_geometry(
         anchor_a,
         anchor_b,
+        ref_atom,
         r_a,
         r_b,
+        fallback_ref_atom,
         eps=eps,
     )
     return center + radius.unsqueeze(-1) * (
@@ -128,20 +199,47 @@ def phosphate_from_bridge_phase_torch(
     )
 
 
-def bridge_phase_from_points_torch(
+def phosphate_from_bridge_phase(
     anchor_a: torch.Tensor,
     anchor_b: torch.Tensor,
-    phosphate: torch.Tensor,
+    ref_atom: torch.Tensor,
+    phase: torch.Tensor,
     r_a: torch.Tensor,
     r_b: torch.Tensor,
+    fallback_ref_atom: torch.Tensor | None = None,
     *,
     eps: float = 1e-8,
 ) -> torch.Tensor:
-    center, _radius, u, v = bridge_circle_geometry_torch(
+    return chemical_phosphate_from_bridge_phase(
         anchor_a,
         anchor_b,
+        ref_atom,
+        phase,
         r_a,
         r_b,
+        fallback_ref_atom,
+        eps=eps,
+    )
+
+
+def chemical_bridge_phase_from_points_torch(
+    anchor_a: torch.Tensor,
+    anchor_b: torch.Tensor,
+    ref_atom: torch.Tensor,
+    phosphate: torch.Tensor,
+    r_a: torch.Tensor,
+    r_b: torch.Tensor,
+    fallback_ref_atom: torch.Tensor | None = None,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    center, _radius, u, v = chemical_bridge_circle_geometry(
+        anchor_a,
+        anchor_b,
+        ref_atom,
+        r_a,
+        r_b,
+        fallback_ref_atom,
         eps=eps,
     )
     q = phosphate - center
@@ -154,21 +252,80 @@ def bridge_phase_from_points_torch(
     return torch.atan2(y, x)
 
 
-def bridge_phase_from_points(
+def bridge_phase_from_points_torch(
+    anchor_a: torch.Tensor,
+    anchor_b: torch.Tensor,
+    ref_atom: torch.Tensor,
+    phosphate: torch.Tensor,
+    r_a: torch.Tensor,
+    r_b: torch.Tensor,
+    fallback_ref_atom: torch.Tensor | None = None,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    return chemical_bridge_phase_from_points_torch(
+        anchor_a,
+        anchor_b,
+        ref_atom,
+        phosphate,
+        r_a,
+        r_b,
+        fallback_ref_atom,
+        eps=eps,
+    )
+
+
+def chemical_bridge_phase_from_points_numpy(
     anchor_a: np.ndarray,
     anchor_b: np.ndarray,
+    ref_atom: np.ndarray,
     phosphate: np.ndarray,
     r_a: float,
     r_b: float,
+    fallback_ref_atom: np.ndarray | None = None,
 ) -> float:
-    phase = bridge_phase_from_points_torch(
+    tensors = [
         torch.as_tensor(anchor_a, dtype=torch.float64).reshape(1, 3),
         torch.as_tensor(anchor_b, dtype=torch.float64).reshape(1, 3),
+        torch.as_tensor(ref_atom, dtype=torch.float64).reshape(1, 3),
         torch.as_tensor(phosphate, dtype=torch.float64).reshape(1, 3),
+    ]
+    fallback_tensor = None
+    if fallback_ref_atom is not None:
+        fallback_tensor = torch.as_tensor(
+            fallback_ref_atom,
+            dtype=torch.float64,
+        ).reshape(1, 3)
+    phase = chemical_bridge_phase_from_points_torch(
+        tensors[0],
+        tensors[1],
+        tensors[2],
+        tensors[3],
         torch.tensor([r_a], dtype=torch.float64),
         torch.tensor([r_b], dtype=torch.float64),
+        fallback_tensor,
     )
     return float(phase.item())
+
+
+def bridge_phase_from_points_numpy(
+    anchor_a: np.ndarray,
+    anchor_b: np.ndarray,
+    ref_atom: np.ndarray,
+    phosphate: np.ndarray,
+    r_a: float,
+    r_b: float,
+    fallback_ref_atom: np.ndarray | None = None,
+) -> float:
+    return chemical_bridge_phase_from_points_numpy(
+        anchor_a,
+        anchor_b,
+        ref_atom,
+        phosphate,
+        r_a,
+        r_b,
+        fallback_ref_atom,
+    )
 
 
 def nucleotide_torsions(xyz_by_name_cur, xyz_by_name_prev, xyz_by_name_next, base_one_letter):
@@ -183,6 +340,8 @@ def nucleotide_torsions(xyz_by_name_cur, xyz_by_name_prev, xyz_by_name_next, bas
     mask = np.zeros(N_TORSIONS, dtype=bool)
 
     o3_prev = g(xyz_by_name_prev, "O3'")
+    c3_prev = g(xyz_by_name_prev, "C3'")
+    c4_prev = g(xyz_by_name_prev, "C4'")
     p_cur = g(xyz_by_name_cur, 'P')
     o5 = g(xyz_by_name_cur, "O5'")
     c5 = g(xyz_by_name_cur, "C5'")
@@ -199,9 +358,17 @@ def nucleotide_torsions(xyz_by_name_cur, xyz_by_name_prev, xyz_by_name_next, bas
 
     _set(TOR_GAMMA, o5, c5, c4, c3)
     _set(TOR_DELTA, c5, c4, c3, o3_cur)
-    if o3_prev is not None and p_cur is not None and o5 is not None:
+    if o3_prev is not None and c3_prev is not None and p_cur is not None and o5 is not None:
         r_a, r_b = _bridge_template_bond_lengths(base_one_letter)
-        torsions[TOR_BRIDGE_PHASE] = bridge_phase_from_points(o3_prev, o5, p_cur, r_a, r_b)
+        torsions[TOR_BRIDGE_PHASE] = chemical_bridge_phase_from_points_numpy(
+            o3_prev,
+            o5,
+            c3_prev,
+            p_cur,
+            r_a,
+            r_b,
+            c4_prev,
+        )
         mask[TOR_BRIDGE_PHASE] = True
 
     op1 = g(xyz_by_name_cur, 'OP1')

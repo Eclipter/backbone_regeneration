@@ -1578,6 +1578,89 @@ print_rmsd_summary(
     sample_total_is_edge,
 )
 
+# %% Best-of-k decoder RMSD vs true coords
+BEST_OF_K = 10
+
+best_of_k_rmsds_list: list[float] = []
+best_of_k_is_edge_list: list[bool] = []
+
+eval_loader = DataLoader(
+    cast(Any, test_dataset),
+    batch_size=RMSD_EVAL_BATCH_SIZE,
+    shuffle=False,
+)
+
+with torch.no_grad():
+    for batch in tqdm(
+        eval_loader,
+        total=len(eval_loader),
+        desc=f'best-of-{BEST_OF_K} RMSD',
+        colour=PROGRESS_BAR_COLOR,
+    ):
+        batch = cast(Any, batch).to(device)
+
+        b, ws = model._b_ws(batch)
+        ti = batch.target_nt_idx.long()
+        bi = torch.arange(b, device=device)
+
+        theta_w = batch.torsions.view(b, ws, N_TORSIONS).float()
+        tau_w = (
+            batch.tau_m
+            .view(b, ws)
+            .clamp(min=TAU_M_MIN, max=TAU_M_MAX)
+            .float()
+        )
+        torsion_mask_w = batch.torsion_mask.view(b, ws, N_TORSIONS)
+
+        n_bb = len(BACKBONE_ATOMS)
+        gt_bb_world = batch.bb_xyz_world.view(b, ws, n_bb, 3)[bi, ti]
+        origin = batch.nt_origins_world.view(b, ws, 3)[bi, ti]
+        frame = batch.nt_frames_world.view(b, ws, 3, 3)[bi, ti]
+        gt_local = ((gt_bb_world - origin[:, None]) @ frame).detach().cpu().numpy()
+        is_edge_batch = model._is_edge_target(batch).detach().cpu().numpy().astype(bool)
+
+        best_rmsds_batch = np.full(b, np.nan, dtype=np.float64)
+        for _ in range(BEST_OF_K):
+            pred_theta, pred_tau_m = model.sample(
+                batch,
+                num_timesteps=15,
+            )
+            theta_pred_w = theta_w.clone()
+            tau_pred_w = tau_w.clone()
+            theta_pred_w[bi, ti] = pred_theta.float()
+            tau_pred_w[bi, ti] = pred_tau_m.clamp(
+                min=TAU_M_MIN,
+                max=TAU_M_MAX,
+            ).float()
+
+            coords_pred_w = model._build_window_backbone(
+                theta_pred_w,
+                tau_pred_w,
+                batch,
+                torsion_mask_w,
+            )
+            pred_bb_world = coords_pred_w[bi, ti]
+            pred_local = ((pred_bb_world - origin[:, None]) @ frame).detach().cpu().numpy()
+
+            for sample_idx in range(b):
+                rmsd = local_backbone_rmsd(pred_local[sample_idx], gt_local[sample_idx])
+                if np.isfinite(rmsd) and (
+                    not np.isfinite(best_rmsds_batch[sample_idx])
+                    or rmsd < best_rmsds_batch[sample_idx]
+                ):
+                    best_rmsds_batch[sample_idx] = rmsd
+
+        best_of_k_rmsds_list.extend(best_rmsds_batch.tolist())
+        best_of_k_is_edge_list.extend(is_edge_batch.tolist())
+
+best_of_k_rmsds = np.asarray(best_of_k_rmsds_list, dtype=np.float64)
+best_of_k_is_edge = np.asarray(best_of_k_is_edge_list, dtype=bool)
+print_rmsd_summary(
+    f'Best-of-{BEST_OF_K} decoder(pred torsions) vs true coords:',
+    best_of_k_rmsds,
+    best_of_k_is_edge,
+)
+
 # %% Compare PHENIX run time with Base2Backbone
 
 NUM_TIMESTEPS_LIST = [5, 10, 15, 20, 30, 50, 100, 200, 300, 500, 1000]

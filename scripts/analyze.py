@@ -25,6 +25,7 @@ from config import BASE
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import Batch, Data
+from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from base2backbone.data import BACKBONE_ATOMS, BASE_TO_INDEX, parse_dna
@@ -46,6 +47,7 @@ from base2backbone.inference import write_structure
 from base2backbone.io import default_atoms_provider
 from base2backbone.runtime import (PROGRESS_BAR_COLOR, collect_scalar_history,
                                    load_analysis_run_artifacts)
+from base2backbone.torsion_constants import N_TORSIONS, TAU_M_MAX, TAU_M_MIN
 
 IDX_TO_BASE = {v: k for k, v in BASE_TO_INDEX.items()}
 
@@ -1381,7 +1383,6 @@ def accumulate_per_atom_errors(
     gt_local,
     atom_sq_sums,
     atom_counts,
-    atom_max_errs,
 ):
     bb_atom_idx = {name: i for i, name in enumerate(BACKBONE_ATOMS)}
     op_match = {'OP1': 'OP1', 'OP2': 'OP2'}
@@ -1410,13 +1411,11 @@ def accumulate_per_atom_errors(
         if np.isnan(pred_xyz).any() or np.isnan(gt_xyz).any():
             continue
         sq_err = float(np.sum((pred_xyz - gt_xyz) ** 2))
-        err = float(np.sqrt(sq_err))
         atom_sq_sums[atom_name] += sq_err
         atom_counts[atom_name] += 1
-        atom_max_errs[atom_name] = max(atom_max_errs[atom_name], err)
 
 
-def summarize_per_atom_errors(atom_sq_sums, atom_counts, atom_max_errs):
+def collect_per_atom_errors(atom_sq_sums, atom_counts):
     total_sq = float(sum(atom_sq_sums.values()))
     atom_rows = []
     for atom_name in BACKBONE_ATOMS:
@@ -1428,101 +1427,155 @@ def summarize_per_atom_errors(atom_sq_sums, atom_counts, atom_max_errs):
             atom_name,
             float(np.sqrt(mean_sq)),
             100.0 * atom_sq_sums[atom_name] / max(total_sq, 1e-12),
-            count,
-            atom_max_errs[atom_name],
         ))
-
-    print('\nPer-atom error contribution:')
-    for atom_name, atom_rmsd, contrib_pct, count, max_err in sorted(
-        atom_rows,
-        key=lambda row: row[2],
-        reverse=True,
-    ):
-        print(
-            f'  {atom_name:>4}: rmsd={atom_rmsd:.3f} A  '
-            f'contrib={contrib_pct:5.1f}%  '
-            f'max={max_err:.3f} A  '
-            f'n={count}'
-        )
-
-    if atom_rows:
-        atom_names = [row[0] for row in atom_rows]
-        atom_rmsds = [row[1] for row in atom_rows]
-        atom_contribs = [row[2] for row in atom_rows]
-
-        fig2, (ax_atom_rmsd, ax_atom_contrib) = plt.subplots(1, 2, figsize=(12, 4))
-        ax_atom_rmsd.bar(atom_names, atom_rmsds, color='skyblue')
-        ax_atom_rmsd.set_title('RMSD по отдельным атомам')
-        ax_atom_rmsd.set_ylabel('RMSD (Å)')
-        ax_atom_rmsd.tick_params(axis='x', rotation=45)
-
-        ax_atom_contrib.bar(atom_names, atom_contribs, color='indianred')
-        ax_atom_contrib.set_title('Вклад в общий RMSD')
-        ax_atom_contrib.set_ylabel('Вклад (%)')
-        ax_atom_contrib.tick_params(axis='x', rotation=45)
-
-        fig2.tight_layout()
-        plt.show()
+    return atom_rows
 
 
-# %% Decode oracle torsions
+def plot_per_atom_errors(atom_rows):
+    if not atom_rows:
+        return
+
+    atom_names = [row[0] for row in atom_rows]
+    atom_rmsds = [row[1] for row in atom_rows]
+    atom_contribs = [row[2] for row in atom_rows]
+
+    fig_rmsd, ax_atom_rmsd = plt.subplots(figsize=(6, 4))
+    ax_atom_rmsd.bar(atom_names, atom_rmsds, color='indigo')
+    ax_atom_rmsd.set_ylabel('RMSD (Å)')
+    ax_atom_rmsd.tick_params(axis='x', rotation=45)
+    ax_atom_rmsd.spines['top'].set_visible(False)
+    ax_atom_rmsd.spines['right'].set_visible(False)
+    fig_rmsd.tight_layout()
+    plt.savefig(osp.join(run_dir, 'per_atom_rmsd.png'), bbox_inches='tight', dpi=300)
+    plt.show()
+
+    fig_contrib, ax_atom_contrib = plt.subplots(figsize=(6, 4))
+    ax_atom_contrib.bar(atom_names, atom_contribs, color='violet')
+    ax_atom_contrib.set_ylabel('Вклад (%)')
+    ax_atom_contrib.tick_params(axis='x', rotation=45)
+    ax_atom_contrib.spines['top'].set_visible(False)
+    ax_atom_contrib.spines['right'].set_visible(False)
+    fig_contrib.tight_layout()
+    plt.savefig(osp.join(run_dir, 'per_atom_contrib.png'), bbox_inches='tight', dpi=300)
+    plt.show()
+
+
+# %% Oracle decoder RMSD + decoder(pred torsions) vs decoder(true torsions)
+RMSD_EVAL_BATCH_SIZE = 128
+
 oracle_rmsds_list: list[float] = []
 oracle_is_edge_list: list[bool] = []
 oracle_atom_sq_sums: defaultdict[str, float] = defaultdict(float)
 oracle_atom_counts: defaultdict[str, int] = defaultdict(int)
-oracle_atom_max_errs: defaultdict[str, float] = defaultdict(float)
+decoded_torsion_rmsds_list: list[float] = []
+decoded_torsion_is_edge_list: list[bool] = []
+sample_total_rmsds_list: list[float] = []
+sample_total_is_edge_list: list[bool] = []
+
+eval_loader = DataLoader(
+    cast(Any, test_dataset),
+    batch_size=RMSD_EVAL_BATCH_SIZE,
+    shuffle=False,
+)
 
 with torch.no_grad():
-    for i in tqdm(
-        range(len(test_dataset)),
-        desc='decoder oracle',
+    for batch in tqdm(
+        eval_loader,
+        total=len(eval_loader),
+        desc='oracle + decoded torsion RMSD',
         colour=PROGRESS_BAR_COLOR,
     ):
-        data = cast(Data, test_dataset[i].clone())
-        batch = cast(Any, Batch.from_data_list([data])).to(device)
+        batch = cast(Any, batch).to(device)
 
-        theta0, _, tau0, _, _ = model._theta_mask_target(batch)
-        rmsd = model._compute_rmsd_per_graph_local(theta0, tau0, batch)
+        b, ws = model._b_ws(batch)
+        ti = batch.target_nt_idx.long()
+        bi = torch.arange(b, device=device)
 
-        oracle_rmsds_list.append(float(rmsd.item()))
-        tidx = int(data.target_nt_idx.item())
-        oracle_is_edge_list.append(bool(data.is_chain_edge_nt[tidx].item()))
+        theta_w = batch.torsions.view(b, ws, N_TORSIONS).float()
+        tau_w = (
+            batch.tau_m
+            .view(b, ws)
+            .clamp(min=TAU_M_MIN, max=TAU_M_MAX)
+            .float()
+        )
+        torsion_mask_w = batch.torsion_mask.view(b, ws, N_TORSIONS)
 
-        gt_bb_world = data.bb_xyz_world[tidx].detach().cpu().numpy()
-        origin = data.nt_origins_world[tidx].detach().cpu().numpy()
-        frame = data.nt_frames_world[tidx].detach().cpu().numpy()
-        gt_local = (gt_bb_world - origin) @ frame
-
-        restype = IDX_TO_BASE[int(data.base_types[tidx].argmax().item())]
-        o3_prev_local = None
-        if bool(data.o3_prev_valid[tidx].item()):
-            o3_prev_local = data.o3_prev_local[tidx].detach().cpu().numpy()
-        decoded = build_backbone_local(
-            theta0[0].detach().cpu().numpy(),
-            restype,
-            o3_prev_local=o3_prev_local,
-            tau_m=float(tau0[0].clamp(min=1e-3).item()),
+        coords_oracle_w = model._build_window_backbone(
+            theta_w,
+            tau_w,
+            batch,
+            torsion_mask_w,
         )
 
-        pred_local = np.full((len(BACKBONE_ATOMS), 3), np.nan, dtype=np.float64)
-        for atom_idx, atom_name in enumerate(BACKBONE_ATOMS):
-            if atom_name in decoded:
-                pred_local[atom_idx] = np.asarray(decoded[atom_name], dtype=np.float64)
-        accumulate_per_atom_errors(
-            pred_local,
-            gt_local,
-            oracle_atom_sq_sums,
-            oracle_atom_counts,
-            oracle_atom_max_errs,
+        pred_theta, pred_tau_m = model.sample(batch, num_timesteps=15)
+        theta_pred_w = theta_w.clone()
+        tau_pred_w = tau_w.clone()
+        theta_pred_w[bi, ti] = pred_theta.float()
+        tau_pred_w[bi, ti] = pred_tau_m.clamp(min=TAU_M_MIN, max=TAU_M_MAX).float()
+
+        coords_pred_w = model._build_window_backbone(
+            theta_pred_w,
+            tau_pred_w,
+            batch,
+            torsion_mask_w,
         )
 
+        n_bb = len(BACKBONE_ATOMS)
+        gt_bb_world = batch.bb_xyz_world.view(b, ws, n_bb, 3)[bi, ti]
+        oracle_bb_world = coords_oracle_w[bi, ti]
+        pred_bb_world = coords_pred_w[bi, ti]
+        origin = batch.nt_origins_world.view(b, ws, 3)[bi, ti]
+        frame = batch.nt_frames_world.view(b, ws, 3, 3)[bi, ti]
+
+        gt_local = ((gt_bb_world - origin[:, None]) @ frame).detach().cpu().numpy()
+        oracle_local = ((oracle_bb_world - origin[:, None]) @ frame).detach().cpu().numpy()
+        pred_local = ((pred_bb_world - origin[:, None]) @ frame).detach().cpu().numpy()
+        is_edge_batch = model._is_edge_target(batch).detach().cpu().numpy().astype(bool)
+
+        for sample_idx in range(b):
+            oracle_rmsds_list.append(
+                local_backbone_rmsd(oracle_local[sample_idx], gt_local[sample_idx])
+            )
+            oracle_is_edge_list.append(bool(is_edge_batch[sample_idx]))
+            accumulate_per_atom_errors(
+                oracle_local[sample_idx],
+                gt_local[sample_idx],
+                oracle_atom_sq_sums,
+                oracle_atom_counts,
+            )
+            decoded_torsion_rmsds_list.append(
+                local_backbone_rmsd(pred_local[sample_idx], oracle_local[sample_idx])
+            )
+            decoded_torsion_is_edge_list.append(bool(is_edge_batch[sample_idx]))
+            sample_total_rmsds_list.append(
+                local_backbone_rmsd(pred_local[sample_idx], gt_local[sample_idx])
+            )
+            sample_total_is_edge_list.append(bool(is_edge_batch[sample_idx]))
+
+# %% Plot decoder RMSD summaries
 oracle_rmsds = np.asarray(oracle_rmsds_list, dtype=np.float64)
 oracle_is_edge = np.asarray(oracle_is_edge_list, dtype=bool)
 print_rmsd_summary('Oracle decoder RMSD:', oracle_rmsds, oracle_is_edge)
-summarize_per_atom_errors(
+oracle_per_atom_rows = collect_per_atom_errors(
     oracle_atom_sq_sums,
     oracle_atom_counts,
-    oracle_atom_max_errs,
+)
+plot_per_atom_errors(oracle_per_atom_rows)
+
+decoded_torsion_rmsds = np.asarray(decoded_torsion_rmsds_list, dtype=np.float64)
+decoded_torsion_is_edge = np.asarray(decoded_torsion_is_edge_list, dtype=bool)
+print_rmsd_summary(
+    'Decoder(pred torsions) vs decoder(true torsions):',
+    decoded_torsion_rmsds,
+    decoded_torsion_is_edge,
+)
+
+sample_total_rmsds = np.asarray(sample_total_rmsds_list, dtype=np.float64)
+sample_total_is_edge = np.asarray(sample_total_is_edge_list, dtype=bool)
+print_rmsd_summary(
+    'Decoder(pred torsions) vs true coords:',
+    sample_total_rmsds,
+    sample_total_is_edge,
 )
 
 # %% Compare PHENIX run time with Base2Backbone

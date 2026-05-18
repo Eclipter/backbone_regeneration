@@ -35,7 +35,7 @@ BASE = dict(
     RUN_NAME='torsions/10',  # Run path under `logs/`
     DATASET_MANIFEST='thesis_2026-05-17.json',  # Set to None to fetch from RCSB PDB API and save into latest.json
     SEED=42,
-    TORCH_COMPILE=True,
+    TORCH_COMPILE=False,
     START_FROM_LAST_CKPT=True,
 )
 

@@ -12,16 +12,16 @@
     "score_loss_weighting": "sigma2",
     "log_tau_init_noise_scale": null
   },
-  "N_TORSIONS_LATENT": 8,
+  "N_TORSIONS_LATENT": 7,
   "base_to_idx": {
     "A": 0,
     "C": 1,
     "G": 2,
     "T": 3
   },
-  "node_dim": 88,
+  "node_dim": 85,
   "time_emb_dim": 32,
   "window_size": 3,
   "opset_version": 17,
-  "source_checkpoint": "epoch=199.ckpt"
+  "source_checkpoint": "epoch=197.ckpt"
 }

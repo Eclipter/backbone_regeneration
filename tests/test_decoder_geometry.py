@@ -17,6 +17,7 @@ from base2backbone.geometry.backbone import (
     nucleotide_torsions, nus_rad_from_phase_and_amplitude,
     wrap_dihedral_diff)
 from base2backbone.geometry import bridge_phase_from_points_torch
+from base2backbone.torsion_constants import TOR_BRIDGE_PHASE
 
 
 def _assert_window_bb_finiteness_design(bb: torch.Tensor) -> None:
@@ -337,30 +338,101 @@ def test_ground_truth_torsions_from_disk():
         assert torch.isfinite(bb).all()
 
 
+def test_build_backbone_requires_c3_prev_for_chemical_bridge(device):
+    theta = torch.zeros(1, N_TORSIONS, device=device)
+    tau = torch.tensor([0.35], device=device)
+    ri = torch.tensor([3], dtype=torch.long, device=device)
+    o3 = torch.randn(1, 3, device=device)
+    with pytest.raises(ValueError, match='c3_prev_local is required'):
+        build_backbone_from_torsions(theta, tau, ri, o3, None)
+
+
+def test_bridge_phase_is_rigid_transform_invariant(device):
+    rest = 'C'
+    prev_np, next_np = canonical_two_residue_bridge_positions(rest, rest)
+
+    def t(d, name):
+        return torch.tensor(d[name], dtype=torch.float64, device=device).reshape(1, 3)
+
+    o3 = t(prev_np, "O3'")
+    c3 = t(prev_np, "C3'")
+    c4 = t(prev_np, "C4'")
+    o5 = t(next_np, "O5'")
+    p = t(next_np, 'P')
+
+    ri = torch.tensor([1], dtype=torch.long, device=device)
+    tc = _template_tc(device)
+
+    phase0 = bridge_phase_from_points_torch(
+        o3,
+        o5,
+        c3,
+        p,
+        tc['bond_p_o3_inter'][ri].double(),
+        tc['bond_p_o5'][ri].double(),
+        c4,
+    )
+
+    q, _ = torch.linalg.qr(torch.randn(3, 3, dtype=torch.float64, device=device))
+    if torch.det(q) < 0:
+        q[:, 0] *= -1
+    shift = torch.randn(1, 3, dtype=torch.float64, device=device)
+
+    def rt(x):
+        return x @ q.T + shift
+
+    phase1 = bridge_phase_from_points_torch(
+        rt(o3),
+        rt(o5),
+        rt(c3),
+        rt(p),
+        tc['bond_p_o3_inter'][ri].double(),
+        tc['bond_p_o5'][ri].double(),
+        rt(c4),
+    )
+
+    assert wrap_dihedral_diff(phase1, phase0).abs().item() < 1e-6
+
+
 def test_ground_truth_torsions_rmsd_loose(device):
     tpl = _get_template('T')
-    xyz_prev = {"O3'": tpl["O3'"].copy()}
-    xyz_next = {'P': tpl['P'].copy(), "O5'": tpl["O5'"].copy()}
-    t_row, _mk, tau_mv, tau_ok = nucleotide_torsions(tpl, xyz_prev, xyz_next, 'T')
+    vec = tpl['P'] - tpl["O3'"]
+    scale = 1.001
+    xyz_prev = {
+        "O3'": tpl["O3'"] - vec * scale,
+        "C3'": tpl["C3'"] - vec * scale,
+        "C4'": tpl["C4'"] - vec * scale,
+    }
+    xyz_next = {
+        'P': tpl['P'] + vec * scale,
+        "O5'": tpl["O5'"] + vec * scale,
+    }
+    t_row, mask, tau_mv, tau_ok = nucleotide_torsions(tpl, xyz_prev, xyz_next, 'T')
     assert tau_ok
+    assert bool(mask[TOR_BRIDGE_PHASE])
     tau_t = float(tau_mv)
-    bb = build_backbone_from_torsions(
-        torch.tensor(t_row, dtype=torch.float32, device=device).unsqueeze(0),
-        torch.tensor([tau_t], device=device),
-        torch.tensor([3], dtype=torch.long, device=device),
-        None,
-    )
+    theta = torch.tensor(t_row, dtype=torch.float32, device=device).unsqueeze(0)
+    tau = torch.tensor([tau_t], device=device)
+    ri = torch.tensor([3], dtype=torch.long, device=device)
+
+    bb_sugar = build_backbone_from_torsions(theta, tau, ri, None)
+    sugar_atoms = ("C1'", "C2'", "C3'", "C4'", "C5'", "O3'", "O4'", "O5'")
     diffs = []
-    for nm, v in bb.items():
-        if nm not in tpl:
-            continue
+    for nm in sugar_atoms:
         gt = torch.tensor(tpl[nm], dtype=torch.float32, device=device)
-        diffs.append((v.squeeze(0) - gt).norm().item())
+        diffs.append((bb_sugar[nm].squeeze(0) - gt).norm().item())
     rms = float(np.sqrt(np.mean(np.square(diffs)))) if diffs else 0.0
     # Tight bound: with the column-stacked frame, the template-derived y-axis
     # and the stereo-pinned C2' branch, the only residual is the Altona-Sundaralingam
     # ν fit error (~0.03 rad) which propagates to ~0.05 Å per ring atom.
     assert rms < 0.10, f'round-trip RMSD too high: {rms:.4f} A'
+
+    o3_prev = torch.tensor(xyz_prev["O3'"], dtype=torch.float32, device=device).unsqueeze(0)
+    c3_prev = torch.tensor(xyz_prev["C3'"], dtype=torch.float32, device=device).unsqueeze(0)
+    c4_prev = torch.tensor(xyz_prev["C4'"], dtype=torch.float32, device=device).unsqueeze(0)
+    bb = build_backbone_from_torsions(theta, tau, ri, o3_prev, c3_prev, c4_prev)
+    assert 'P' in bb
+    assert torch.isfinite(bb['P']).all()
 
 
 def test_window_builder_batch_size_gt_one_finite(device):

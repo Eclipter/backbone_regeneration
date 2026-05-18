@@ -719,12 +719,18 @@ with torch.no_grad():
 
 restype = IDX_TO_BASE[int(data.base_types[tidx].argmax().item())]
 o3_prev_vis = None
-if bool(data.o3_prev_valid[tidx].item()):
+c3_prev_vis = None
+c4_prev_vis = None
+if bool(data.prev_bridge_ref_valid[tidx].item()):
     o3_prev_vis = data.o3_prev_local[tidx].numpy()
+    c3_prev_vis = data.c3_prev_local[tidx].numpy()
+    c4_prev_vis = data.c4_prev_local[tidx].numpy()
 pred_local = build_backbone_local(
     pred_theta[0].cpu().numpy(),
     restype,
     o3_prev_local=o3_prev_vis,
+    c3_prev_local=c3_prev_vis,
+    c4_prev_local=c4_prev_vis,
     tau_m=float(pred_tau_m[0].clamp(min=1e-3).item()),
 )
 
@@ -1039,8 +1045,12 @@ with torch.no_grad():
         tidx = int(data.target_nt_idx.item())
         restype = idx_to_base[int(data.base_types[tidx].argmax().item())]
         o3_ir = None
-        if bool(data.o3_prev_valid[tidx].item()):
+        c3_ir = None
+        c4_ir = None
+        if bool(data.prev_bridge_ref_valid[tidx].item()):
             o3_ir = data.o3_prev_local[tidx].numpy()
+            c3_ir = data.c3_prev_local[tidx].numpy()
+            c4_ir = data.c4_prev_local[tidx].numpy()
 
         batch = cast(Any, Batch.from_data_list([data])).to(device)
 
@@ -1050,7 +1060,12 @@ with torch.no_grad():
             torsions_np = pred_theta[0].cpu().numpy()
             tau_m_val = float(pred_tau_m[0].clamp(min=1e-3).item())
             bb = build_backbone_local(
-                torsions_np, restype, o3_prev_local=o3_ir, tau_m=tau_m_val,
+                torsions_np,
+                restype,
+                o3_prev_local=o3_ir,
+                c3_prev_local=c3_ir,
+                c4_prev_local=c4_ir,
+                tau_m=tau_m_val,
             )
             run_coords.append({k: v for k, v in bb.items() if k not in skip_atoms})
 

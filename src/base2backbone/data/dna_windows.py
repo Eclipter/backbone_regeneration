@@ -253,26 +253,47 @@ def build_window_data(window, window_idx, chain_len, chain_direction, structure,
                 bb_world[row_idx, atom_idx] = torch.tensor(np.asarray(experimental[atom_name], dtype=np.float32))
 
     o3_index = BACKBONE_ATOMS.index("O3'")
+    c3_index = BACKBONE_ATOMS.index("C3'")
+    c4_index = BACKBONE_ATOMS.index("C4'")
     o3_prev_local_rows = []
-    o3_prev_valid_rows = []
+    c3_prev_local_rows = []
+    c4_prev_local_rows = []
+    prev_bridge_ref_valid_rows = []
     for window_pos in range(window_size):
         if window_pos == 0:
             o3_prev_local_rows.append(torch.zeros(3, dtype=torch.float32))
-            o3_prev_valid_rows.append(False)
+            c3_prev_local_rows.append(torch.zeros(3, dtype=torch.float32))
+            c4_prev_local_rows.append(torch.zeros(3, dtype=torch.float32))
+            prev_bridge_ref_valid_rows.append(False)
         else:
-            o3_world = bb_world[window_pos - 1, o3_index]
-            if torch.isnan(o3_world).any():
+            prev_row = bb_world[window_pos - 1]
+            o3_world = prev_row[o3_index]
+            c3_world = prev_row[c3_index]
+            c4_world = prev_row[c4_index]
+            finite_o3 = not torch.isnan(o3_world).any()
+            finite_c3 = not torch.isnan(c3_world).any()
+            finite_c4 = not torch.isnan(c4_world).any()
+            bridge_ref_ok = finite_o3 and finite_c3 and finite_c4
+            if not bridge_ref_ok:
                 o3_prev_local_rows.append(torch.zeros(3, dtype=torch.float32))
-                o3_prev_valid_rows.append(False)
+                c3_prev_local_rows.append(torch.zeros(3, dtype=torch.float32))
+                c4_prev_local_rows.append(torch.zeros(3, dtype=torch.float32))
+                prev_bridge_ref_valid_rows.append(False)
             else:
                 origin = nt_origins[window_pos]
                 frame = nt_frames[window_pos]
                 o3_local = (o3_world - origin) @ frame
+                c3_local = (c3_world - origin) @ frame
+                c4_local = (c4_world - origin) @ frame
                 o3_prev_local_rows.append(o3_local.float())
-                o3_prev_valid_rows.append(True)
+                c3_prev_local_rows.append(c3_local.float())
+                c4_prev_local_rows.append(c4_local.float())
+                prev_bridge_ref_valid_rows.append(True)
 
     o3_prev_local_t = torch.stack(o3_prev_local_rows, dim=0)
-    o3_prev_valid_t = torch.tensor(o3_prev_valid_rows, dtype=torch.bool)
+    c3_prev_local_t = torch.stack(c3_prev_local_rows, dim=0)
+    c4_prev_local_t = torch.stack(c4_prev_local_rows, dim=0)
+    prev_bridge_ref_valid_t = torch.tensor(prev_bridge_ref_valid_rows, dtype=torch.bool)
 
     return Data(
         nt_origins_world=nt_origins_world,
@@ -291,7 +312,9 @@ def build_window_data(window, window_idx, chain_len, chain_direction, structure,
         touches_chain_edge=torch.tensor(touches_chain_edge, dtype=torch.bool),
         bb_xyz_world=bb_world,
         o3_prev_local=o3_prev_local_t,
-        o3_prev_valid=o3_prev_valid_t,
+        c3_prev_local=c3_prev_local_t,
+        c4_prev_local=c4_prev_local_t,
+        prev_bridge_ref_valid=prev_bridge_ref_valid_t,
         target_nt_idx=target_nt_idx,
     )
 

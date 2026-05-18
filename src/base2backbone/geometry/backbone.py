@@ -988,11 +988,18 @@ def build_backbone_from_torsions(
     if o3_prev_local is None:
         return out
 
-    prev_atoms = {
+    if c3_prev_local is None:
+        raise ValueError(
+            'c3_prev_local is required when o3_prev_local is provided '
+            'for chemical bridge_phase decoding',
+        )
+
+    prev_atoms: dict[str, torch.Tensor] = {
         "O3'": o3_prev_local,
-        "C3'": c3_prev_local if c3_prev_local is not None else out["C3'"],
-        "C4'": c4_prev_local if c4_prev_local is not None else out["C4'"],
+        "C3'": c3_prev_local,
     }
+    if c4_prev_local is not None:
+        prev_atoms["C4'"] = c4_prev_local
     next_atoms: dict[str, torch.Tensor] = {
         "O5'": out["O5'"],
         "C5'": out["C5'"],

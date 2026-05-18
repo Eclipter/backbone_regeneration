@@ -208,6 +208,19 @@ def print_rmsd_summary(title, rmsds, is_edge=None):
     return print_rmsd_metric_summary(title, summary)
 
 
+def mean_confidence_interval(values, z_score=1.959963984540054):
+    vals = finite_rmsd_values(values)
+    if len(vals) == 0:
+        return None, None, None
+
+    mean = float(np.mean(vals))
+    if len(vals) == 1:
+        return mean, mean, mean
+
+    half_width = float(z_score * np.std(vals, ddof=1) / np.sqrt(len(vals)))
+    return mean, mean - half_width, mean + half_width
+
+
 def rmsd_summary_with_suffix(rmsds, is_edge=None, suffix='_rmsd'):
     summary = rmsd_summary_metrics(rmsds, is_edge)
     return {
@@ -1461,7 +1474,7 @@ def plot_per_atom_errors(atom_rows):
 
 
 # %% Oracle decoder RMSD + decoder(pred torsions) vs decoder(true torsions)
-RMSD_EVAL_BATCH_SIZE = 128
+RMSD_EVAL_BATCH_SIZE = 20000
 
 oracle_rmsds_list: list[float] = []
 oracle_is_edge_list: list[bool] = []
@@ -1579,10 +1592,11 @@ print_rmsd_summary(
 )
 
 # %% Best-of-k decoder RMSD vs true coords
-BEST_OF_K = 10
+BEST_OF_K_LIST = [1, 2, 4, 7, 10, 15]
 
-best_of_k_rmsds_list: list[float] = []
+best_of_k_rmsds_by_k_list = {k: [] for k in BEST_OF_K_LIST}
 best_of_k_is_edge_list: list[bool] = []
+max_best_of_k = max(BEST_OF_K_LIST)
 
 eval_loader = DataLoader(
     cast(Any, test_dataset),
@@ -1594,7 +1608,7 @@ with torch.no_grad():
     for batch in tqdm(
         eval_loader,
         total=len(eval_loader),
-        desc=f'best-of-{BEST_OF_K} RMSD',
+        desc=f'best-of-k RMSD for {BEST_OF_K_LIST}',
         colour=PROGRESS_BAR_COLOR,
     ):
         batch = cast(Any, batch).to(device)
@@ -1620,7 +1634,7 @@ with torch.no_grad():
         is_edge_batch = model._is_edge_target(batch).detach().cpu().numpy().astype(bool)
 
         best_rmsds_batch = np.full(b, np.nan, dtype=np.float64)
-        for _ in range(BEST_OF_K):
+        for k_idx in range(1, max_best_of_k + 1):
             pred_theta, pred_tau_m = model.sample(
                 batch,
                 num_timesteps=15,
@@ -1642,24 +1656,59 @@ with torch.no_grad():
             pred_bb_world = coords_pred_w[bi, ti]
             pred_local = ((pred_bb_world - origin[:, None]) @ frame).detach().cpu().numpy()
 
-            for sample_idx in range(b):
-                rmsd = local_backbone_rmsd(pred_local[sample_idx], gt_local[sample_idx])
+            for batch_idx in range(b):
+                rmsd = local_backbone_rmsd(pred_local[batch_idx], gt_local[batch_idx])
                 if np.isfinite(rmsd) and (
-                    not np.isfinite(best_rmsds_batch[sample_idx])
-                    or rmsd < best_rmsds_batch[sample_idx]
+                    not np.isfinite(best_rmsds_batch[batch_idx])
+                    or rmsd < best_rmsds_batch[batch_idx]
                 ):
-                    best_rmsds_batch[sample_idx] = rmsd
+                    best_rmsds_batch[batch_idx] = rmsd
 
-        best_of_k_rmsds_list.extend(best_rmsds_batch.tolist())
+            if k_idx in best_of_k_rmsds_by_k_list:
+                best_of_k_rmsds_by_k_list[k_idx].extend(best_rmsds_batch.tolist())
+
         best_of_k_is_edge_list.extend(is_edge_batch.tolist())
 
-best_of_k_rmsds = np.asarray(best_of_k_rmsds_list, dtype=np.float64)
 best_of_k_is_edge = np.asarray(best_of_k_is_edge_list, dtype=bool)
-print_rmsd_summary(
-    f'Best-of-{BEST_OF_K} decoder(pred torsions) vs true coords:',
-    best_of_k_rmsds,
-    best_of_k_is_edge,
+best_of_k_rmsds_by_k = {
+    k: np.asarray(rmsds, dtype=np.float64)
+    for k, rmsds in best_of_k_rmsds_by_k_list.items()
+}
+best_of_k_summary_by_k = {}
+for k in BEST_OF_K_LIST:
+    best_of_k_summary_by_k[k] = print_rmsd_summary(
+        f'Best-of-{k} decoder(pred torsions) vs true coords:',
+        best_of_k_rmsds_by_k[k],
+        best_of_k_is_edge,
+    )
+
+# %% Plot best-of-k decoder RMSD curve
+best_of_k_curve = []
+for k in BEST_OF_K_LIST:
+    mean_rmsd = float(np.mean(finite_rmsd_values(best_of_k_rmsds_by_k[k])))
+    best_of_k_curve.append({
+        'k': k,
+        'mean_rmsd': mean_rmsd,
+    })
+
+best_of_k_values = np.asarray([row['k'] for row in best_of_k_curve], dtype=np.int64)
+best_of_k_means = np.asarray([row['mean_rmsd'] for row in best_of_k_curve], dtype=np.float64)
+
+fig, ax = plt.subplots(figsize=(7, 4))
+ax.plot(
+    best_of_k_values,
+    best_of_k_means,
+    marker='o',
+    color='indigo',
+    linewidth=2,
 )
+ax.set_xticks(best_of_k_values)
+ax.set_xlabel('k', fontsize=18)
+ax.set_ylabel('RMSD (Å)', fontsize=18)
+sns.despine(ax=ax, top=True, right=True)
+fig.tight_layout()
+fig.savefig(osp.join(run_dir, 'best_of_k_curve.png'), bbox_inches='tight', dpi=300)
+plt.show()
 
 # %% Compare PHENIX run time with Base2Backbone
 

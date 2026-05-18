@@ -27,6 +27,34 @@ def world_to_local_np(
     return (points_world - target_origin) @ target_frame
 
 
+def local_to_world_np(
+    points_local,
+    origin_world,
+    frame_world,
+) -> np.ndarray:
+    points_local = np.asarray(points_local, dtype=np.float64)
+    origin_world = np.asarray(origin_world, dtype=np.float64)
+    frame_world = np.asarray(frame_world, dtype=np.float64)
+    return points_local @ frame_world.T + origin_world
+
+
+def backbone_predictions_from_matched_local(
+    ref_local: np.ndarray,
+    origin_world: np.ndarray,
+    frame_world: np.ndarray,
+    segid: str,
+    resid: int,
+) -> dict[tuple[str, int, str], np.ndarray]:
+    predictions: dict[tuple[str, int, str], np.ndarray] = {}
+    for atom_idx, atom_name in enumerate(BACKBONE_ATOMS):
+        local_xyz = ref_local[atom_idx]
+        if not np.isfinite(local_xyz).all():
+            continue
+        world_xyz = local_to_world_np(local_xyz, origin_world, frame_world)
+        predictions[(segid, resid, atom_name)] = world_xyz.astype(np.float32)
+    return predictions
+
+
 @lru_cache(maxsize=1)
 def _backbone_bonds() -> tuple[tuple[str, str], ...]:
     graph = nucleotide_graphs['A']

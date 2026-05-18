@@ -17,16 +17,16 @@ BASE = dict(
     SWA=True,
     SWA_LR=0.1,
     SWA_EPOCH_START=100,
-    NUM_EPOCHS=300,
+    NUM_EPOCHS=200,
     ANGULAR_SIGMA_MIN=0.01*pi,  # from 0 (no noise), to ANGULAR_SIGMA_MAX
     ANGULAR_SIGMA_MAX=pi,  # from ANGULAR_SIGMA_MIN, to pi (wrapped angles ~ uniform)
     TAU_SIGMA_MIN=0.01,  # from 0 (no noise), to TAU_SIGMA_MAX
     TAU_SIGMA_MAX=1.5,  # from TAU_SIGMA_MIN, to ~3.4 (= log(TAU_M_MAX/TAU_M_MIN))
     SCORE_LOSS_WEIGHTING='sigma2',  # 'sigma2' | 'none'
     TAU_LOSS_WEIGHT=1,  # [0, +inf)
-    CLOSURE_LOSS_WEIGHT=0.3,  # [0, +inf)
+    CLOSURE_LOSS_WEIGHT=1e-3,  # [0, +inf)
     CLOSURE_BOND_WEIGHT=1,  # [0, +inf)
-    CLOSURE_ANGLE_WEIGHT=1,  # [0, +inf)
+    CLOSURE_ANGLE_WEIGHT=0.3,  # [0, +inf)
     CLOSURE_TORSION_WEIGHT=1,  # [0, +inf)
     # Closure σ (normalization for squared deviations); fail thresholds in bridge_closure.py are in σ-units.
     CLOSURE_SIGMA_BOND_A=0.05,  # (0, +inf) Å
@@ -41,8 +41,7 @@ BASE = dict(
 
 # One entry = one experiment. Put ONLY the overrides from BASE here
 EXPERIMENTS = [
-    # {},  # baseline (matches BASE)
-    {'CLOSURE_LOSS_WEIGHT': 1e-3, 'CLOSURE_ANGLE_WEIGHT': 0.3},
+    {},  # baseline (matches BASE)
 ]
 
 ######### TO DOs ########

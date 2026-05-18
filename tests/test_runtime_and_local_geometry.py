@@ -1,7 +1,7 @@
 import numpy as np
 
 from base2backbone.data import BACKBONE_ATOMS
-from base2backbone.eval import local_backbone_rmsd
+from base2backbone.eval import local_backbone_rmsd, local_to_world_np, world_to_local_np
 from base2backbone.runtime.tensorboard import collect_scalar_history, scalars_to_dataframe
 
 
@@ -83,3 +83,16 @@ def test_local_backbone_rmsd_is_permutation_invariant_for_phosphate_oxygens():
     gt[BACKBONE_ATOMS.index('OP2')] = np.array([1.0, 0.0, 0.0])
 
     assert local_backbone_rmsd(pred, gt) == 0.0
+
+
+def test_local_to_world_roundtrips_with_world_to_local():
+    origin = np.array([1.0, 2.0, 3.0])
+    frame = np.array([
+        [0.0, 1.0, 0.0],
+        [0.0, 0.0, 1.0],
+        [1.0, 0.0, 0.0],
+    ])
+    local = np.array([[0.5, 0.0, 0.0], [0.0, 0.5, 0.0]])
+    world = local_to_world_np(local, origin, frame)
+    recovered = world_to_local_np(world, origin, frame)
+    assert np.allclose(recovered, local)

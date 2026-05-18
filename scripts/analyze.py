@@ -9,7 +9,7 @@ import time
 import warnings
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from functools import lru_cache
+from functools import lru_cache, partial
 from pathlib import Path
 from typing import Any, cast
 
@@ -22,36 +22,41 @@ import torch
 from Bio.PDB.MMCIF2Dict import MMCIF2Dict
 from Bio.PDB.PDBExceptions import PDBConstructionWarning
 from config import BASE
-from sklearn.neighbors import NearestNeighbors
-from sklearn.preprocessing import StandardScaler
 from torch_geometric.data import Batch, Data
 from torch_geometric.loader import DataLoader
 from tqdm import tqdm
 
 from base2backbone.data import BACKBONE_ATOMS, BASE_TO_INDEX, parse_dna
 from base2backbone.dataset import DNADataModule
-from base2backbone.eval import (backbone_local_in_target_frame,
-                                backbone_segments_from_local_coords,
-                                bond_segments_from_nt_graph,
-                                coords_local_per_nt,
-                                find_window_matching_sample,
-                                local_backbone_rmsd, ordered_backbone_segments,
-                                phosphodiester_segments_local,
-                                world_to_local_np)
+from base2backbone.eval.knn_baseline import (KnnBaselineState,
+                                             build_knn_baseline_state,
+                                             dataset_samples_cached,
+                                             run_knn_protocol,
+                                             select_feature_columns)
+from base2backbone.eval.local_geometry import (
+    backbone_local_in_target_frame, backbone_segments_from_local_coords,
+    bond_segments_from_nt_graph, coords_local_per_nt,
+    find_window_matching_sample, local_backbone_rmsd,
+    ordered_backbone_segments, phosphodiester_segments_local,
+    world_to_local_np)
+from base2backbone.eval.molprobity import (
+    annotate_benchmark_rows_with_molprobity, print_molprobity_method_summaries,
+    summarize_molprobity_rows)
+from base2backbone.eval.structure_runners import (run_knn_baseline_structure,
+                                                  run_mean_baseline_structure)
 from base2backbone.geometry.backbone import build_backbone_local
 from base2backbone.inference import \
     _build_output_universe as build_output_universe
 from base2backbone.inference import \
     _predict_backbone_from_chain_records as predict_backbone_from_chain_records
-from base2backbone.inference import write_structure
+from base2backbone.inference import (write_phenix_hybrid_structure,
+                                     write_structure)
 from base2backbone.io import default_atoms_provider
 from base2backbone.runtime import (PROGRESS_BAR_COLOR, collect_scalar_history,
                                    load_analysis_run_artifacts)
 from base2backbone.torsion_constants import N_TORSIONS, TAU_M_MAX, TAU_M_MIN
 
 IDX_TO_BASE = {v: k for k, v in BASE_TO_INDEX.items()}
-
-TOR_NAMES = ['α', 'β', 'γ', 'ε', 'ζ', 'χ', 'phase']
 
 # %% Load prerequisites
 run_id = 'torsions/10/CLOSURE_LOSS_WEIGHT=0.001_CLOSURE_ANGLE_WEIGHT=0.3'
@@ -244,85 +249,6 @@ def prefixed_rmsd_stats(summary, prefix):
         f'{prefix}_{key}_rmsd': summary[f'{key}_rmsd']
         for key, _ in RMSD_SUMMARY_FIELDS
     }
-
-
-# %% Mean train-torsion baseline on test set
-def mean_target_torsions_and_tau(dataset):
-    first_data = cast(Data, dataset[0])
-    n_torsions = int(first_data.torsions.shape[-1])
-    sin_sums = np.zeros(n_torsions, dtype=np.float64)
-    cos_sums = np.zeros(n_torsions, dtype=np.float64)
-    torsion_counts = np.zeros(n_torsions, dtype=np.int64)
-    tau_sum = 0.0
-    tau_count = 0
-
-    for i in tqdm(
-        range(len(dataset)),
-        desc='mean baseline: train torsions',
-        colour=PROGRESS_BAR_COLOR,
-    ):
-        data = cast(Data, dataset[i])
-        tidx = int(data.target_nt_idx.item())
-        theta = data.torsions[tidx].detach().cpu().numpy()
-        theta_mask = data.torsion_mask[tidx].detach().cpu().numpy().astype(bool)
-        sin_sums[theta_mask] += np.sin(theta[theta_mask])
-        cos_sums[theta_mask] += np.cos(theta[theta_mask])
-        torsion_counts[theta_mask] += 1
-
-        if bool(data.tau_m_mask[tidx].item()):
-            tau_sum += float(data.tau_m[tidx].item())
-            tau_count += 1
-
-    mean_theta = np.zeros(n_torsions, dtype=np.float64)
-    valid_torsions = torsion_counts > 0
-    mean_theta[valid_torsions] = np.arctan2(
-        sin_sums[valid_torsions],
-        cos_sums[valid_torsions],
-    )
-    mean_tau = tau_sum / tau_count
-    return mean_theta, mean_tau, torsion_counts, tau_count
-
-
-def evaluate_mean_torsion_baseline(dataset, mean_theta, mean_tau):
-    pred_theta = torch.as_tensor(
-        mean_theta,
-        device=device,
-        dtype=torch.float32,
-    ).unsqueeze(0)
-    pred_tau = torch.tensor([mean_tau], device=device, dtype=torch.float32)
-    rmsds: list[float] = []
-    is_edge: list[bool] = []
-
-    with torch.no_grad():
-        for i in tqdm(
-            range(len(dataset)),
-            desc='mean baseline: test decode',
-            colour=PROGRESS_BAR_COLOR,
-        ):
-            data = cast(Data, dataset[i].clone())
-            batch = cast(Any, Batch.from_data_list([data])).to(device)
-            rmsd = model._compute_rmsd_per_graph_local(pred_theta, pred_tau, batch)
-
-            rmsds.append(float(rmsd.item()))
-            tidx = int(data.target_nt_idx.item())
-            is_edge.append(bool(data.is_chain_edge_nt[tidx].item()))
-
-    return np.asarray(rmsds, dtype=np.float64), np.asarray(is_edge, dtype=bool)
-
-
-mean_baseline_theta, mean_baseline_tau, mean_baseline_torsion_counts, mean_baseline_tau_count = (
-    mean_target_torsions_and_tau(train_dataset)
-)
-mean_baseline_test_rmsds, mean_baseline_test_is_edge = evaluate_mean_torsion_baseline(
-    test_dataset,
-    mean_baseline_theta,
-    mean_baseline_tau,
-)
-print_rmsd_summary(
-    'Mean train torsion/amplitude baseline test RMSD:',
-    mean_baseline_test_rmsds,
-    mean_baseline_test_is_edge,
-)
 
 
 # %% Show samples from dataset
@@ -664,7 +590,7 @@ fig.tight_layout()
 fig.savefig(osp.join(run_dir, 'test.png'), bbox_inches='tight', dpi=300)
 plt.show()
 
-# %% Visualize one test prediction
+# %% Visualize one sample generation
 test_pdb_to_local: dict[str, list[int]] = defaultdict(list)
 test_paths = []
 for local_i, (w_idx, _) in enumerate(test_dataset.virtual_entries):
@@ -952,7 +878,7 @@ fig.update_layout(
 )
 fig.show()
 
-# %% Run whole-structure inference
+# %% Visualize whole-structure generation
 inference_pdb_id = random.choice(sorted(test_pdb_to_local.keys()))
 raw_inference_path = osp.join('..', 'data', 'raw', f'{inference_pdb_id}.cif')
 
@@ -1093,7 +1019,88 @@ with torch.no_grad():
 inter_run_rmsd_mean = _rmsd_mean(inter_run_rmsds)
 print(f'\nInter-run RMSD (mean): {format_rmsd_value(inter_run_rmsd_mean)}')
 
-# %% Prepare kNN baseline
+# %% Test mean train-torsion baseline
+
+
+def mean_target_torsions_and_tau(dataset):
+    first_data = cast(Data, dataset[0])
+    n_torsions = int(first_data.torsions.shape[-1])
+    sin_sums = np.zeros(n_torsions, dtype=np.float64)
+    cos_sums = np.zeros(n_torsions, dtype=np.float64)
+    torsion_counts = np.zeros(n_torsions, dtype=np.int64)
+    tau_sum = 0.0
+    tau_count = 0
+
+    for i in tqdm(
+        range(len(dataset)),
+        desc='mean baseline: train torsions',
+        colour=PROGRESS_BAR_COLOR,
+    ):
+        data = cast(Data, dataset[i])
+        tidx = int(data.target_nt_idx.item())
+        theta = data.torsions[tidx].detach().cpu().numpy()
+        theta_mask = data.torsion_mask[tidx].detach().cpu().numpy().astype(bool)
+        sin_sums[theta_mask] += np.sin(theta[theta_mask])
+        cos_sums[theta_mask] += np.cos(theta[theta_mask])
+        torsion_counts[theta_mask] += 1
+
+        if bool(data.tau_m_mask[tidx].item()):
+            tau_sum += float(data.tau_m[tidx].item())
+            tau_count += 1
+
+    mean_theta = np.zeros(n_torsions, dtype=np.float64)
+    valid_torsions = torsion_counts > 0
+    mean_theta[valid_torsions] = np.arctan2(
+        sin_sums[valid_torsions],
+        cos_sums[valid_torsions],
+    )
+    mean_tau = tau_sum / tau_count
+    return mean_theta, mean_tau, torsion_counts, tau_count
+
+
+def evaluate_mean_torsion_baseline(dataset, mean_theta, mean_tau):
+    pred_theta = torch.as_tensor(
+        mean_theta,
+        device=device,
+        dtype=torch.float32,
+    ).unsqueeze(0)
+    pred_tau = torch.tensor([mean_tau], device=device, dtype=torch.float32)
+    rmsds: list[float] = []
+    is_edge: list[bool] = []
+
+    with torch.no_grad():
+        for i in tqdm(
+            range(len(dataset)),
+            desc='mean baseline: test decode',
+            colour=PROGRESS_BAR_COLOR,
+        ):
+            data = cast(Data, dataset[i].clone())
+            batch = cast(Any, Batch.from_data_list([data])).to(device)
+            rmsd = model._compute_rmsd_per_graph_local(pred_theta, pred_tau, batch)
+
+            rmsds.append(float(rmsd.item()))
+            tidx = int(data.target_nt_idx.item())
+            is_edge.append(bool(data.is_chain_edge_nt[tidx].item()))
+
+    return np.asarray(rmsds, dtype=np.float64), np.asarray(is_edge, dtype=bool)
+
+
+mean_baseline_theta, mean_baseline_tau, mean_baseline_torsion_counts, mean_baseline_tau_count = (
+    mean_target_torsions_and_tau(train_dataset)
+)
+mean_baseline_test_rmsds, mean_baseline_test_is_edge = evaluate_mean_torsion_baseline(
+    test_dataset,
+    mean_baseline_theta,
+    mean_baseline_tau,
+)
+print_rmsd_summary(
+    'Mean train torsion/amplitude baseline test RMSD:',
+    mean_baseline_test_rmsds,
+    mean_baseline_test_is_edge,
+)
+
+
+# %% Index kNN baseline
 
 knn_base_dataset = train_dataset.base
 
@@ -1150,195 +1157,34 @@ def build_pdb_meta_cache(pdb_ids):
     return cache
 
 
-def payload_key(dataset, target_type):
-    return 'central' if target_type == dataset.CENTRAL else 'edge'
-
-
-def feature_blocks(base_data, payload):
-    return {
-        'rel_origins': payload['rel_origins'],
-        'rel_frames': payload['rel_frames'],
-        'pair_rel_origins': payload['pair_rel_origins'],
-        'pair_rel_frames': payload['pair_rel_frames'],
-        'base_types': base_data.base_types,
-        'has_pair_nt': base_data.has_pair_nt.float(),
-        'chain_end_class': base_data.chain_end_class,
-        'is_target_nt': payload['is_target_nt'].float(),
-    }
-
-
-def feature_dim_and_slices(base_data, payload):
-    """Return (total_dim, name→slice) in one pass over feature_blocks."""
-    slices = {}
-    offset = 0
-    for name, arr in feature_blocks(base_data, payload).items():
-        size = int(arr.numel())
-        slices[name] = slice(offset, offset + size)
-        offset += size
-    return offset, slices
-
-
-def knn_feature_into(base_data, payload, out):
-    offset = 0
-    for arr in feature_blocks(base_data, payload).values():
-        flat = arr.reshape(-1).numpy()
-        out[offset:offset + flat.size] = flat
-        offset += flat.size
-
-
-def dataset_samples_cached(dataset, label, pdb_meta_cache):
-    n_samples = len(dataset)
-    n_bb = len(BACKBONE_ATOMS)
-    metas: list[dict[str, Any]] = []
-
-    first_w_idx, first_target_type = dataset.virtual_entries[0]
-    first_base = dataset.base.get(first_w_idx)
-    first_payloads = cast(
-        dict[str, dict[str, torch.Tensor]],
-        getattr(first_base, '_precomputed_target_payloads'),
-    )
-    first_payload = first_payloads[payload_key(dataset, first_target_type)]
-    feat_dim, feat_slices = feature_dim_and_slices(first_base, first_payload)
-
-    feats = np.empty((n_samples, feat_dim), dtype=np.float32)
-    locals_ = np.empty((n_samples, n_bb, 3), dtype=np.float32)
-    base_cache: dict[int, Any] = {first_w_idx: first_base}
-
-    for i in tqdm(
-            range(n_samples),
+def _index_knn_dataset_samples(dataset, label, pdb_meta_cache):
+    return dataset_samples_cached(
+        dataset,
+        label,
+        pdb_meta_cache,
+        progress_bar=lambda it: tqdm(
+            it,
             desc=f'kNN: indexing {label}',
             colour=PROGRESS_BAR_COLOR,
-    ):
-        w_idx, target_type = dataset.virtual_entries[i]
-        if w_idx not in base_cache:
-            base_cache[w_idx] = dataset.base.get(w_idx)
-        base = base_cache[w_idx]
-        payloads = cast(
-            dict[str, dict[str, torch.Tensor]],
-            getattr(base, '_precomputed_target_payloads'),
-        )
-        payload = payloads[payload_key(dataset, target_type)]
-        ti = int(payload['target_nt_idx'].item())
-        path = dataset.base.data_list[w_idx]
-        pdb_id = Path(path).parent.name
-        bb_w = base.bb_xyz_world[ti].numpy()
-        o = base.nt_origins_world[ti].numpy()
-        R = base.nt_frames_world[ti].numpy()
-        knn_feature_into(base, payload, feats[i])
-        locals_[i] = ((bb_w - o) @ R).astype(np.float32)
-        pdb_meta = pdb_meta_cache[pdb_id]
-        metas.append({
-            'sample_key': f'{label}:{w_idx}:{target_type}',
-            'pdb_id': pdb_id,
-            'deposit_group_id': pdb_meta['deposit_group_id'],
-            'dna_sequence_tokens': pdb_meta['dna_sequence_tokens'],
-            'base_type': int(base.base_types[ti].argmax().item()),
-            'is_edge': bool(base.is_chain_edge_nt[ti].item()),
-        })
-    return feats, locals_, metas, feat_slices
-
-
-def fit_knn_indices(ref_feats, ref_metas) -> tuple[
-    StandardScaler,
-    dict[int, np.ndarray],
-    dict[int, NearestNeighbors],
-]:
-    scaler = StandardScaler()
-    ref_feats_scaled = np.asarray(scaler.fit_transform(ref_feats), dtype=np.float32)
-    ref_indices_lists: defaultdict[int, list[int]] = defaultdict(list)
-    for idx, meta in enumerate(ref_metas):
-        ref_indices_lists[meta['base_type']].append(idx)
-    ref_indices_by_base = {
-        base_type: np.asarray(indices, dtype=np.int64)
-        for base_type, indices in ref_indices_lists.items()
-    }
-    nn_by_base = {}
-    for base_type, indices in ref_indices_by_base.items():
-        nn = NearestNeighbors(n_neighbors=len(indices), algorithm='auto')
-        nn.fit(ref_feats_scaled[indices])
-        nn_by_base[base_type] = nn
-    return scaler, ref_indices_by_base, nn_by_base
-
-
-def candidate_allowed(query_meta, ref_meta, allow_same_sample):
-    if not allow_same_sample and ref_meta['sample_key'] == query_meta['sample_key']:
-        return False
-    if ref_meta['pdb_id'] == query_meta['pdb_id']:
-        return False
-    if (
-        query_meta['deposit_group_id'] is not None
-        and ref_meta['deposit_group_id'] == query_meta['deposit_group_id']
-    ):
-        return False
-    if query_meta['dna_sequence_tokens'] & ref_meta['dna_sequence_tokens']:
-        return False
-    return True
-
-
-def run_knn_protocol(name, query_feats, query_locals, query_metas, ref_feats, ref_locals, ref_metas,
-                     allow_same_sample):
-    scaler, ref_indices_by_base, nn_by_base = fit_knn_indices(ref_feats, ref_metas)
-    query_feats_scaled = np.asarray(scaler.transform(query_feats), dtype=np.float32)
-    rmsds: list[float] = []
-    is_edge: list[bool] = []
-    missing = 0
-    for i, meta in enumerate(tqdm(
-            query_metas,
-            desc=f'kNN: {name}',
-            colour=PROGRESS_BAR_COLOR,
-    )):
-        ref_indices = ref_indices_by_base.get(meta['base_type'])
-        if ref_indices is None or len(ref_indices) == 0:
-            rmsds.append(np.nan)
-            is_edge.append(meta['is_edge'])
-            missing += 1
-            continue
-        _, neighbors = nn_by_base[meta['base_type']].kneighbors(
-            query_feats_scaled[i:i + 1],
-            n_neighbors=len(ref_indices),
-        )
-        match_idx = None
-        for local_idx in neighbors[0]:
-            ref_idx = int(ref_indices[int(local_idx)])
-            if candidate_allowed(meta, ref_metas[ref_idx], allow_same_sample):
-                match_idx = ref_idx
-                break
-        if match_idx is None:
-            rmsds.append(np.nan)
-            missing += 1
-        else:
-            rmsds.append(local_backbone_rmsd(ref_locals[match_idx], query_locals[i]))
-        is_edge.append(meta['is_edge'])
-    rmsds_arr = np.asarray(rmsds, dtype=np.float64)
-    is_edge_arr = np.asarray(is_edge, dtype=bool)
-    print_rmsd_summary(
-        f'kNN backbone RMSD (local frame) [{name}]',
-        rmsds_arr,
-        is_edge_arr,
+        ),
     )
-    print(
-        f'  {"eligible":>10}: '
-        f'{np.isfinite(rmsds_arr).sum()}/{len(rmsds_arr)} '
-        f'(missing={missing})'
-    )
-    return rmsds_arr, is_edge_arr
 
 
 pdb_meta_cache = build_pdb_meta_cache(
     collect_pdb_ids(train_dataset, val_dataset, test_dataset)
 )
 
-train_feats, train_locals, train_metas, train_feat_slices = dataset_samples_cached(
+train_feats, train_locals, train_metas, train_feat_slices = _index_knn_dataset_samples(
     train_dataset,
     'train',
     pdb_meta_cache,
 )
-val_feats, val_locals, val_metas, val_feat_slices = dataset_samples_cached(
+val_feats, val_locals, val_metas, val_feat_slices = _index_knn_dataset_samples(
     val_dataset,
     'val',
     pdb_meta_cache,
 )
-test_feats, test_locals, test_metas, test_feat_slices = dataset_samples_cached(
+test_feats, test_locals, test_metas, test_feat_slices = _index_knn_dataset_samples(
     test_dataset,
     'test',
     pdb_meta_cache,
@@ -1355,14 +1201,13 @@ feature_sets = [
 ]
 
 
-def select_feature_columns(feats, feat_slices, feature_names):
-    return np.concatenate(
-        [feats[:, feat_slices[name]] for name in feature_names],
-        axis=1,
-    )
-
-
 # %% Run kNN feature-set comparison
+KNN_MOLPROBITY_FEATURE_NAMES = [
+    'rel_origins',
+    'rel_frames',
+    'base_types',
+]
+
 for feature_set_name, feature_names in feature_sets:
     test_subset_feats = select_feature_columns(test_feats, test_feat_slices, feature_names)
     train_subset_feats = select_feature_columns(train_feats, train_feat_slices, feature_names)
@@ -1375,7 +1220,17 @@ for feature_set_name, feature_names in feature_sets:
         train_locals,
         train_metas,
         allow_same_sample=False,
+        print_summary=print_rmsd_summary,
     )
+
+knn_baseline_state = build_knn_baseline_state(
+    select_feature_columns(test_feats, test_feat_slices, KNN_MOLPROBITY_FEATURE_NAMES),
+    test_metas,
+    select_feature_columns(train_feats, train_feat_slices, KNN_MOLPROBITY_FEATURE_NAMES),
+    train_locals,
+    train_metas,
+    allow_same_sample=False,
+)
 # %% Compare logged model RMSD and oracle decoder RMSD
 wide_per_mode = globals().get('wide_per_mode')
 if wide_per_mode is None:
@@ -1580,7 +1435,7 @@ with torch.no_grad():
             )
             sample_total_is_edge_list.append(bool(is_edge_batch[sample_idx]))
 
-# %% Plot decoder RMSD summaries
+# %% Plot oracle decoder summaries
 oracle_rmsds = np.asarray(oracle_rmsds_list, dtype=np.float64)
 oracle_is_edge = np.asarray(oracle_is_edge_list, dtype=bool)
 print_rmsd_summary('Oracle decoder RMSD:', oracle_rmsds, oracle_is_edge)
@@ -1697,7 +1552,7 @@ for k in BEST_OF_K_LIST:
         best_of_k_is_edge,
     )
 
-# %% Plot best-of-k decoder RMSD curve
+# %% Plot best-of-k curve
 best_of_k_curve = []
 for k in BEST_OF_K_LIST:
     mean_rmsd = float(np.mean(finite_rmsd_values(best_of_k_rmsds_by_k[k])))
@@ -1783,9 +1638,13 @@ def run_phenix_geometry_minimization(
     max_iterations: int = 500,
     macro_cycles: int = 5,
     timeout_s: int = 300,
+    window_size: int | None = None,
 ) -> dict:
     """
     Run Phenix geometry minimization on a DNA structure.
+
+    The raw mmCIF/PDB is parsed with PyNAMod; PHENIX receives experimental base
+    coordinates and canonical template backbone atoms in nucleotide ref frames.
 
     Returns:
         {
@@ -1793,25 +1652,49 @@ def run_phenix_geometry_minimization(
             "wall_time_s": float,
             "returncode": int,
             "output_pdb": Path | None,
+            "phenix_input_pdb": Path | None,
             "stdout": str,
             "stderr": str,
         }
     """
 
-    input_pdb = Path(input_pdb).resolve()
+    raw_path = Path(input_pdb).resolve()
     output_dir = Path(output_dir).resolve()
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    prefix = input_pdb.stem
+    if window_size is None:
+        window_size = int(getattr(test_dataset.base, 'window_size', 3))
+
+    prefix = raw_path.stem
+    phenix_input_path = output_dir / f'{prefix}_phenix_hybrid.pdb'
 
     t0 = time.perf_counter()
 
-    with tempfile.TemporaryDirectory(dir="/tmp") as tmpdir:
+    try:
+        write_phenix_hybrid_structure(
+            raw_path,
+            phenix_input_path,
+            window_size=window_size,
+        )
+    except Exception as e:
+        return {
+            'success': False,
+            'wall_time_s': time.perf_counter() - t0,
+            'returncode': -998,
+            'output_pdb': None,
+            'phenix_input_pdb': None,
+            'stdout': '',
+            'stderr': repr(e),
+        }
+
+    struct_tmp_root = Path(__file__).resolve().parents[1] / 'data'
+    struct_tmp_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=struct_tmp_root) as tmpdir:
         tmpdir = Path(tmpdir)
 
-        local_pdb = tmpdir / input_pdb.name
-        shutil.copy2(input_pdb, local_pdb)
+        local_pdb = tmpdir / phenix_input_path.name
+        shutil.copy2(phenix_input_path, local_pdb)
 
         out_prefix = tmpdir / prefix
 
@@ -1843,12 +1726,13 @@ def run_phenix_geometry_minimization(
 
         except subprocess.TimeoutExpired as e:
             return {
-                "success": False,
-                "wall_time_s": time.perf_counter() - t0,
-                "returncode": -1,
-                "output_pdb": None,
-                "stdout": e.stdout or '',
-                "stderr": f"Timeout after {timeout_s}s\n{e.stderr or ''}",
+                'success': False,
+                'wall_time_s': time.perf_counter() - t0,
+                'returncode': -1,
+                'output_pdb': None,
+                'phenix_input_pdb': phenix_input_path,
+                'stdout': e.stdout or '',
+                'stderr': f'Timeout after {timeout_s}s\n{e.stderr or ''}',
             }
 
         src = pick_phenix_minimized_structure(tmpdir, local_pdb)
@@ -1868,12 +1752,13 @@ def run_phenix_geometry_minimization(
                 ).strip()
 
         return {
-            "success": result.returncode == 0 and output_pdb is not None,
-            "wall_time_s": wall_time_s,
-            "returncode": result.returncode,
-            "output_pdb": output_pdb,
-            "stdout": result.stdout,
-            "stderr": stderr_out,
+            'success': result.returncode == 0 and output_pdb is not None,
+            'wall_time_s': wall_time_s,
+            'returncode': result.returncode,
+            'output_pdb': output_pdb,
+            'phenix_input_pdb': phenix_input_path,
+            'stdout': result.stdout,
+            'stderr': stderr_out,
         }
 
 
@@ -2015,6 +1900,9 @@ def run_structure_benchmark(
     runner,
     label,
     max_workers=1,
+    run_molprobity: bool = False,
+    molprobity_timeout_s: int = 600,
+    molprobity_max_workers: int = 4,
     **runner_kwargs,
 ):
     output_dir = Path(output_dir)
@@ -2092,6 +1980,12 @@ def run_structure_benchmark(
         f'{label}: processed {len(rows)} structures '
         f'in {time.perf_counter() - batch_t0:.2f}s'
     )
+    if run_molprobity:
+        annotate_benchmark_rows_with_molprobity(
+            rows,
+            timeout_s=molprobity_timeout_s,
+            max_workers=molprobity_max_workers,
+        )
     return rows
 
 
@@ -2652,6 +2546,7 @@ def benchmark_timesteps_vs_phenix_on_subset(
         run_phenix_geometry_minimization,
         label='PHENIX',
         max_workers=phenix_max_workers,
+        window_size=test_dataset.base.window_size,
     )
     print_benchmark_summary('PHENIX', phenix_rows)
     summarize_structure_vs_ref_backbone_rmsd(
@@ -2696,6 +2591,91 @@ def benchmark_timesteps_vs_phenix_on_subset(
     }
 
 
+def benchmark_structure_methods_with_molprobity(
+    output_dir,
+    input_paths=None,
+    *,
+    knn_state: KnnBaselineState | None = None,
+    mean_theta: np.ndarray | None = None,
+    mean_tau: float | None = None,
+    phenix_max_workers: int = 4,
+    num_timesteps: int | None = None,
+    require_standard_monomers: bool = True,
+    molprobity_timeout_s: int = 600,
+    molprobity_max_workers: int = 32,
+):
+    """Export test structures for all methods and run MolProbity validation."""
+    if input_paths is None:
+        input_paths = collect_test_dataset_raw_paths(test_dataset)
+        if require_standard_monomers:
+            input_paths = filter_standard_raw_paths(input_paths)
+    if mean_theta is None or mean_tau is None:
+        mean_theta, mean_tau, _, _ = mean_target_torsions_and_tau(train_dataset)
+    if knn_state is None:
+        knn_state = knn_baseline_state
+
+    output_dir = Path(output_dir)
+    window_size = int(test_dataset.base.window_size)
+    benchmark_kwargs = {
+        'window_size': window_size,
+        'run_molprobity': True,
+        'molprobity_timeout_s': molprobity_timeout_s,
+        'molprobity_max_workers': molprobity_max_workers,
+    }
+
+    method_rows = {
+        'model': run_structure_benchmark(
+            input_paths,
+            output_dir / 'model',
+            run_base2backbone_inference,
+            label='model',
+            max_workers=1,
+            checkpoint_model=model,
+            device=device,
+            num_timesteps=num_timesteps,
+            **benchmark_kwargs,
+        ),
+        'phenix': run_structure_benchmark(
+            input_paths,
+            output_dir / 'phenix',
+            run_phenix_geometry_minimization,
+            label='PHENIX',
+            max_workers=phenix_max_workers,
+            **benchmark_kwargs,
+        ),
+        'mean_baseline': run_structure_benchmark(
+            input_paths,
+            output_dir / 'mean_baseline',
+            partial(
+                run_mean_baseline_structure,
+                mean_theta=mean_theta,
+                mean_tau=float(mean_tau),
+                device=device,
+            ),
+            label='mean baseline',
+            max_workers=1,
+            **benchmark_kwargs,
+        ),
+        'knn': run_structure_benchmark(
+            input_paths,
+            output_dir / 'knn',
+            partial(run_knn_baseline_structure, knn_state=knn_state),
+            label='kNN',
+            max_workers=1,
+            **benchmark_kwargs,
+        ),
+    }
+    print_molprobity_method_summaries(method_rows)
+    return {
+        'input_paths': input_paths,
+        'method_rows': method_rows,
+        'molprobity_summaries': {
+            name: summarize_molprobity_rows(rows)
+            for name, rows in method_rows.items()
+        },
+    }
+
+
 def compare_model_vs_phenix_on_test_dataset(
     output_dir,
     phenix_max_workers=4,
@@ -2703,12 +2683,21 @@ def compare_model_vs_phenix_on_test_dataset(
     model_device=None,
     num_timesteps=None,
     require_standard_monomers=True,
+    run_molprobity: bool = False,
+    molprobity_timeout_s: int = 600,
+    molprobity_max_workers: int = 32,
 ):
     input_paths = collect_test_dataset_raw_paths(test_dataset)
     if require_standard_monomers:
         input_paths = filter_standard_raw_paths(input_paths)
     output_dir = Path(output_dir)
 
+    benchmark_kwargs = {
+        'window_size': test_dataset.base.window_size,
+        'run_molprobity': run_molprobity,
+        'molprobity_timeout_s': molprobity_timeout_s,
+        'molprobity_max_workers': molprobity_max_workers,
+    }
     model_rows = run_structure_benchmark(
         input_paths,
         output_dir / 'base2backbone',
@@ -2717,8 +2706,8 @@ def compare_model_vs_phenix_on_test_dataset(
         max_workers=1,
         checkpoint_model=model if checkpoint_model is None else checkpoint_model,
         device=device if model_device is None else model_device,
-        window_size=test_dataset.base.window_size,
         num_timesteps=num_timesteps,
+        **benchmark_kwargs,
     )
     phenix_rows = run_structure_benchmark(
         input_paths,
@@ -2726,6 +2715,7 @@ def compare_model_vs_phenix_on_test_dataset(
         run_phenix_geometry_minimization,
         label='PHENIX',
         max_workers=phenix_max_workers,
+        **benchmark_kwargs,
     )
     summarize_structure_vs_ref_backbone_rmsd(
         'PHENIX',
@@ -2737,13 +2727,19 @@ def compare_model_vs_phenix_on_test_dataset(
         phenix_rows,
         window_size=test_dataset.base.window_size,
     )
-    return {
+    result = {
         'input_paths': input_paths,
         'model_rows': model_rows,
         'phenix_rows': phenix_rows,
         'comparison_rows': comparison_rows,
         'summary': summary,
     }
+    if run_molprobity:
+        result['molprobity_summaries'] = print_molprobity_method_summaries({
+            'model': model_rows,
+            'phenix': phenix_rows,
+        })
+    return result
 
 
 runtime_subset_seed = 42

@@ -19,7 +19,7 @@ class _FakeResponse:
 def test_get_pdb_ids_updates_latest_manifest(tmp_path, monkeypatch):
     manifest_path = tmp_path / 'manifests' / 'latest.json'
     monkeypatch.setattr(dna_windows, 'REPO_ROOT', tmp_path)
-    monkeypatch.setattr(dna_windows.requests, 'post', lambda *args, **kwargs: _FakeResponse())
+    monkeypatch.setattr('requests.post', lambda *args, **kwargs: _FakeResponse())
 
     pdb_ids = dna_windows.get_pdb_ids(None)
 
@@ -34,8 +34,7 @@ def test_get_pdb_ids_reads_non_latest_manifest_from_file(tmp_path, monkeypatch):
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(['3GHI', '4JKL']) + '\n', encoding='utf-8')
     monkeypatch.setattr(
-        dna_windows.requests,
-        'post',
+        'requests.post',
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError('RCSB fetch must not run')),
     )
 

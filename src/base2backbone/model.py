@@ -3,6 +3,7 @@ from typing import Any, cast
 
 import lightning.pytorch as pl
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 from lightning.pytorch.loggers import TensorBoardLogger
 from torch.optim import AdamW
@@ -151,6 +152,9 @@ class BackboneLightningModule(pl.LightningModule):
             tuple[torch.Tensor, torch.Tensor],
         ] = {}
         self._rmsd_keep_cache: dict[tuple[str, int | None], torch.Tensor] = {}
+        self._test_rmsd_values: list[torch.Tensor] = []
+        self._test_rmsd_is_edge: list[torch.Tensor] = []
+        self._test_closure_values: dict[str, list[torch.Tensor]] = {}
 
     def load_state_dict(self, state_dict, strict=True):  # type: ignore[no-untyped-def]
         # Align checkpoint keys with eager vs torch.compile-wrapped `score_network` (OptimizedModule uses `_orig_mod`).
@@ -652,6 +656,16 @@ class BackboneLightningModule(pl.LightningModule):
             if key in metrics:
                 self.logger.experiment.add_scalar(key, metrics[key], self.current_epoch)
 
+    def _write_scalar_values(self, scalars: dict[str, float]) -> None:
+        if (
+            self.trainer is None
+            or not self.trainer.is_global_zero
+            or not isinstance(self.logger, TensorBoardLogger)
+        ):
+            return
+        for key, value in scalars.items():
+            self.logger.experiment.add_scalar(key, value, self.current_epoch)
+
     def _write_rmsd_scalars(self, prefix):
         if prefix == 'val':
             keys = [
@@ -667,27 +681,63 @@ class BackboneLightningModule(pl.LightningModule):
             ]
         self._write_epoch_scalars(keys)
 
-    def _val_closure_tensorboard_keys(self):
-        """TensorBoard scalars for bridge closure on validation samples."""
+    @staticmethod
+    def _closure_tensorboard_keys(prefix: str):
+        """TensorBoard scalars for bridge closure diagnostics."""
         return [
-            'diagnostics/val/closure_loss',
-            'diagnostics/val/closure_bond_loss',
-            'diagnostics/val/closure_angle_loss',
-            'diagnostics/val/closure_torsion_loss',
-            'diagnostics/val/closure_valid_bridge_fraction',
-            'diagnostics/val/closure_num_valid_bridges',
-            'diagnostics/val/closure_fail_rate',
-            'diagnostics/val/bridge_bond_mae',
-            'diagnostics/val/bridge_angle_mae_deg',
-            'diagnostics/val/bridge_torsion_mae_deg',
+            f'diagnostics/{prefix}/closure_loss',
+            f'diagnostics/{prefix}/closure_bond_loss',
+            f'diagnostics/{prefix}/closure_angle_loss',
+            f'diagnostics/{prefix}/closure_torsion_loss',
+            f'diagnostics/{prefix}/closure_valid_bridge_fraction',
+            f'diagnostics/{prefix}/closure_num_valid_bridges',
+            f'diagnostics/{prefix}/closure_fail_rate',
+            f'diagnostics/{prefix}/bridge_bond_mae',
+            f'diagnostics/{prefix}/bridge_angle_mae_deg',
+            f'diagnostics/{prefix}/bridge_torsion_mae_deg',
         ]
 
     def on_validation_epoch_end(self):
         self._write_rmsd_scalars('val')
-        self._write_epoch_scalars(self._val_closure_tensorboard_keys())
+        self._write_epoch_scalars(self._closure_tensorboard_keys('val'))
+
+    def on_test_epoch_start(self) -> None:
+        self._test_rmsd_values.clear()
+        self._test_rmsd_is_edge.clear()
+        self._test_closure_values.clear()
 
     def on_test_epoch_end(self):
-        self._write_rmsd_scalars('test')
+        if not self._test_rmsd_values:
+            return
+
+        per_graph_rmsd = self._gather_epoch_tensor(torch.cat(self._test_rmsd_values, dim=0))
+        is_edge = self._gather_epoch_tensor(
+            torch.cat(self._test_rmsd_is_edge, dim=0).to(dtype=torch.float32),
+        ).to(dtype=torch.bool)
+        metrics = self._summarize_rmsd_metrics(per_graph_rmsd, is_edge)
+        metrics.update({
+            'test/rmsd/avg': metrics['test/rmsd/avg_mean'],
+            'test/rmsd/central': metrics['test/rmsd/central_mean'],
+            'test/rmsd/edge': metrics['test/rmsd/edge_mean'],
+        })
+        for key, values in self._test_closure_values.items():
+            gathered_values = self._gather_epoch_tensor(torch.cat(values, dim=0))
+            metrics[f'diagnostics/test/{key}'] = gathered_values.mean()
+        finite_count = int(torch.isfinite(per_graph_rmsd).sum().item())
+        for name, value in metrics.items():
+            self.log(
+                name,
+                value,
+                on_epoch=True,
+                on_step=False,
+                sync_dist=False,
+                batch_size=max(finite_count, 1),
+                logger=False,
+            )
+        self._write_scalar_values({key: float(value.item()) for key, value in metrics.items()})
+        self._test_rmsd_values.clear()
+        self._test_rmsd_is_edge.clear()
+        self._test_closure_values.clear()
 
     @torch.no_grad()
     def p_sample_loop(self, batch, num_timesteps: int | None = None):
@@ -828,6 +878,57 @@ class BackboneLightningModule(pl.LightningModule):
         out = torch.where(ok, torch.sqrt(contrib / count), out)
         return out.to(pred_torsions.dtype)
 
+    def _gather_epoch_tensor(self, values: torch.Tensor) -> torch.Tensor:
+        if values.ndim != 1:
+            raise ValueError('Expected a flat tensor for epoch aggregation.')
+        if not dist.is_available() or not dist.is_initialized():
+            return values
+
+        local_len = torch.tensor([values.numel()], device=values.device, dtype=torch.long)
+        gathered_lens = self.all_gather(local_len).reshape(-1)
+        max_len = int(gathered_lens.max().item())
+        if values.numel() < max_len:
+            pad = torch.zeros(max_len - values.numel(), device=values.device, dtype=values.dtype)
+            values = torch.cat([values, pad], dim=0)
+        gathered_values = self.all_gather(values)
+        keep_mask = (
+            torch.arange(max_len, device=values.device)
+            .unsqueeze(0)
+            .expand(gathered_lens.numel(), max_len)
+            < gathered_lens.unsqueeze(1)
+        )
+        return gathered_values.reshape(-1)[keep_mask.reshape(-1)]
+
+    @staticmethod
+    def _summarize_rmsd_metrics(
+        per_graph_rmsd: torch.Tensor,
+        is_edge: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        if per_graph_rmsd.ndim != 1 or is_edge.ndim != 1:
+            raise ValueError('RMSD summary expects flat tensors.')
+        if per_graph_rmsd.numel() != is_edge.numel():
+            raise ValueError('RMSD values and edge mask must have the same length.')
+
+        values = per_graph_rmsd.to(dtype=torch.float64)
+        finite = torch.isfinite(values)
+        avg_values = values[finite]
+        if avg_values.numel() == 0:
+            raise ValueError('Cannot summarize RMSD metrics without finite values.')
+
+        def masked_mean(mask: torch.Tensor) -> torch.Tensor:
+            masked_values = values[mask & finite]
+            if masked_values.numel() == 0:
+                return values.new_tensor(float('nan'))
+            return masked_values.mean()
+
+        return {
+            'test/rmsd/avg_median': torch.quantile(avg_values, 0.5),
+            'test/rmsd/avg_mean': avg_values.mean(),
+            'test/rmsd/avg_p90': torch.quantile(avg_values, 0.9),
+            'test/rmsd/central_mean': masked_mean(~is_edge),
+            'test/rmsd/edge_mean': masked_mean(is_edge),
+        }
+
     def _bridge_closure_metrics_full_window(
         self,
         theta_w: torch.Tensor,
@@ -926,13 +1027,17 @@ class BackboneLightningModule(pl.LightningModule):
         eval_batch, theta_w, tau_w, coords_w = self._predict_eval_window(batch)
         bi = torch.arange(eval_batch.num_graphs, device=coords_w.device)
         ti = eval_batch.target_nt_idx.long()
-        self._log_rmsd(
-            'test',
+        per_graph_rmsd = self._compute_rmsd_per_graph_local(
             theta_w[bi, ti],
             tau_w[bi, ti],
             eval_batch,
             coords_w=coords_w,
         )
+        self._test_rmsd_values.append(per_graph_rmsd.detach())
+        self._test_rmsd_is_edge.append(self._is_edge_target(eval_batch).detach())
+        clo = self._bridge_closure_metrics_full_window(theta_w, tau_w, eval_batch, bb_world=coords_w)
+        for key, val in clo.items():
+            self._test_closure_values.setdefault(key, []).append(val.detach().reshape(1))
 
     @torch.no_grad()
     def sample(self, batch, num_timesteps: int | None = None):

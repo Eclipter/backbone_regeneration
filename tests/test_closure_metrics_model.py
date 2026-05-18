@@ -106,6 +106,12 @@ def test_validation_step_source_always_logs_val_closure():
     assert "f'diagnostics/val/{key}'" in src.replace(' ', '')
 
 
+def test_test_step_source_collects_test_closure():
+    src = inspect.getsource(BackboneLightningModule.test_step)
+    assert '_bridge_closure_metrics_full_window' in src
+    assert '_test_closure_values.setdefault(key, []).append' in src.replace(' ', '')
+
+
 def test_tl_latent_width_matches_torch_geometry():
     assert N_LATENT == 7
 
@@ -414,3 +420,63 @@ def test_predict_eval_window_retargets_all_positions(monkeypatch):
 
 
 test_sampler_shapes_finite = test_p_sample_loop_finite_shapes_with_stub_scores
+
+
+def test_on_test_epoch_end_logs_requested_rmsd_summaries(monkeypatch):
+    hp = dict(
+        hidden_dim=32,
+        num_heads=4,
+        num_layers=1,
+        num_timesteps=2,
+        batch_size=1,
+        lr=1e-3,
+        lr_scheduler=None,
+        lr_scheduler_patience=1,
+        lr_scheduler_threshold=0.1,
+        lr_scheduler_cooldown=0,
+        angular_sigma_min=0.05,
+        angular_sigma_max=0.15,
+        tau_sigma_min=0.05,
+        tau_sigma_max=0.15,
+        tau_loss_weight=1.0,
+        score_loss_weighting='sigma2',
+        weight_decay=0.01,
+        closure_loss_weight=0.0,
+        closure_bond_weight=1.0,
+        closure_angle_weight=1.0,
+        closure_torsion_weight=1.0,
+    )
+    mod = BackboneLightningModule(**cast(Any, hp)).eval()
+    mod._test_rmsd_values = [torch.tensor([1.0, 2.0, 4.0, 8.0], dtype=torch.float32)]
+    mod._test_rmsd_is_edge = [torch.tensor([False, True, False, True])]
+    mod._test_closure_values = {
+        'closure_bond_loss': [torch.tensor([1.0, 3.0], dtype=torch.float32)],
+        'closure_angle_loss': [torch.tensor([2.0, 6.0], dtype=torch.float32)],
+        'closure_fail_rate': [torch.tensor([0.25, 0.75], dtype=torch.float32)],
+    }
+    logged: dict[str, float] = {}
+    written: dict[str, float] = {}
+
+    def _capture_log(name, value, **kwargs):  # noqa: ARG001
+        logged[name] = float(value)
+
+    monkeypatch.setattr(mod, 'log', _capture_log)
+    monkeypatch.setattr(mod, '_write_scalar_values', lambda scalars: written.update(scalars))
+
+    mod.on_test_epoch_end()
+
+    assert logged['test/rmsd/avg_median'] == 3.0
+    assert logged['test/rmsd/avg_mean'] == 3.75
+    assert logged['test/rmsd/avg_p90'] == 6.800000000000001
+    assert logged['test/rmsd/central_mean'] == 2.5
+    assert logged['test/rmsd/edge_mean'] == 5.0
+    assert logged['test/rmsd/avg'] == logged['test/rmsd/avg_mean']
+    assert logged['test/rmsd/central'] == logged['test/rmsd/central_mean']
+    assert logged['test/rmsd/edge'] == logged['test/rmsd/edge_mean']
+    assert logged['diagnostics/test/closure_bond_loss'] == 2.0
+    assert logged['diagnostics/test/closure_angle_loss'] == 4.0
+    assert logged['diagnostics/test/closure_fail_rate'] == 0.5
+    assert written == logged
+    assert mod._test_rmsd_values == []
+    assert mod._test_rmsd_is_edge == []
+    assert mod._test_closure_values == {}

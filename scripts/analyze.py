@@ -8,8 +8,7 @@ import tempfile
 import time
 import warnings
 from collections import defaultdict
-from concurrent.futures import (ProcessPoolExecutor, ThreadPoolExecutor,
-                                as_completed)
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
@@ -18,7 +17,6 @@ import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
 import py3Dmol
-import requests
 import seaborn as sns
 import torch
 from Bio.PDB.MMCIF2Dict import MMCIF2Dict
@@ -54,7 +52,7 @@ IDX_TO_BASE = {v: k for k, v in BASE_TO_INDEX.items()}
 TOR_NAMES = ['α', 'β', 'γ', 'ε', 'ζ', 'χ', 'phase']
 
 # %% Load prerequisites
-run_id = 'torsions/7/CLOSURE_LOSS_WEIGHT=0.001_CLOSURE_ANGLE_WEIGHT=0.3'
+run_id = 'torsions/10/CLOSURE_LOSS_WEIGHT=0.001_CLOSURE_ANGLE_WEIGHT=0.3'
 
 artifacts = load_analysis_run_artifacts(run_id)
 run_dir = artifacts.run_dir
@@ -551,6 +549,8 @@ metric_tags = {
     'val/rmsd/central':                    ('central', 'val/rmsd'),
     'val/rmsd/edge':                       ('edge',    'val/rmsd'),
     'test/rmsd/avg':                       ('avg',     'test/rmsd'),
+    'test/rmsd/avg_median':                ('avg',     'test/rmsd/avg_median'),
+    'test/rmsd/avg_p90':                   ('avg',     'test/rmsd/avg_p90'),
     'test/rmsd/central':                   ('central', 'test/rmsd'),
     'test/rmsd/edge':                      ('edge',    'test/rmsd'),
 }
@@ -999,189 +999,6 @@ view.addLabel(
 view.zoomTo()
 view.show()
 
-# %% Estimate dataset noise
-
-
-@lru_cache
-def dna_seqs(pdb_id):
-    q = ('{ entry(entry_id: "%s") { polymer_entities { entity_poly {'
-         'rcsb_entity_polymer_type pdbx_seq_one_letter_code_can } } } }') % pdb_id
-    r = requests.post('https://data.rcsb.org/graphql', json={'query': q}, timeout=10)
-    return [
-        e['entity_poly']['pdbx_seq_one_letter_code_can']
-        for e in r.json()['data']['entry']['polymer_entities']
-        if e['entity_poly']['rcsb_entity_polymer_type'] == 'DNA'
-    ]
-
-
-@lru_cache
-def similar_entries(seq):
-    r = requests.post('https://search.rcsb.org/rcsbsearch/v2/query', json={
-        'query': {'type': 'terminal', 'service': 'sequence', 'parameters': {
-            'evalue_cutoff': 1, 'identity_cutoff': 1.0,
-            'sequence_type': 'dna', 'value': seq}},
-        'return_type': 'entry',
-    }, timeout=15)
-    return [x['identifier'] for x in r.json().get('result_set', [])]
-
-
-@lru_cache
-def parsed_chain_records(pdb_id):
-    path = osp.join('..', 'data', 'raw', f'{pdb_id}.cif')
-    if not osp.exists(path):
-        raise FileNotFoundError(f'No local CIF for {pdb_id}')
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', PDBConstructionWarning)
-        _, chain_records = parse_dna(
-            path, use_full_nucleotide=True, window_size=test_dataset.base.window_size,
-        )
-    return chain_records
-
-
-def central_window_index(chain_records):
-    ci = test_dataset.base.window_size // 2
-    idx = {}
-    for _, _, windows in chain_records:
-        for window, _, data in windows:
-            central_nt = window[ci]
-            idx[(central_nt.segid, int(central_nt.resid))] = data
-    return idx
-
-
-def central_backbone_local(data):
-    """Backbone atom positions in the local frame of the central nucleotide."""
-    ci = data.bb_xyz_world.shape[0] // 2
-    bb_world = data.bb_xyz_world[ci].numpy()    # [n_bb, 3]
-    o_t = data.nt_origins_world[ci].numpy()
-    R_t = data.nt_frames_world[ci].numpy()
-    valid = ~np.any(np.isnan(bb_world), axis=1)
-    local = (bb_world - o_t) @ R_t             # transform to local frame
-    return {BACKBONE_ATOMS[j]: local[j] for j in range(len(BACKBONE_ATOMS)) if valid[j]}
-
-
-def central_backbone_is_edge(data):
-    ci = data.bb_xyz_world.shape[0] // 2
-    return bool(data.is_chain_edge_nt[ci].item())
-
-
-_window_cache: dict = {}  # populated in phase 2 by worker processes
-
-
-def window_index_for_pdb(pdb_id):
-    return _window_cache[pdb_id]
-
-
-def experimental_rmsd_windows(pdb_id1, pdb_id2):
-    idx1 = window_index_for_pdb(pdb_id1)
-    idx2 = window_index_for_pdb(pdb_id2)
-    values = []
-    is_edge = []
-    for key in set(idx1) & set(idx2):
-        atoms1 = central_backbone_local(idx1[key])
-        atoms2 = central_backbone_local(idx2[key])
-        shared = [n for n in BACKBONE_ATOMS if n in atoms1 and n in atoms2]
-        if not shared:
-            continue
-        pos1 = np.array([atoms1[n] for n in shared])
-        pos2 = np.array([atoms2[n] for n in shared])
-        values.append(float(np.sqrt(np.mean(np.sum((pos1 - pos2) ** 2, axis=1)))))
-        is_edge.append(central_backbone_is_edge(idx1[key]))
-    return values, is_edge
-
-
-def _collect_partners(pdb_id):
-    try:
-        return pdb_id, sorted(
-            {e for seq in dna_seqs(pdb_id) for e in similar_entries(seq)} - {pdb_id}
-        )
-    except Exception:
-        return pdb_id, []
-
-
-def _parse_and_index(pdb_id):
-    try:
-        return pdb_id, central_window_index(parsed_chain_records(pdb_id))
-    except Exception:
-        return pdb_id, None
-
-
-test_pdb_ids = sorted({
-    Path(test_dataset.base.data_list[w_idx]).parent.name
-    for w_idx, _ in test_dataset.virtual_entries
-})
-
-# Phase 1: collect all partner lists via parallel API calls
-print(f'Collecting partners for {len(test_pdb_ids)} PDB IDs...')
-with ThreadPoolExecutor(max_workers=8) as executor:
-    partner_map = dict(executor.map(_collect_partners, test_pdb_ids))
-n_pairs = sum(len(v) for v in partner_map.values())
-print(f'Found {n_pairs} pairs across {len(partner_map)} PDB IDs')
-
-# Phase 2: parse + index CIF files in parallel (ThreadPoolExecutor avoids fork+PyTorch issues)
-_raw_dir = osp.join('..', 'data', 'raw')
-all_needed_ids = {pid for partners in partner_map.values() for pid in partners} | set(test_pdb_ids)
-available_ids = sorted(pid for pid in all_needed_ids if osp.exists(osp.join(_raw_dir, f'{pid}.cif')))
-
-with ThreadPoolExecutor(max_workers=8) as executor:
-    for pdb_id, idx in tqdm(
-            executor.map(_parse_and_index, available_ids),
-            total=len(available_ids),
-            desc=f'Parsing CIF files ({len(available_ids)} / {len(all_needed_ids)})',
-            colour=PROGRESS_BAR_COLOR,
-    ):
-        if idx is not None:
-            _window_cache[pdb_id] = idx
-print(f'Indexed {len(_window_cache)} PDB structures')
-
-# Phase 3: compute RMSDs (everything is already cached, this is CPU-bound)
-rmsd_values = []
-rmsd_is_edge = []
-for pdb_id, partners in partner_map.items():
-    for pid in partners:
-        try:
-            wv, wv_is_edge = experimental_rmsd_windows(pdb_id, pid)
-            if wv:
-                rmsd_values.extend(wv)
-                rmsd_is_edge.extend(wv_is_edge)
-                pair_summary = rmsd_summary_metrics(wv, wv_is_edge)
-                print(f'{pdb_id} vs {pid}: {format_rmsd_summary_line(pair_summary)}')
-        except Exception:
-            pass
-
-# %% Plot dataset-noise RMSD distribution
-noise_rmsd_summary = print_rmsd_summary(
-    'Experimental structure-pair RMSD:',
-    rmsd_values,
-    rmsd_is_edge,
-)
-fig, ax = plt.subplots(figsize=(7, 4))
-ax.hist(rmsd_values, bins=50, color='skyblue', edgecolor='white')
-for mode, color in mode_colors.items():
-    val = float(wide_per_mode[mode]['val/rmsd'].dropna().iloc[-1])
-    ax.axvline(
-        val,
-        color=color,
-        linewidth=2,
-        label=f'валидационный RMSD, {validation_labels[mode]} ({val:.2f} Å)',
-    )
-noise_median = noise_rmsd_summary['avg_median']
-if noise_median is not None:
-    ax.axvline(
-        noise_median,
-        color='red',
-        linestyle='--',
-        linewidth=2,
-        label=f'медиана по экспериментальным структурам ({noise_median:.2f} Å)',
-    )
-ax.set_xlim(0, 3)
-ax.set_xlabel('RMSD (Å)', fontsize=13)
-ax.set_ylabel('Количество структур', fontsize=13)
-ax.legend(fontsize=11)
-sns.despine(ax=ax)
-fig.tight_layout()
-fig.savefig(osp.join(run_dir, 'experimental_rmsd.png'), dpi=300, bbox_inches='tight')
-plt.show()
-
 # %% Measure stochastic spread across independent diffusion runs on the same input
 K = 10
 N_SAMPLES = 60
@@ -1196,8 +1013,6 @@ inter_run_indices = rng.choice(
 ).tolist()
 
 inter_run_rmsds: list[float] = []
-inter_run_is_edge: list[bool] = []
-sample_medians: list[float] = []
 
 with torch.no_grad():
     for wi in tqdm(
@@ -1207,7 +1022,6 @@ with torch.no_grad():
     ):
         data = cast(Any, test_dataset[wi].clone())
         tidx = int(data.target_nt_idx.item())
-        sample_is_edge = bool(data.is_chain_edge_nt[tidx].item())
         restype = idx_to_base[int(data.base_types[tidx].argmax().item())]
         o3_ir = None
         if bool(data.o3_prev_valid[tidx].item()):
@@ -1245,33 +1059,9 @@ with torch.no_grad():
         pair_rmsds = rmsds_mat[r1, r2].tolist()
 
         inter_run_rmsds.extend(pair_rmsds)
-        inter_run_is_edge.extend([sample_is_edge] * len(pair_rmsds))
-        sample_medians.append(float(np.median(pair_rmsds)))
 
-# %% Plot stochastic-spread RMSD distribution
-
-inter_run_rmsd_summary = print_rmsd_summary(
-    'Inter-run RMSD:',
-    inter_run_rmsds,
-    inter_run_is_edge,
-)
-inter_run_median = inter_run_rmsd_summary['avg_median']
-
-fig, ax = plt.subplots(figsize=(7, 4))
-ax.hist(inter_run_rmsds, color='mediumpurple', edgecolor='white')
-if inter_run_median is not None:
-    ax.axvline(inter_run_median, color='black', linestyle='--', linewidth=2,
-               label=f'медиана: {inter_run_median:.1f} Å')
-if rmsd_values and noise_median is not None:
-    ax.axvline(noise_median, color='red', linestyle='--', linewidth=2,
-               label=f'экспериментальный порог: {noise_median:.1f} Å')
-ax.set_xlabel('RMSD (Å)', fontsize=13)
-ax.set_ylabel('Количество структур', fontsize=13)
-ax.legend(fontsize=11)
-sns.despine(ax=ax)
-fig.tight_layout()
-fig.savefig(osp.join(run_dir, 'inter_run_rmsd.png'), dpi=300, bbox_inches='tight')
-plt.show()
+inter_run_rmsd_mean = _rmsd_mean(inter_run_rmsds)
+print(f'\nInter-run RMSD (mean): {format_rmsd_value(inter_run_rmsd_mean)}')
 
 # %% Prepare kNN baseline
 
@@ -1566,21 +1356,23 @@ else:
         for key, _ in RMSD_SUMMARY_FIELDS
     }
     logged_model_test_n_finite = 0
-    for label, summary_key in [
-        ('avg', 'avg_mean'),
-        ('central', 'central_mean'),
-        ('edge', 'edge_mean'),
+    for label, metric_name, summary_key in [
+        ('avg', 'test/rmsd/avg_median', 'avg_median'),
+        ('avg', 'test/rmsd', 'avg_mean'),
+        ('avg', 'test/rmsd/avg_p90', 'avg_p90'),
+        ('central', 'test/rmsd', 'central_mean'),
+        ('edge', 'test/rmsd', 'edge_mean'),
     ]:
         w = wide_per_mode.get(label)
         if w is None:
             continue
-        if 'test/rmsd' in w.columns:
-            values = w['test/rmsd'].dropna()
+        if metric_name in w.columns:
+            values = w[metric_name].dropna()
             if len(values):
                 logged_model_test_summary[summary_key] = float(values.iloc[-1])
                 logged_model_test_n_finite += 1
     logged_model_test_summary['n_finite'] = logged_model_test_n_finite
-    logged_model_test_summary['n_total'] = 3
+    logged_model_test_summary['n_total'] = len(RMSD_SUMMARY_FIELDS)
     print_rmsd_metric_summary('Logged model test RMSD:', logged_model_test_summary)
 
 
@@ -1659,14 +1451,14 @@ def summarize_per_atom_errors(atom_sq_sums, atom_counts, atom_max_errs):
         atom_contribs = [row[2] for row in atom_rows]
 
         fig2, (ax_atom_rmsd, ax_atom_contrib) = plt.subplots(1, 2, figsize=(12, 4))
-        ax_atom_rmsd.bar(atom_names, atom_rmsds, color='steelblue')
-        ax_atom_rmsd.set_title('Per-atom RMSD')
-        ax_atom_rmsd.set_ylabel('RMSD (A)')
+        ax_atom_rmsd.bar(atom_names, atom_rmsds, color='skyblue')
+        ax_atom_rmsd.set_title('RMSD по отдельным атомам')
+        ax_atom_rmsd.set_ylabel('RMSD (Å)')
         ax_atom_rmsd.tick_params(axis='x', rotation=45)
 
         ax_atom_contrib.bar(atom_names, atom_contribs, color='indianred')
-        ax_atom_contrib.set_title('Contribution to total squared error')
-        ax_atom_contrib.set_ylabel('Contribution (%)')
+        ax_atom_contrib.set_title('Вклад в общий RMSD')
+        ax_atom_contrib.set_ylabel('Вклад (%)')
         ax_atom_contrib.tick_params(axis='x', rotation=45)
 
         fig2.tight_layout()
@@ -1735,7 +1527,7 @@ summarize_per_atom_errors(
 
 # %% Compare PHENIX run time with Base2Backbone
 
-NUM_TIMESTEPS_LIST = [5, 10, 15, 30, 50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 1000]
+NUM_TIMESTEPS_LIST = [5, 10, 15, 20, 30, 50, 100, 200, 300, 500, 1000]
 
 
 def pick_phenix_minimized_structure(tmpdir: Path, local_input: Path) -> Path | None:

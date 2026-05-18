@@ -5,7 +5,7 @@ build-backend = 'setuptools.build_meta'
 [project]
 name = 'base2backbone'
 version = '0.1.0'
-description = 'DNA backbone regeneration from base-only structures'
+description = 'DNA backbone generation from base-only structures'
 readme = 'README.md'
 requires-python = '>=3.13,<3.14'
 urls = {Repository = 'https://github.com/Eclipter/base2backbone'}
@@ -13,25 +13,24 @@ urls = {Repository = 'https://github.com/Eclipter/base2backbone'}
 dependencies = [
   'biopython>=1.86',
   'gemmi',
-  'lightning',
-  'matplotlib',
   'MDAnalysis>=2.10.0',
   'numpy>=2.4.3',
-  'onnx',
-  'onnxruntime',
-  'pandas>=3.0.1',
-  'plotly',
-  'py3Dmol',
-  'requests',
-  'scikit-learn',
-  'seaborn>=0.13.2',
-  'tensorboard',
   'torch',
   'torch-geometric',
   'tqdm',
+  'onnxruntime'
 ]
 
 [project.optional-dependencies]
+dev = [
+  'lightning',
+  'tensorboard',
+  'requests',
+  'onnx',
+  'matplotlib',
+  'plotly',
+  'py3Dmol',
+]
 test = [
   'pytest>=9.0.2',
 ]

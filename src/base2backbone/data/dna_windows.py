@@ -6,7 +6,6 @@ from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
-import requests
 import torch
 import torch.nn.functional as F
 from MDAnalysis.exceptions import SelectionError
@@ -128,6 +127,8 @@ def get_pdb_ids(dataset_manifest=None):
             'scoring_strategy': 'combined',
         },
     }
+
+    import requests
 
     response = requests.post(
         'https://search.rcsb.org/rcsbsearch/v2/query',

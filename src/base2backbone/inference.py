@@ -21,7 +21,8 @@ from .geometry import build_batch_window_backbone_from_torsions
 from .geometry.templates import get_template
 from .io import default_atoms_provider, inference_atoms_provider
 from .onnx_inference import OnnxSampler
-from .runtime import MODEL_DIR, PROGRESS_BAR_COLOR
+from .runtime.paths import MODEL_DIR
+from .runtime.progress import PROGRESS_BAR_COLOR
 from .torsion_constants import (N_TORSIONS, TAU_M_MAX, TAU_M_MIN,
                                 TOR_BRIDGE_PHASE)
 

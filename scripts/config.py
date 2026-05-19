@@ -17,7 +17,7 @@ BASE = dict(
     SWA=True,
     SWA_LR=0.1,
     SWA_EPOCH_START=100,
-    NUM_EPOCHS=300,
+    NUM_EPOCHS=200,
     ANGULAR_SIGMA_MIN=0.01*pi,  # from 0 (no noise), to ANGULAR_SIGMA_MAX
     ANGULAR_SIGMA_MAX=pi,  # from ANGULAR_SIGMA_MIN, to pi (wrapped angles ~ uniform)
     TAU_SIGMA_MIN=0.01,  # from 0 (no noise), to TAU_SIGMA_MAX
@@ -41,7 +41,8 @@ BASE = dict(
 
 # One entry = one experiment. Put ONLY the overrides from BASE here
 EXPERIMENTS = [
-    {},  # baseline (matches BASE)
+    # {},  # baseline (matches BASE)
+    {'EDGE_WEIGHT': 0.5},
 ]
 
 ######### TO DOs ########

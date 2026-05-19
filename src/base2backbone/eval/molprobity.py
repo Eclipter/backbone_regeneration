@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 import subprocess
@@ -213,6 +214,39 @@ def run_structure_molprobity(
     )
 
 
+def _molprobity_cache_path(output_pdb: str | Path) -> Path:
+    path = Path(output_pdb)
+    return path.with_name(f'{path.name}.molprobity.json')
+
+
+def _load_molprobity_cache(output_pdb: str | Path, *, prefix: str) -> dict[str, Any] | None:
+    cache_path = _molprobity_cache_path(output_pdb)
+    if not cache_path.is_file():
+        return None
+    try:
+        payload = json.loads(cache_path.read_text(encoding='utf-8'))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get('prefix') != prefix:
+        return None
+    fields = payload.get('fields')
+    return fields if isinstance(fields, dict) else None
+
+
+def _save_molprobity_cache(
+    output_pdb: str | Path,
+    fields: dict[str, Any],
+    *,
+    prefix: str,
+) -> None:
+    cache_path = _molprobity_cache_path(output_pdb)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps({'prefix': prefix, 'fields': fields}, indent=2),
+        encoding='utf-8',
+    )
+
+
 def _molprobity_row_fields(
     row: dict[str, Any],
     *,
@@ -221,12 +255,17 @@ def _molprobity_row_fields(
     bin_dir: Path | None,
     timeout_s: int,
     run_rna_validate: bool,
+    resume: bool = True,
 ) -> dict[str, Any]:
     if not row.get('success') or not row.get('output_pdb'):
         return {
             f'{prefix}_success': False,
             f'{prefix}_error': 'structure benchmark failed',
         }
+    if resume:
+        cached = _load_molprobity_cache(row['output_pdb'], prefix=prefix)
+        if cached is not None and cached.get(f'{prefix}_success'):
+            return cached
     mp = run_structure_molprobity(
         row['output_pdb'],
         phenix_module=phenix_module,
@@ -234,7 +273,10 @@ def _molprobity_row_fields(
         timeout_s=timeout_s,
         run_rna_validate=run_rna_validate,
     )
-    return mp.as_row_fields(prefix=prefix)
+    fields = mp.as_row_fields(prefix=prefix)
+    if resume and row.get('output_pdb'):
+        _save_molprobity_cache(row['output_pdb'], fields, prefix=prefix)
+    return fields
 
 
 def _molprobity_row_task(task: tuple[Any, ...]) -> dict[str, Any]:
@@ -245,6 +287,7 @@ def _molprobity_row_task(task: tuple[Any, ...]) -> dict[str, Any]:
         bin_dir_str,
         timeout_s,
         run_rna_validate,
+        resume,
     ) = task
     bin_dir = Path(bin_dir_str) if bin_dir_str else None
     return _molprobity_row_fields(
@@ -254,6 +297,7 @@ def _molprobity_row_task(task: tuple[Any, ...]) -> dict[str, Any]:
         bin_dir=bin_dir,
         timeout_s=timeout_s,
         run_rna_validate=run_rna_validate,
+        resume=resume,
     )
 
 
@@ -266,6 +310,7 @@ def annotate_benchmark_rows_with_molprobity(
     timeout_s: int = 600,
     run_rna_validate: bool = True,
     max_workers: int = 4,
+    resume: bool = True,
 ) -> list[dict[str, Any]]:
     """Add MolProbity metrics to successful benchmark rows in place."""
     if not rows:
@@ -278,6 +323,7 @@ def annotate_benchmark_rows_with_molprobity(
         bin_dir_str,
         timeout_s,
         run_rna_validate,
+        resume,
     )
 
     if max_workers == 1:
@@ -289,6 +335,7 @@ def annotate_benchmark_rows_with_molprobity(
                 bin_dir=bin_dir,
                 timeout_s=timeout_s,
                 run_rna_validate=run_rna_validate,
+                resume=resume,
             ))
         return rows
 

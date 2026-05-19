@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Hashable, cast
 
 import numpy as np
 import torch
@@ -205,8 +205,19 @@ def knn_match_indices(
     ref_metas,
     *,
     allow_same_sample: bool,
+    fit_cache: dict[Hashable, tuple[Any, ...]] | None = None,
+    fit_cache_key: Hashable | None = None,
 ):
-    scaler, ref_indices_by_base, nn_by_base = fit_knn_indices(ref_feats, ref_metas)
+    if (
+        fit_cache is not None
+        and fit_cache_key is not None
+        and fit_cache_key in fit_cache
+    ):
+        scaler, ref_indices_by_base, nn_by_base = fit_cache[fit_cache_key]
+    else:
+        scaler, ref_indices_by_base, nn_by_base = fit_knn_indices(ref_feats, ref_metas)
+        if fit_cache is not None and fit_cache_key is not None:
+            fit_cache[fit_cache_key] = (scaler, ref_indices_by_base, nn_by_base)
     query_feats_scaled = np.asarray(scaler.transform(query_feats), dtype=np.float32)
     match_indices: list[int | None] = [None] * len(query_metas)
     query_indices_by_base: defaultdict[int, list[int]] = defaultdict(list)
@@ -241,6 +252,8 @@ def run_knn_protocol(
     allow_same_sample,
     *,
     print_summary=None,
+    fit_cache: dict[Hashable, tuple[Any, ...]] | None = None,
+    fit_cache_key: Hashable | None = None,
 ):
     match_indices = knn_match_indices(
         query_feats,
@@ -248,6 +261,8 @@ def run_knn_protocol(
         ref_feats,
         ref_metas,
         allow_same_sample=allow_same_sample,
+        fit_cache=fit_cache,
+        fit_cache_key=fit_cache_key,
     )
     rmsds: list[float] = []
     is_edge: list[bool] = []
@@ -276,17 +291,30 @@ def run_knn_protocol(
     return rmsds_arr, is_edge_arr, match_indices
 
 
+def query_indices_by_pdb_from_metas(
+    query_metas: list[dict[str, Any]],
+) -> dict[str, list[int]]:
+    by_pdb: defaultdict[str, list[int]] = defaultdict(list)
+    for sample_idx, meta in enumerate(query_metas):
+        by_pdb[meta['pdb_id']].append(sample_idx)
+    return dict(by_pdb)
+
+
 @dataclass
 class KnnBaselineState:
     query_metas: list[dict[str, Any]]
     ref_locals: np.ndarray
     match_indices: list[int | None]
+    query_indices_by_pdb: dict[str, list[int]] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.query_indices_by_pdb:
+            self.query_indices_by_pdb = query_indices_by_pdb_from_metas(self.query_metas)
 
     def predictions_for_pdb(self, pdb_id: str) -> dict[tuple[str, int, str], np.ndarray]:
         predictions: dict[tuple[str, int, str], np.ndarray] = {}
-        for sample_idx, meta in enumerate(self.query_metas):
-            if meta['pdb_id'] != pdb_id:
-                continue
+        for sample_idx in self.query_indices_by_pdb.get(pdb_id, ()):
+            meta = self.query_metas[sample_idx]
             match_idx = self.match_indices[sample_idx]
             if match_idx is None:
                 continue
@@ -309,6 +337,8 @@ def build_knn_baseline_state(
     ref_metas,
     *,
     allow_same_sample: bool = False,
+    fit_cache: dict[Hashable, tuple[Any, ...]] | None = None,
+    fit_cache_key: Hashable | None = None,
 ) -> KnnBaselineState:
     match_indices = knn_match_indices(
         query_feats,
@@ -316,9 +346,86 @@ def build_knn_baseline_state(
         ref_feats,
         ref_metas,
         allow_same_sample=allow_same_sample,
+        fit_cache=fit_cache,
+        fit_cache_key=fit_cache_key,
     )
     return KnnBaselineState(
         query_metas=query_metas,
         ref_locals=ref_locals,
         match_indices=match_indices,
+    )
+
+
+_pool_knn_state: KnnBaselineState | None = None
+
+
+def init_knn_baseline_worker(knn_state: KnnBaselineState) -> None:
+    """Set per-process kNN state once (ProcessPoolExecutor initializer)."""
+    global _pool_knn_state
+    _pool_knn_state = knn_state
+
+
+def run_knn_baseline_structure_pooled(
+    input_path: str | Path,
+    output_pdb_dir: str | Path,
+    *,
+    window_size: int,
+    resume: bool = True,
+) -> dict[str, Any]:
+    """kNN export worker; ``knn_state`` must be set via ``init_knn_baseline_worker``."""
+    if _pool_knn_state is None:
+        raise RuntimeError('kNN worker pool not initialized')
+    from .structure_runners import run_knn_baseline_structure
+
+    return run_knn_baseline_structure(
+        input_path,
+        output_pdb_dir,
+        knn_state=_pool_knn_state,
+        window_size=window_size,
+        resume=resume,
+    )
+
+
+def _benchmark_input_key(path: str | Path) -> str:
+    return str(Path(path).resolve())
+
+
+def run_knn_baseline_structure_batch(
+    input_paths: list[str | Path],
+    output_dir: str | Path,
+    *,
+    knn_state: KnnBaselineState,
+    window_size: int,
+    resume: bool = True,
+) -> dict[str, dict[str, Any]]:
+    from .structure_runners import run_knn_baseline_structure
+
+    results: dict[str, dict[str, Any]] = {}
+    for raw_input_path in input_paths:
+        input_path = Path(raw_input_path).resolve()
+        results[_benchmark_input_key(input_path)] = run_knn_baseline_structure(
+            input_path,
+            output_dir,
+            knn_state=knn_state,
+            window_size=window_size,
+            resume=resume,
+        )
+    return results
+
+
+def run_knn_baseline_structure_batch_pooled(
+    input_paths: list[str | Path],
+    output_pdb_dir: str | Path,
+    *,
+    window_size: int,
+    resume: bool = True,
+) -> dict[str, dict[str, Any]]:
+    if _pool_knn_state is None:
+        raise RuntimeError('kNN worker pool not initialized')
+    return run_knn_baseline_structure_batch(
+        input_paths,
+        output_pdb_dir,
+        knn_state=_pool_knn_state,
+        window_size=window_size,
+        resume=resume,
     )

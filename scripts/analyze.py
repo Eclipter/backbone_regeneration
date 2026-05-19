@@ -32,6 +32,8 @@ from base2backbone.dataset import DNADataModule
 from base2backbone.eval.knn_baseline import (KnnBaselineState,
                                              build_knn_baseline_state,
                                              dataset_samples_cached,
+                                             init_knn_baseline_worker,
+                                             run_knn_baseline_structure_batch_pooled,
                                              run_knn_protocol,
                                              select_feature_columns)
 from base2backbone.eval.local_geometry import (
@@ -43,8 +45,13 @@ from base2backbone.eval.local_geometry import (
 from base2backbone.eval.molprobity import (
     annotate_benchmark_rows_with_molprobity, print_molprobity_method_summaries,
     print_molprobity_summary, summarize_molprobity_rows)
-from base2backbone.eval.structure_runners import (run_knn_baseline_structure,
-                                                  run_mean_baseline_structure)
+from base2backbone.eval.structure_runners import (
+    CheckpointSamplerAdapter,
+    init_base2backbone_inference_worker,
+    run_base2backbone_best_of_k_benchmark,
+    run_base2backbone_inference_batch_pooled,
+    run_mean_baseline_structure,
+)
 from base2backbone.geometry.backbone import build_backbone_local
 from base2backbone.inference import \
     _build_output_universe as build_output_universe
@@ -63,6 +70,7 @@ KNN_CACHE_ROOT = ANALYSIS_TMP_ROOT / 'knn_cache'
 KNN_CACHE_VERSION = 'v1'
 KNN_MOLPROBITY_ROOT = ANALYSIS_TMP_ROOT / 'knn_molprobity'
 BASE2BACKBONE_MOLPROBITY_ROOT = ANALYSIS_TMP_ROOT / 'base2backbone_molprobity'
+BEST_OF_K_MOLPROBITY_ROOT = ANALYSIS_TMP_ROOT / 'best_of_k_molprobity'
 MOLPROBITY_TIMEOUT_S = 600
 MOLPROBITY_MAX_WORKERS = 32
 RMSD_EVAL_BATCH_SIZE = 20000
@@ -138,6 +146,10 @@ def collect_test_dataset_raw_paths(dataset):
     return [raw_paths_by_id[pdb_id] for pdb_id in sorted(raw_paths_by_id)]
 
 
+def _batch_result_key(path: str | Path) -> str:
+    return str(Path(path).resolve())
+
+
 def run_structure_benchmark(
     input_paths,
     output_dir,
@@ -146,10 +158,14 @@ def run_structure_benchmark(
     max_workers=1,
     molprobity_timeout_s: int = MOLPROBITY_TIMEOUT_S,
     molprobity_max_workers: int = MOLPROBITY_MAX_WORKERS,
+    pool_initializer=None,
+    pool_initargs=(),
+    resume=True,
+    submit_batch_size: int | None = None,
     **runner_kwargs,
 ):
     output_dir = Path(output_dir)
-    input_paths = [Path(path) for path in input_paths]
+    input_paths = [Path(path).resolve() for path in input_paths]
 
     rows = []
     batch_t0 = time.perf_counter()
@@ -168,6 +184,8 @@ def run_structure_benchmark(
         })
 
     if max_workers == 1:
+        if pool_initializer is not None:
+            pool_initializer(*pool_initargs)
         for input_path in tqdm(
             input_paths,
             desc=f'{label} benchmark',
@@ -175,7 +193,12 @@ def run_structure_benchmark(
             colour=PROGRESS_BAR_COLOR,
         ):
             try:
-                res = runner(input_path, output_pdb_dir, **runner_kwargs)
+                res = runner(
+                    input_path,
+                    output_pdb_dir,
+                    resume=resume,
+                    **runner_kwargs,
+                )
             except Exception as e:
                 res = {
                     'success': False,
@@ -186,38 +209,87 @@ def run_structure_benchmark(
                 }
             append_result(input_path, res)
     else:
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            futures = {
-                ex.submit(
-                    runner,
-                    input_path,
-                    output_pdb_dir,
-                    **runner_kwargs,
-                ): input_path
-                for input_path in input_paths
-            }
+        executor_kwargs: dict[str, Any] = {'max_workers': max_workers}
+        if pool_initializer is not None:
+            executor_kwargs['initializer'] = pool_initializer
+            executor_kwargs['initargs'] = pool_initargs
+        with ProcessPoolExecutor(**executor_kwargs) as ex:
+            if submit_batch_size is not None and submit_batch_size > 1:
+                path_batches = [
+                    input_paths[i:i + submit_batch_size]
+                    for i in range(0, len(input_paths), submit_batch_size)
+                ]
+                futures = {
+                    ex.submit(
+                        runner,
+                        batch,
+                        output_pdb_dir,
+                        resume=resume,
+                        **runner_kwargs,
+                    ): batch
+                    for batch in path_batches
+                }
+                progress_total = len(futures)
+            else:
+                futures = {
+                    ex.submit(
+                        runner,
+                        input_path,
+                        output_pdb_dir,
+                        resume=resume,
+                        **runner_kwargs,
+                    ): input_path
+                    for input_path in input_paths
+                }
+                progress_total = len(futures)
 
             for fut in tqdm(
                 as_completed(futures),
-                total=len(futures),
+                total=progress_total,
                 desc=f'{label} benchmark',
                 leave=False,
                 colour=PROGRESS_BAR_COLOR,
             ):
-                input_path = futures[fut]
-
+                batch = futures[fut]
                 try:
-                    res = fut.result()
+                    result = fut.result()
                 except Exception as e:
-                    res = {
-                        'success': False,
-                        'wall_time_s': None,
-                        'returncode': -999,
-                        'output_pdb': None,
-                        'stderr': repr(e),
-                    }
+                    if submit_batch_size is not None and submit_batch_size > 1:
+                        result = {
+                            _batch_result_key(path): {
+                                'success': False,
+                                'wall_time_s': None,
+                                'returncode': -999,
+                                'output_pdb': None,
+                                'stderr': repr(e),
+                            }
+                            for path in batch
+                        }
+                    else:
+                        result = {
+                            'success': False,
+                            'wall_time_s': None,
+                            'returncode': -999,
+                            'output_pdb': None,
+                            'stderr': repr(e),
+                        }
 
-                append_result(input_path, res)
+                if submit_batch_size is not None and submit_batch_size > 1:
+                    for input_path in batch:
+                        res = result.get(
+                            _batch_result_key(input_path),
+                            {
+                                'success': False,
+                                'wall_time_s': None,
+                                'returncode': -999,
+                                'output_pdb': None,
+                                'stderr': 'missing batch result',
+                            },
+                        )
+                        append_result(input_path, res)
+                    continue
+
+                append_result(batch, result)
 
     print(
         f'{label}: processed {len(rows)} structures '
@@ -227,24 +299,92 @@ def run_structure_benchmark(
         rows,
         timeout_s=molprobity_timeout_s,
         max_workers=molprobity_max_workers,
+        resume=resume,
     )
     return rows
 
 
-class CheckpointSamplerAdapter:
-    """Wrap checkpoint ``sample``; ``num_timesteps=None`` uses ``model.hparams`` default."""
+def run_batched_structure_benchmark(
+    input_paths,
+    output_dir,
+    runner,
+    label,
+    batch_size,
+    molprobity_timeout_s: int = MOLPROBITY_TIMEOUT_S,
+    molprobity_max_workers: int = MOLPROBITY_MAX_WORKERS,
+    pool_initializer=None,
+    pool_initargs=(),
+    resume=True,
+    **runner_kwargs,
+):
+    output_dir = Path(output_dir)
+    input_paths = [Path(path).resolve() for path in input_paths]
+    rows = []
+    batch_t0 = time.perf_counter()
+    output_pdb_dir = output_dir / 'pdb'
+    output_pdb_dir.mkdir(parents=True, exist_ok=True)
 
-    def __init__(self, checkpoint_model, num_timesteps: int | None):
-        self.checkpoint_model = checkpoint_model
-        self.num_timesteps = num_timesteps
+    if pool_initializer is not None:
+        pool_initializer(*pool_initargs)
 
-    def sample(self, batch):
-        if self.num_timesteps is None:
-            return self.checkpoint_model.sample(batch)
-        return self.checkpoint_model.sample(
-            batch,
-            num_timesteps=self.num_timesteps,
-        )
+    for batch_start in tqdm(
+        range(0, len(input_paths), batch_size),
+        desc=f'{label} benchmark',
+        leave=False,
+        colour=PROGRESS_BAR_COLOR,
+    ):
+        batch_paths = input_paths[batch_start:batch_start + batch_size]
+        try:
+            batch_results = runner(
+                batch_paths,
+                output_pdb_dir,
+                resume=resume,
+                **runner_kwargs,
+            )
+        except Exception as e:
+            batch_results = {
+                _batch_result_key(path): {
+                    'success': False,
+                    'wall_time_s': None,
+                    'returncode': -999,
+                    'output_pdb': None,
+                    'stderr': repr(e),
+                }
+                for path in batch_paths
+            }
+
+        for input_path in batch_paths:
+            res = batch_results.get(
+                _batch_result_key(input_path),
+                {
+                    'success': False,
+                    'wall_time_s': None,
+                    'returncode': -999,
+                    'output_pdb': None,
+                    'stderr': 'missing batch result',
+                },
+            )
+            rows.append({
+                'id': input_path.stem,
+                'input_path': str(input_path),
+                'success': res['success'],
+                'wall_time_s': res['wall_time_s'],
+                'returncode': res['returncode'],
+                'output_pdb': str(res['output_pdb']) if res['output_pdb'] else '',
+                'stderr': res['stderr'][:1000],
+            })
+
+    print(
+        f'{label}: processed {len(rows)} structures '
+        f'in {time.perf_counter() - batch_t0:.2f}s'
+    )
+    annotate_benchmark_rows_with_molprobity(
+        rows,
+        timeout_s=molprobity_timeout_s,
+        max_workers=molprobity_max_workers,
+        resume=resume,
+    )
+    return rows
 
 
 RMSD_SUMMARY_FIELDS = (
@@ -1070,86 +1210,27 @@ view.show()
 # %% Calculate chemical validity for base2backbone
 
 
-def run_base2backbone_inference(
-    input_path: str | Path,
-    output_dir: str | Path,
-    checkpoint_model,
-    device: str | None = None,
-    window_size: int | None = None,
-    num_timesteps: int | None = None,
-) -> dict:
-    """
-    Run end-to-end inference from a Lightning checkpoint and write a backbone PDB.
+BASE2BACKBONE_BENCHMARK_TIMESTEPS = 15
+BASE2BACKBONE_STRUCTURE_BATCH_SIZE = 4
+BASE2BACKBONE_WINDOW_BATCH_SIZE = 20000
 
-    Timing includes inference and output serialization to mirror PHENIX latency.
-    """
-
-    input_path = Path(input_path).resolve()
-    output_dir = Path(output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if window_size is None:
-        window_size_i = int(getattr(test_dataset.base, 'window_size', 3))
-    else:
-        window_size_i = int(window_size)
-
-    output_pdb = output_dir / f'{input_path.stem}_base2backbone.pdb'
-    t0 = time.perf_counter()
-    input_path_str = str(input_path)
-
-    try:
-        adapter = CheckpointSamplerAdapter(checkpoint_model, num_timesteps)
-        _, chain_records = parse_dna(
-            input_path_str,
-            use_full_nucleotide=False,
-            window_size=window_size_i,
-        )
-        predictions = predict_backbone_from_chain_records(
-            [chain_records],
-            adapter,
-            device
-        )[0]
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', PDBConstructionWarning)
-            _, full_chain_records = parse_dna(
-                input_path_str,
-                use_full_nucleotide=True,
-                window_size=window_size_i,
-            )
-        write_structure(build_output_universe(full_chain_records, predictions), output_pdb)
-    except Exception as e:
-        return {
-            'success': False,
-            'wall_time_s': time.perf_counter() - t0,
-            'returncode': -999,
-            'output_pdb': None,
-            'stdout': '',
-            'stderr': repr(e),
-        }
-
-    return {
-        'success': True,
-        'wall_time_s': time.perf_counter() - t0,
-        'returncode': 0,
-        'output_pdb': output_pdb,
-        'stdout': '',
-        'stderr': '',
-    }
-
-
-base2backbone_molprobity_rows = run_structure_benchmark(
+base2backbone_window_size = int(test_dataset.base.window_size)
+model.eval()
+base2backbone_molprobity_rows = run_batched_structure_benchmark(
     collect_test_dataset_raw_paths(test_dataset),
     BASE2BACKBONE_MOLPROBITY_ROOT,
-    partial(
-        run_base2backbone_inference,
-        checkpoint_model=model,
-        device=device,
-    ),
+    run_base2backbone_inference_batch_pooled,
     label='base2backbone',
-    max_workers=1,
-    window_size=int(test_dataset.base.window_size),
+    batch_size=BASE2BACKBONE_STRUCTURE_BATCH_SIZE,
+    pool_initializer=init_base2backbone_inference_worker,
+    pool_initargs=(
+        model,
+        device,
+        base2backbone_window_size,
+        BASE2BACKBONE_BENCHMARK_TIMESTEPS,
+    ),
+    window_batch_size=BASE2BACKBONE_WINDOW_BATCH_SIZE,
+    resume=True,
     molprobity_timeout_s=MOLPROBITY_TIMEOUT_S,
     molprobity_max_workers=MOLPROBITY_MAX_WORKERS,
 )
@@ -1511,6 +1592,8 @@ KNN_MOLPROBITY_FEATURE_NAMES = [
 
 test_molprobity_input_paths = collect_test_dataset_raw_paths(test_dataset)
 knn_molprobity_window_size = int(test_dataset.base.window_size)
+KNN_FIT_CACHE: dict[tuple[str, ...], tuple[Any, ...]] = {}
+KNN_STRUCTURE_BATCH_SIZE = 8
 
 for feature_set_name, feature_names in feature_sets:
     test_subset_feats = select_feature_columns(test_feats, test_feat_slices, feature_names)
@@ -1529,6 +1612,8 @@ for feature_set_name, feature_names in feature_sets:
         train_metas,
         allow_same_sample=False,
         print_summary=print_rmsd_summary,
+        fit_cache=KNN_FIT_CACHE,
+        fit_cache_key=tuple(feature_names),
     )
     knn_feature_state = KnnBaselineState(
         query_metas=test_metas,
@@ -1536,13 +1621,16 @@ for feature_set_name, feature_names in feature_sets:
         match_indices=knn_match_indices,
     )
     knn_molprobity_digest = hashlib.sha256(knn_protocol_name.encode()).hexdigest()[:16]
-    knn_molprobity_rows = run_structure_benchmark(
+    knn_molprobity_rows = run_batched_structure_benchmark(
         test_molprobity_input_paths,
         KNN_MOLPROBITY_ROOT / knn_molprobity_digest,
-        partial(run_knn_baseline_structure, knn_state=knn_feature_state),
+        run_knn_baseline_structure_batch_pooled,
         label=f'kNN ({feature_set_name})',
-        max_workers=32,
+        batch_size=KNN_STRUCTURE_BATCH_SIZE,
+        pool_initializer=init_knn_baseline_worker,
+        pool_initargs=(knn_feature_state,),
         window_size=knn_molprobity_window_size,
+        resume=True,
         molprobity_timeout_s=MOLPROBITY_TIMEOUT_S,
         molprobity_max_workers=MOLPROBITY_MAX_WORKERS,
     )
@@ -1557,6 +1645,8 @@ knn_baseline_state = build_knn_baseline_state(
     select_feature_columns(train_feats, train_feat_slices, KNN_MOLPROBITY_FEATURE_NAMES),
     train_locals,
     train_metas,
+    fit_cache=KNN_FIT_CACHE,
+    fit_cache_key=tuple(KNN_MOLPROBITY_FEATURE_NAMES),
     allow_same_sample=False,
 )
 # %% Compare logged model RMSD and oracle decoder RMSD
@@ -1788,8 +1878,9 @@ print_rmsd_summary(
     sample_total_is_edge,
 )
 
-# %% Best-of-k decoder RMSD vs true coords
+# %% Best-of-k decoder RMSD vs true coords and MolProbity
 BEST_OF_K_LIST = [1, 2, 4, 7, 10, 15]
+BEST_OF_K_BENCHMARK_TIMESTEPS = 15
 
 best_of_k_rmsds_by_k_list = {k: [] for k in BEST_OF_K_LIST}
 best_of_k_is_edge_list: list[bool] = []
@@ -1866,6 +1957,19 @@ with torch.no_grad():
 
         best_of_k_is_edge_list.extend(is_edge_batch.tolist())
 
+best_of_k_molprobity_rows_by_k = run_base2backbone_best_of_k_benchmark(
+    collect_test_dataset_raw_paths(test_dataset),
+    BEST_OF_K_MOLPROBITY_ROOT,
+    sampler=CheckpointSamplerAdapter(model, BEST_OF_K_BENCHMARK_TIMESTEPS),
+    device=device,
+    window_size=int(test_dataset.base.window_size),
+    best_of_k_list=BEST_OF_K_LIST,
+    window_batch_size=BASE2BACKBONE_WINDOW_BATCH_SIZE,
+    resume=True,
+    molprobity_timeout_s=MOLPROBITY_TIMEOUT_S,
+    molprobity_max_workers=MOLPROBITY_MAX_WORKERS,
+)
+
 best_of_k_is_edge = np.asarray(best_of_k_is_edge_list, dtype=bool)
 best_of_k_rmsds_by_k = {
     k: np.asarray(rmsds, dtype=np.float64)
@@ -1877,6 +1981,10 @@ for k in BEST_OF_K_LIST:
         f'Best-of-{k} decoder(pred torsions) vs true coords:',
         best_of_k_rmsds_by_k[k],
         best_of_k_is_edge,
+    )
+    print_molprobity_summary(
+        f'Best-of-{k} MolProbity:',
+        best_of_k_molprobity_rows_by_k[k],
     )
 
 # %% Plot best-of-k curve
@@ -1967,6 +2075,7 @@ def run_phenix_geometry_minimization(
     macro_cycles: int = 5,
     timeout_s: int = 300,
     window_size: int | None = None,
+    resume: bool = True,
 ) -> dict:
     """
     Run Phenix geometry minimization on a DNA structure.
@@ -2119,11 +2228,12 @@ def run_base2backbone_checkpoint_inference(
             window_size=window_size_i,
         )
         adapter = CheckpointSamplerAdapter(checkpoint_model, num_timesteps)
-        predictions = predict_backbone_from_chain_records(
-            [chain_records],
-            adapter,
-            device
-        )[0]
+        with torch.inference_mode():
+            predictions = predict_backbone_from_chain_records(
+                [chain_records],
+                adapter,
+                device,
+            )[0]
         with warnings.catch_warnings():
             warnings.simplefilter('ignore', PDBConstructionWarning)
             _, full_chain_records = parse_dna(
@@ -2765,23 +2875,22 @@ def benchmark_structure_methods_with_molprobity(
 
     output_dir = Path(output_dir)
     window_size = int(test_dataset.base.window_size)
-    benchmark_kwargs = {
-        'window_size': window_size,
-        'molprobity_timeout_s': molprobity_timeout_s,
-        'molprobity_max_workers': molprobity_max_workers,
-    }
+    if num_timesteps is None:
+        num_timesteps = BASE2BACKBONE_BENCHMARK_TIMESTEPS
 
     method_rows = {
-        'model': run_structure_benchmark(
+        'model': run_batched_structure_benchmark(
             input_paths,
             output_dir / 'model',
-            run_base2backbone_inference,
+            run_base2backbone_inference_batch_pooled,
             label='model',
-            max_workers=1,
-            checkpoint_model=model,
-            device=device,
-            num_timesteps=num_timesteps,
-            **benchmark_kwargs,
+            batch_size=BASE2BACKBONE_STRUCTURE_BATCH_SIZE,
+            pool_initializer=init_base2backbone_inference_worker,
+            pool_initargs=(model, device, window_size, num_timesteps),
+            window_batch_size=BASE2BACKBONE_WINDOW_BATCH_SIZE,
+            resume=True,
+            molprobity_timeout_s=molprobity_timeout_s,
+            molprobity_max_workers=molprobity_max_workers,
         ),
         'phenix': run_structure_benchmark(
             input_paths,
@@ -2789,7 +2898,9 @@ def benchmark_structure_methods_with_molprobity(
             run_phenix_geometry_minimization,
             label='PHENIX',
             max_workers=phenix_max_workers,
-            **benchmark_kwargs,
+            window_size=window_size,
+            molprobity_timeout_s=molprobity_timeout_s,
+            molprobity_max_workers=molprobity_max_workers,
         ),
         'mean_baseline': run_structure_benchmark(
             input_paths,
@@ -2802,15 +2913,22 @@ def benchmark_structure_methods_with_molprobity(
             ),
             label='mean baseline',
             max_workers=32,
-            **benchmark_kwargs,
+            window_size=window_size,
+            molprobity_timeout_s=molprobity_timeout_s,
+            molprobity_max_workers=molprobity_max_workers,
         ),
-        'knn': run_structure_benchmark(
+        'knn': run_batched_structure_benchmark(
             input_paths,
             output_dir / 'knn',
-            partial(run_knn_baseline_structure, knn_state=knn_state),
+            run_knn_baseline_structure_batch_pooled,
             label='kNN',
-            max_workers=32,
-            **benchmark_kwargs,
+            batch_size=KNN_STRUCTURE_BATCH_SIZE,
+            pool_initializer=init_knn_baseline_worker,
+            pool_initargs=(knn_state,),
+            window_size=window_size,
+            resume=True,
+            molprobity_timeout_s=molprobity_timeout_s,
+            molprobity_max_workers=molprobity_max_workers,
         ),
     }
     print_molprobity_method_summaries(method_rows)
@@ -2829,7 +2947,7 @@ def compare_model_vs_phenix_on_test_dataset(
     phenix_max_workers=4,
     checkpoint_model=None,
     model_device=None,
-    num_timesteps=None,
+    num_timesteps=BASE2BACKBONE_BENCHMARK_TIMESTEPS,
     require_standard_monomers=True,
     molprobity_timeout_s: int = MOLPROBITY_TIMEOUT_S,
     molprobity_max_workers: int = MOLPROBITY_MAX_WORKERS,
@@ -2839,20 +2957,29 @@ def compare_model_vs_phenix_on_test_dataset(
         input_paths = filter_standard_raw_paths(input_paths)
     output_dir = Path(output_dir)
 
+    benchmark_model = model if checkpoint_model is None else checkpoint_model
+    benchmark_device = device if model_device is None else model_device
+    benchmark_window_size = int(test_dataset.base.window_size)
     benchmark_kwargs = {
-        'window_size': test_dataset.base.window_size,
         'molprobity_timeout_s': molprobity_timeout_s,
         'molprobity_max_workers': molprobity_max_workers,
     }
-    model_rows = run_structure_benchmark(
+    benchmark_model.eval()
+    model_rows = run_batched_structure_benchmark(
         input_paths,
         output_dir / 'base2backbone',
-        run_base2backbone_inference,
+        run_base2backbone_inference_batch_pooled,
         label='base2backbone',
-        max_workers=1,
-        checkpoint_model=model if checkpoint_model is None else checkpoint_model,
-        device=device if model_device is None else model_device,
-        num_timesteps=num_timesteps,
+        batch_size=BASE2BACKBONE_STRUCTURE_BATCH_SIZE,
+        pool_initializer=init_base2backbone_inference_worker,
+        pool_initargs=(
+            benchmark_model,
+            benchmark_device,
+            benchmark_window_size,
+            num_timesteps,
+        ),
+        window_batch_size=BASE2BACKBONE_WINDOW_BATCH_SIZE,
+        resume=True,
         **benchmark_kwargs,
     )
     phenix_rows = run_structure_benchmark(
@@ -2861,7 +2988,8 @@ def compare_model_vs_phenix_on_test_dataset(
         run_phenix_geometry_minimization,
         label='PHENIX',
         max_workers=phenix_max_workers,
-        **benchmark_kwargs,
+        molprobity_timeout_s=molprobity_timeout_s,
+        molprobity_max_workers=molprobity_max_workers,
     )
     summarize_structure_vs_ref_backbone_rmsd(
         'PHENIX',

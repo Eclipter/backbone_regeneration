@@ -1,4 +1,5 @@
 # %% Imports
+import hashlib
 import os.path as osp
 import random
 import shlex
@@ -41,7 +42,7 @@ from base2backbone.eval.local_geometry import (
     world_to_local_np)
 from base2backbone.eval.molprobity import (
     annotate_benchmark_rows_with_molprobity, print_molprobity_method_summaries,
-    summarize_molprobity_rows)
+    print_molprobity_summary, summarize_molprobity_rows)
 from base2backbone.eval.structure_runners import (run_knn_baseline_structure,
                                                   run_mean_baseline_structure)
 from base2backbone.geometry.backbone import build_backbone_local
@@ -57,9 +58,16 @@ from base2backbone.runtime import (PROGRESS_BAR_COLOR, collect_scalar_history,
 from base2backbone.torsion_constants import N_TORSIONS, TAU_M_MAX, TAU_M_MIN
 
 IDX_TO_BASE = {v: k for k, v in BASE_TO_INDEX.items()}
+ANALYSIS_TMP_ROOT = Path(__file__).resolve().parents[1] / 'data'
+KNN_CACHE_ROOT = ANALYSIS_TMP_ROOT / 'knn_cache'
+KNN_CACHE_VERSION = 'v1'
+KNN_MOLPROBITY_ROOT = ANALYSIS_TMP_ROOT / 'knn_molprobity'
+MOLPROBITY_TIMEOUT_S = 600
+MOLPROBITY_MAX_WORKERS = 32
+RMSD_EVAL_BATCH_SIZE = 20000
 
 # %% Load prerequisites
-run_id = 'torsions/10/CLOSURE_LOSS_WEIGHT=0.001_CLOSURE_ANGLE_WEIGHT=0.3'
+run_id = 'torsions/11/baseline'
 
 artifacts = load_analysis_run_artifacts(run_id)
 run_dir = artifacts.run_dir
@@ -109,6 +117,117 @@ mode_colors = {
 }
 mode_linestyles = {'avg': '-', 'central': '--', 'edge': '--'}
 print(f'device: {device}')
+
+
+def collect_test_dataset_raw_paths(dataset):
+    raw_dir = Path(dataset.base.raw_dir)
+    raw_paths_by_id = {}
+    for base_idx, _ in dataset.virtual_entries:
+        pdb_id = Path(dataset.base.data_list[base_idx]).parent.name
+        raw_paths_by_id[pdb_id] = raw_dir / f'{pdb_id}.cif'
+
+    missing_paths = [path for path in raw_paths_by_id.values() if not path.exists()]
+    if missing_paths:
+        missing_str = '\n'.join(str(path) for path in missing_paths[:10])
+        raise FileNotFoundError(
+            'Missing raw test structures:\n'
+            f'{missing_str}'
+        )
+
+    return [raw_paths_by_id[pdb_id] for pdb_id in sorted(raw_paths_by_id)]
+
+
+def run_structure_benchmark(
+    input_paths,
+    output_dir,
+    runner,
+    label,
+    max_workers=1,
+    molprobity_timeout_s: int = MOLPROBITY_TIMEOUT_S,
+    molprobity_max_workers: int = MOLPROBITY_MAX_WORKERS,
+    **runner_kwargs,
+):
+    output_dir = Path(output_dir)
+    input_paths = [Path(path) for path in input_paths]
+
+    rows = []
+    batch_t0 = time.perf_counter()
+    output_pdb_dir = output_dir / 'pdb'
+    output_pdb_dir.mkdir(parents=True, exist_ok=True)
+
+    def append_result(input_path, res):
+        rows.append({
+            'id': input_path.stem,
+            'input_path': str(input_path),
+            'success': res['success'],
+            'wall_time_s': res['wall_time_s'],
+            'returncode': res['returncode'],
+            'output_pdb': str(res['output_pdb']) if res['output_pdb'] else '',
+            'stderr': res['stderr'][:1000],
+        })
+
+    if max_workers == 1:
+        for input_path in tqdm(
+            input_paths,
+            desc=f'{label} benchmark',
+            leave=False,
+            colour=PROGRESS_BAR_COLOR,
+        ):
+            try:
+                res = runner(input_path, output_pdb_dir, **runner_kwargs)
+            except Exception as e:
+                res = {
+                    'success': False,
+                    'wall_time_s': None,
+                    'returncode': -999,
+                    'output_pdb': None,
+                    'stderr': repr(e),
+                }
+            append_result(input_path, res)
+    else:
+        with ProcessPoolExecutor(max_workers=max_workers) as ex:
+            futures = {
+                ex.submit(
+                    runner,
+                    input_path,
+                    output_pdb_dir,
+                    **runner_kwargs,
+                ): input_path
+                for input_path in input_paths
+            }
+
+            for fut in tqdm(
+                as_completed(futures),
+                total=len(futures),
+                desc=f'{label} benchmark',
+                leave=False,
+                colour=PROGRESS_BAR_COLOR,
+            ):
+                input_path = futures[fut]
+
+                try:
+                    res = fut.result()
+                except Exception as e:
+                    res = {
+                        'success': False,
+                        'wall_time_s': None,
+                        'returncode': -999,
+                        'output_pdb': None,
+                        'stderr': repr(e),
+                    }
+
+                append_result(input_path, res)
+
+    print(
+        f'{label}: processed {len(rows)} structures '
+        f'in {time.perf_counter() - batch_t0:.2f}s'
+    )
+    annotate_benchmark_rows_with_molprobity(
+        rows,
+        timeout_s=molprobity_timeout_s,
+        max_workers=molprobity_max_workers,
+    )
+    return rows
 
 
 class CheckpointSamplerAdapter:
@@ -1023,39 +1142,46 @@ print(f'\nInter-run RMSD (mean): {format_rmsd_value(inter_run_rmsd_mean)}')
 
 
 def mean_target_torsions_and_tau(dataset):
-    first_data = cast(Data, dataset[0])
-    n_torsions = int(first_data.torsions.shape[-1])
-    sin_sums = np.zeros(n_torsions, dtype=np.float64)
-    cos_sums = np.zeros(n_torsions, dtype=np.float64)
-    torsion_counts = np.zeros(n_torsions, dtype=np.int64)
+    sin_sums = torch.zeros(N_TORSIONS, dtype=torch.float64)
+    cos_sums = torch.zeros(N_TORSIONS, dtype=torch.float64)
+    torsion_counts = torch.zeros(N_TORSIONS, dtype=torch.int64)
     tau_sum = 0.0
     tau_count = 0
 
-    for i in tqdm(
-        range(len(dataset)),
+    loader = DataLoader(
+        cast(Any, dataset),
+        batch_size=RMSD_EVAL_BATCH_SIZE,
+        shuffle=False,
+    )
+    for batch in tqdm(
+        loader,
+        total=len(loader),
         desc='mean baseline: train torsions',
         colour=PROGRESS_BAR_COLOR,
     ):
-        data = cast(Data, dataset[i])
-        tidx = int(data.target_nt_idx.item())
-        theta = data.torsions[tidx].detach().cpu().numpy()
-        theta_mask = data.torsion_mask[tidx].detach().cpu().numpy().astype(bool)
-        sin_sums[theta_mask] += np.sin(theta[theta_mask])
-        cos_sums[theta_mask] += np.cos(theta[theta_mask])
-        torsion_counts[theta_mask] += 1
+        b, ws = model._b_ws(batch)
+        bi = torch.arange(b)
+        ti = batch.target_nt_idx.long()
+        theta = batch.torsions.view(b, ws, N_TORSIONS)[bi, ti].to(dtype=torch.float64)
+        mask = batch.torsion_mask.view(b, ws, N_TORSIONS)[bi, ti].to(dtype=torch.float64)
+        sin_sums += (torch.sin(theta) * mask).sum(dim=0)
+        cos_sums += (torch.cos(theta) * mask).sum(dim=0)
+        torsion_counts += mask.sum(dim=0).to(torch.int64)
 
-        if bool(data.tau_m_mask[tidx].item()):
-            tau_sum += float(data.tau_m[tidx].item())
-            tau_count += 1
+        tau_vals = batch.tau_m.view(b, ws)[bi, ti]
+        tau_mask = batch.tau_m_mask.view(b, ws)[bi, ti].bool()
+        tau_sum += float(tau_vals[tau_mask].sum().item())
+        tau_count += int(tau_mask.sum().item())
 
-    mean_theta = np.zeros(n_torsions, dtype=np.float64)
-    valid_torsions = torsion_counts > 0
+    torsion_counts_np = torsion_counts.numpy()
+    mean_theta = np.zeros(N_TORSIONS, dtype=np.float64)
+    valid_torsions = torsion_counts_np > 0
     mean_theta[valid_torsions] = np.arctan2(
-        sin_sums[valid_torsions],
-        cos_sums[valid_torsions],
+        sin_sums.numpy()[valid_torsions],
+        cos_sums.numpy()[valid_torsions],
     )
     mean_tau = tau_sum / tau_count
-    return mean_theta, mean_tau, torsion_counts, tau_count
+    return mean_theta, mean_tau, torsion_counts_np, tau_count
 
 
 def evaluate_mean_torsion_baseline(dataset, mean_theta, mean_tau):
@@ -1068,19 +1194,24 @@ def evaluate_mean_torsion_baseline(dataset, mean_theta, mean_tau):
     rmsds: list[float] = []
     is_edge: list[bool] = []
 
+    loader = DataLoader(
+        cast(Any, dataset),
+        batch_size=RMSD_EVAL_BATCH_SIZE,
+        shuffle=False,
+    )
     with torch.no_grad():
-        for i in tqdm(
-            range(len(dataset)),
+        for batch in tqdm(
+            loader,
+            total=len(loader),
             desc='mean baseline: test decode',
             colour=PROGRESS_BAR_COLOR,
         ):
-            data = cast(Data, dataset[i].clone())
-            batch = cast(Any, Batch.from_data_list([data])).to(device)
+            batch = cast(Any, batch).to(device)
             rmsd = model._compute_rmsd_per_graph_local(pred_theta, pred_tau, batch)
-
-            rmsds.append(float(rmsd.item()))
-            tidx = int(data.target_nt_idx.item())
-            is_edge.append(bool(data.is_chain_edge_nt[tidx].item()))
+            rmsds.extend(rmsd.detach().cpu().numpy().tolist())
+            is_edge.extend(
+                model._is_edge_target(batch).detach().cpu().numpy().astype(bool).tolist()
+            )
 
     return np.asarray(rmsds, dtype=np.float64), np.asarray(is_edge, dtype=bool)
 
@@ -1097,6 +1228,25 @@ print_rmsd_summary(
     'Mean train torsion/amplitude baseline test RMSD:',
     mean_baseline_test_rmsds,
     mean_baseline_test_is_edge,
+)
+mean_baseline_molprobity_rows = run_structure_benchmark(
+    collect_test_dataset_raw_paths(test_dataset),
+    ANALYSIS_TMP_ROOT / 'mean_baseline_molprobity',
+    partial(
+        run_mean_baseline_structure,
+        mean_theta=mean_baseline_theta,
+        mean_tau=float(mean_baseline_tau),
+        device=device,
+    ),
+    label='mean baseline',
+    max_workers=1,
+    window_size=int(test_dataset.base.window_size),
+    molprobity_timeout_s=MOLPROBITY_TIMEOUT_S,
+    molprobity_max_workers=MOLPROBITY_MAX_WORKERS,
+)
+print_molprobity_summary(
+    'Mean train torsion/amplitude baseline MolProbity:',
+    mean_baseline_molprobity_rows,
 )
 
 
@@ -1157,8 +1307,45 @@ def build_pdb_meta_cache(pdb_ids):
     return cache
 
 
+def _knn_dataset_cache_path(dataset, label, pdb_meta_cache):
+    data_list = dataset.base.data_list
+    processed_dir = Path(dataset.base.processed_dir)
+    completion_tag = processed_dir / dataset.base.processed_file_names
+    first_path = Path(data_list[0]) if data_list else None
+    last_path = Path(data_list[-1]) if data_list else None
+    signature = '\n'.join([
+        KNN_CACHE_VERSION,
+        label,
+        str(processed_dir.resolve()),
+        str(len(data_list)),
+        str(len(dataset.virtual_entries)),
+        str(len(pdb_meta_cache)),
+        str(completion_tag.stat().st_mtime_ns if completion_tag.exists() else -1),
+        str(first_path.resolve() if first_path is not None else ''),
+        str(first_path.stat().st_mtime_ns if first_path is not None else -1),
+        str(last_path.resolve() if last_path is not None else ''),
+        str(last_path.stat().st_mtime_ns if last_path is not None else -1),
+        str(tuple(dataset.virtual_entries[:8])),
+        str(tuple(dataset.virtual_entries[-8:])),
+    ])
+    digest = hashlib.sha256(signature.encode('utf-8')).hexdigest()[:16]
+    return KNN_CACHE_ROOT / f'{label}-{digest}.pt'
+
+
 def _index_knn_dataset_samples(dataset, label, pdb_meta_cache):
-    return dataset_samples_cached(
+    KNN_CACHE_ROOT.mkdir(parents=True, exist_ok=True)
+    cache_path = _knn_dataset_cache_path(dataset, label, pdb_meta_cache)
+    if cache_path.exists():
+        print(f'kNN: loading cached {label} index from {cache_path}')
+        cached = torch.load(cache_path, weights_only=False)
+        return (
+            cached['feats'],
+            cached['locals'],
+            cached['metas'],
+            cached['feat_slices'],
+        )
+
+    indexed = dataset_samples_cached(
         dataset,
         label,
         pdb_meta_cache,
@@ -1168,6 +1355,27 @@ def _index_knn_dataset_samples(dataset, label, pdb_meta_cache):
             colour=PROGRESS_BAR_COLOR,
         ),
     )
+    with tempfile.NamedTemporaryFile(
+        dir=KNN_CACHE_ROOT,
+        suffix='.pt',
+        delete=False,
+    ) as tmp_file:
+        tmp_path = Path(tmp_file.name)
+    try:
+        torch.save(
+            {
+                'feats': indexed[0],
+                'locals': indexed[1],
+                'metas': indexed[2],
+                'feat_slices': indexed[3],
+            },
+            tmp_path,
+        )
+        tmp_path.replace(cache_path)
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
+    return indexed
 
 
 pdb_meta_cache = build_pdb_meta_cache(
@@ -1208,11 +1416,18 @@ KNN_MOLPROBITY_FEATURE_NAMES = [
     'base_types',
 ]
 
+test_molprobity_input_paths = collect_test_dataset_raw_paths(test_dataset)
+knn_molprobity_window_size = int(test_dataset.base.window_size)
+
 for feature_set_name, feature_names in feature_sets:
     test_subset_feats = select_feature_columns(test_feats, test_feat_slices, feature_names)
     train_subset_feats = select_feature_columns(train_feats, train_feat_slices, feature_names)
-    run_knn_protocol(
-        f'test-to-train, {feature_set_name}, same base type, no same PDB/deposit/identical DNA seq',
+    knn_protocol_name = (
+        f'test-to-train, {feature_set_name}, same base type, '
+        'no same PDB/deposit/identical DNA seq'
+    )
+    _, _, knn_match_indices = run_knn_protocol(
+        knn_protocol_name,
         test_subset_feats,
         test_locals,
         test_metas,
@@ -1221,6 +1436,26 @@ for feature_set_name, feature_names in feature_sets:
         train_metas,
         allow_same_sample=False,
         print_summary=print_rmsd_summary,
+    )
+    knn_feature_state = KnnBaselineState(
+        query_metas=test_metas,
+        ref_locals=train_locals,
+        match_indices=knn_match_indices,
+    )
+    knn_molprobity_digest = hashlib.sha256(knn_protocol_name.encode()).hexdigest()[:16]
+    knn_molprobity_rows = run_structure_benchmark(
+        test_molprobity_input_paths,
+        KNN_MOLPROBITY_ROOT / knn_molprobity_digest,
+        partial(run_knn_baseline_structure, knn_state=knn_feature_state),
+        label=f'kNN ({feature_set_name})',
+        max_workers=32,
+        window_size=knn_molprobity_window_size,
+        molprobity_timeout_s=MOLPROBITY_TIMEOUT_S,
+        molprobity_max_workers=MOLPROBITY_MAX_WORKERS,
+    )
+    print_molprobity_summary(
+        f'kNN MolProbity (local frame) [{knn_protocol_name}]',
+        knn_molprobity_rows,
     )
 
 knn_baseline_state = build_knn_baseline_state(
@@ -1344,7 +1579,6 @@ def plot_per_atom_errors(atom_rows):
 
 
 # %% Oracle decoder RMSD + decoder(pred torsions) vs decoder(true torsions)
-RMSD_EVAL_BATCH_SIZE = 20000
 
 oracle_rmsds_list: list[float] = []
 oracle_is_edge_list: list[bool] = []
@@ -1582,7 +1816,8 @@ plt.show()
 
 # %% Compare PHENIX run time with Base2Backbone
 
-NUM_TIMESTEPS_LIST = [5, 10, 15, 20, 30, 50, 100, 200, 300, 500, 1000]
+NUM_TIMESTEPS_LIST = [15, 200]
+RUNTIME_SUBSET_SIZE = 30
 
 
 def pick_phenix_minimized_structure(tmpdir: Path, local_input: Path) -> Path | None:
@@ -1688,9 +1923,8 @@ def run_phenix_geometry_minimization(
             'stderr': repr(e),
         }
 
-    struct_tmp_root = Path(__file__).resolve().parents[1] / 'data'
-    struct_tmp_root.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(dir=struct_tmp_root) as tmpdir:
+    ANALYSIS_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=ANALYSIS_TMP_ROOT) as tmpdir:
         tmpdir = Path(tmpdir)
 
         local_pdb = tmpdir / phenix_input_path.name
@@ -1894,101 +2128,6 @@ def run_base2backbone_checkpoint_inference(
     }
 
 
-def run_structure_benchmark(
-    input_paths,
-    output_dir,
-    runner,
-    label,
-    max_workers=1,
-    run_molprobity: bool = False,
-    molprobity_timeout_s: int = 600,
-    molprobity_max_workers: int = 4,
-    **runner_kwargs,
-):
-    output_dir = Path(output_dir)
-    input_paths = [Path(path) for path in input_paths]
-
-    rows = []
-    batch_t0 = time.perf_counter()
-    output_pdb_dir = output_dir / 'pdb'
-    output_pdb_dir.mkdir(parents=True, exist_ok=True)
-
-    def append_result(input_path, res):
-        rows.append({
-            'id': input_path.stem,
-            'input_path': str(input_path),
-            'success': res['success'],
-            'wall_time_s': res['wall_time_s'],
-            'returncode': res['returncode'],
-            'output_pdb': str(res['output_pdb']) if res['output_pdb'] else '',
-            'stderr': res['stderr'][:1000],
-        })
-
-    if max_workers == 1:
-        for input_path in tqdm(
-            input_paths,
-            desc=f'{label} benchmark',
-            leave=False,
-            colour=PROGRESS_BAR_COLOR,
-        ):
-            try:
-                res = runner(input_path, output_pdb_dir, **runner_kwargs)
-            except Exception as e:
-                res = {
-                    'success': False,
-                    'wall_time_s': None,
-                    'returncode': -999,
-                    'output_pdb': None,
-                    'stderr': repr(e),
-                }
-            append_result(input_path, res)
-    else:
-        with ProcessPoolExecutor(max_workers=max_workers) as ex:
-            futures = {
-                ex.submit(
-                    runner,
-                    input_path,
-                    output_pdb_dir,
-                    **runner_kwargs,
-                ): input_path
-                for input_path in input_paths
-            }
-
-            for fut in tqdm(
-                as_completed(futures),
-                total=len(futures),
-                desc=f'{label} benchmark',
-                leave=False,
-                colour=PROGRESS_BAR_COLOR,
-            ):
-                input_path = futures[fut]
-
-                try:
-                    res = fut.result()
-                except Exception as e:
-                    res = {
-                        'success': False,
-                        'wall_time_s': None,
-                        'returncode': -999,
-                        'output_pdb': None,
-                        'stderr': repr(e),
-                    }
-
-                append_result(input_path, res)
-
-    print(
-        f'{label}: processed {len(rows)} structures '
-        f'in {time.perf_counter() - batch_t0:.2f}s'
-    )
-    if run_molprobity:
-        annotate_benchmark_rows_with_molprobity(
-            rows,
-            timeout_s=molprobity_timeout_s,
-            max_workers=molprobity_max_workers,
-        )
-    return rows
-
-
 def run_dataset(input_dir, output_dir, max_workers=4):
     input_dir = Path(input_dir)
     input_paths = sorted(
@@ -2090,24 +2229,6 @@ def filter_standard_raw_paths(input_paths):
         print(f'Skipped {len(skipped_entries)} structures with nonstandard chemistry: {preview}{extra}')
 
     return standard_paths
-
-
-def collect_test_dataset_raw_paths(dataset):
-    raw_dir = Path(dataset.base.raw_dir)
-    raw_paths_by_id = {}
-    for base_idx, _ in dataset.virtual_entries:
-        pdb_id = Path(dataset.base.data_list[base_idx]).parent.name
-        raw_paths_by_id[pdb_id] = raw_dir / f'{pdb_id}.cif'
-
-    missing_paths = [path for path in raw_paths_by_id.values() if not path.exists()]
-    if missing_paths:
-        missing_str = '\n'.join(str(path) for path in missing_paths[:10])
-        raise FileNotFoundError(
-            'Missing raw test structures:\n'
-            f'{missing_str}'
-        )
-
-    return [raw_paths_by_id[pdb_id] for pdb_id in sorted(raw_paths_by_id)]
 
 
 def residue_backbone_positions(chain_records):
@@ -2286,6 +2407,7 @@ def summarize_structure_vs_ref_backbone_rmsd(label, rows, window_size=3):
             f'{format_rmsd_value(summary[f"{key}_backbone_rmsd"])}'
         )
     print(f'  {"n":>12}: {summary["n_rmsd_compared"]}')
+    print_molprobity_summary(f'{label} MolProbity:', rows)
     return summary
 
 
@@ -2480,10 +2602,12 @@ def summarize_runtime_comparison(model_rows, phenix_rows, window_size=3):
                 'n_total': len(rmsd_rows),
             },
         )
+        print_molprobity_summary('Base2Backbone MolProbity:', model_rows)
+        print_molprobity_summary('PHENIX MolProbity:', phenix_rows)
     return comparison_rows, summary
 
 
-def pick_runtime_subset(input_paths, subset_size=10, seed=42, require_standard_monomers=True):
+def pick_runtime_subset(input_paths, subset_size=RUNTIME_SUBSET_SIZE, seed=42, require_standard_monomers=True):
     rng = random.Random(int(seed))
     shuffled_paths = list(input_paths)
     rng.shuffle(shuffled_paths)
@@ -2517,11 +2641,12 @@ def print_benchmark_summary(label, rows):
             f'min={np.min(times):.3f}s '
             f'max={np.max(times):.3f}s'
         )
+    print_molprobity_summary(f'{label} MolProbity:', rows)
 
 
 def benchmark_timesteps_vs_phenix_on_subset(
     output_dir,
-    subset_size=10,
+    subset_size=RUNTIME_SUBSET_SIZE,
     subset_seed=42,
     phenix_max_workers=4,
     num_timesteps_list=None,
@@ -2618,7 +2743,6 @@ def benchmark_structure_methods_with_molprobity(
     window_size = int(test_dataset.base.window_size)
     benchmark_kwargs = {
         'window_size': window_size,
-        'run_molprobity': True,
         'molprobity_timeout_s': molprobity_timeout_s,
         'molprobity_max_workers': molprobity_max_workers,
     }
@@ -2653,7 +2777,7 @@ def benchmark_structure_methods_with_molprobity(
                 device=device,
             ),
             label='mean baseline',
-            max_workers=1,
+            max_workers=32,
             **benchmark_kwargs,
         ),
         'knn': run_structure_benchmark(
@@ -2661,7 +2785,7 @@ def benchmark_structure_methods_with_molprobity(
             output_dir / 'knn',
             partial(run_knn_baseline_structure, knn_state=knn_state),
             label='kNN',
-            max_workers=1,
+            max_workers=32,
             **benchmark_kwargs,
         ),
     }
@@ -2683,9 +2807,8 @@ def compare_model_vs_phenix_on_test_dataset(
     model_device=None,
     num_timesteps=None,
     require_standard_monomers=True,
-    run_molprobity: bool = False,
-    molprobity_timeout_s: int = 600,
-    molprobity_max_workers: int = 32,
+    molprobity_timeout_s: int = MOLPROBITY_TIMEOUT_S,
+    molprobity_max_workers: int = MOLPROBITY_MAX_WORKERS,
 ):
     input_paths = collect_test_dataset_raw_paths(test_dataset)
     if require_standard_monomers:
@@ -2694,7 +2817,6 @@ def compare_model_vs_phenix_on_test_dataset(
 
     benchmark_kwargs = {
         'window_size': test_dataset.base.window_size,
-        'run_molprobity': run_molprobity,
         'molprobity_timeout_s': molprobity_timeout_s,
         'molprobity_max_workers': molprobity_max_workers,
     }
@@ -2734,18 +2856,17 @@ def compare_model_vs_phenix_on_test_dataset(
         'comparison_rows': comparison_rows,
         'summary': summary,
     }
-    if run_molprobity:
-        result['molprobity_summaries'] = print_molprobity_method_summaries({
-            'model': model_rows,
-            'phenix': phenix_rows,
-        })
+    result['molprobity_summaries'] = {
+        'model': summarize_molprobity_rows(model_rows),
+        'phenix': summarize_molprobity_rows(phenix_rows),
+    }
     return result
 
 
 runtime_subset_seed = 42
 runtime_subset_benchmark = benchmark_timesteps_vs_phenix_on_subset(
     Path(run_dir) / 'runtime_benchmark_subset',
-    subset_size=10,
+    subset_size=RUNTIME_SUBSET_SIZE,
     subset_seed=runtime_subset_seed,
     phenix_max_workers=4,
     num_timesteps_list=NUM_TIMESTEPS_LIST,

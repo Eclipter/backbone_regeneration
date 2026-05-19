@@ -2,24 +2,25 @@
 
 from __future__ import annotations
 
-import os.path as osp
-import warnings
 from collections import defaultdict
 from dataclasses import dataclass
-from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
 import torch
-from Bio.PDB.PDBExceptions import PDBConstructionWarning
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import StandardScaler
-from torch_geometric.data import Data
 
-from ..data import BACKBONE_ATOMS, parse_dna
+from ..data import BACKBONE_ATOMS
 from ..dataset import WindowTargetDataset
-from .local_geometry import backbone_predictions_from_matched_local, local_backbone_rmsd
+from .local_geometry import (
+    backbone_predictions_from_matched_local,
+    local_backbone_rmsd,
+)
+
+KNN_INITIAL_NEIGHBORS = 32
+KNN_NEIGHBOR_GROWTH = 4
 
 
 def payload_key(dataset: WindowTargetDataset, target_type: int) -> str:
@@ -57,38 +58,6 @@ def knn_feature_into(base_data, payload, out):
         offset += flat.size
 
 
-@lru_cache(maxsize=None)
-def target_residue_for_window(base, w_idx: int, target_type: int, dataset_kind: str):
-    del dataset_kind  # cache key disambiguator for CENTRAL vs EDGE constants
-    path = base.data_list[w_idx]
-    pdb_id = Path(path).parent.name
-    window_idx = int(Path(path).stem)
-    payloads = cast(
-        dict[str, dict[str, torch.Tensor]],
-        getattr(base, '_precomputed_target_payloads'),
-    )
-    payload = payloads[payload_key_from_type(target_type)]
-    ti = int(payload['target_nt_idx'].item())
-    raw_path = osp.join(base.raw_dir, f'{pdb_id}.cif')
-    with warnings.catch_warnings():
-        warnings.simplefilter('ignore', PDBConstructionWarning)
-        _, chain_records = parse_dna(
-            raw_path,
-            use_full_nucleotide=True,
-            window_size=base.window_size,
-        )
-    for _, _, windows in chain_records:
-        for window, widx, _ in windows:
-            if int(widx) == window_idx:
-                nucleotide = window[ti]
-                return nucleotide.segid, int(nucleotide.resid)
-    raise RuntimeError(f'window {window_idx} not found in {pdb_id}')
-
-
-def payload_key_from_type(target_type: int) -> str:
-    return 'central' if target_type == 0 else 'edge'
-
-
 def dataset_samples_cached(dataset, label, pdb_meta_cache, progress_bar=None):
     n_samples = len(dataset)
     n_bb = len(BACKBONE_ATOMS)
@@ -97,7 +66,7 @@ def dataset_samples_cached(dataset, label, pdb_meta_cache, progress_bar=None):
     first_w_idx, first_target_type = dataset.virtual_entries[0]
     first_base = dataset.base.get(first_w_idx)
     first_payloads = cast(
-        dict[str, dict[str, torch.Tensor]],
+        dict[str, dict[str, Any]],
         getattr(first_base, '_precomputed_target_payloads'),
     )
     first_payload = first_payloads[payload_key(dataset, first_target_type)]
@@ -117,7 +86,7 @@ def dataset_samples_cached(dataset, label, pdb_meta_cache, progress_bar=None):
             base_cache[w_idx] = dataset.base.get(w_idx)
         base = base_cache[w_idx]
         payloads = cast(
-            dict[str, dict[str, torch.Tensor]],
+            dict[str, dict[str, Any]],
             getattr(base, '_precomputed_target_payloads'),
         )
         payload = payloads[payload_key(dataset, target_type)]
@@ -129,18 +98,12 @@ def dataset_samples_cached(dataset, label, pdb_meta_cache, progress_bar=None):
         R = base.nt_frames_world[ti].numpy()
         knn_feature_into(base, payload, feats[i])
         locals_[i] = ((bb_w - o) @ R).astype(np.float32)
-        segid, resid = target_residue_for_window(
-            dataset.base,
-            w_idx,
-            target_type,
-            f'{label}:{target_type}',
-        )
         pdb_meta = pdb_meta_cache[pdb_id]
         metas.append({
             'sample_key': f'{label}:{w_idx}:{target_type}',
             'pdb_id': pdb_id,
-            'segid': segid,
-            'resid': resid,
+            'segid': payload['target_segid'],
+            'resid': int(payload['target_resid']),
             'origin_world': o,
             'frame_world': R,
             'deposit_group_id': pdb_meta['deposit_group_id'],
@@ -170,7 +133,7 @@ def fit_knn_indices(ref_feats, ref_metas):
     }
     nn_by_base = {}
     for base_type, indices in ref_indices_by_base.items():
-        nn = NearestNeighbors(n_neighbors=len(indices), algorithm='auto')
+        nn = NearestNeighbors(algorithm='auto')
         nn.fit(ref_feats_scaled[indices])
         nn_by_base[base_type] = nn
     return scaler, ref_indices_by_base, nn_by_base
@@ -191,6 +154,50 @@ def candidate_allowed(query_meta, ref_meta, allow_same_sample):
     return True
 
 
+def _batched_matches_for_base_type(
+    query_indices,
+    query_feats_scaled,
+    query_metas,
+    ref_indices,
+    ref_metas,
+    nn,
+    *,
+    allow_same_sample: bool,
+):
+    match_indices: list[int | None] = [None] * len(query_indices)
+    if len(query_indices) == 0 or len(ref_indices) == 0:
+        return match_indices
+
+    query_batch = query_feats_scaled[np.asarray(query_indices, dtype=np.int64)]
+    pending_positions = np.arange(len(query_indices), dtype=np.int64)
+    n_ref = len(ref_indices)
+    n_neighbors = min(KNN_INITIAL_NEIGHBORS, n_ref)
+
+    while len(pending_positions) > 0:
+        _, neighbors = nn.kneighbors(
+            query_batch[pending_positions],
+            n_neighbors=n_neighbors,
+        )
+        next_pending: list[int] = []
+        for batch_row, query_pos in enumerate(pending_positions):
+            query_meta = query_metas[query_indices[int(query_pos)]]
+            match_idx = None
+            for local_idx in neighbors[batch_row]:
+                ref_idx = int(ref_indices[int(local_idx)])
+                if candidate_allowed(query_meta, ref_metas[ref_idx], allow_same_sample):
+                    match_idx = ref_idx
+                    break
+            if match_idx is None and n_neighbors < n_ref:
+                next_pending.append(int(query_pos))
+                continue
+            match_indices[int(query_pos)] = match_idx
+        if not next_pending or n_neighbors == n_ref:
+            break
+        pending_positions = np.asarray(next_pending, dtype=np.int64)
+        n_neighbors = min(n_ref, n_neighbors * KNN_NEIGHBOR_GROWTH)
+    return match_indices
+
+
 def knn_match_indices(
     query_feats,
     query_metas,
@@ -201,23 +208,25 @@ def knn_match_indices(
 ):
     scaler, ref_indices_by_base, nn_by_base = fit_knn_indices(ref_feats, ref_metas)
     query_feats_scaled = np.asarray(scaler.transform(query_feats), dtype=np.float32)
-    match_indices: list[int | None] = []
+    match_indices: list[int | None] = [None] * len(query_metas)
+    query_indices_by_base: defaultdict[int, list[int]] = defaultdict(list)
     for i, meta in enumerate(query_metas):
-        ref_indices = ref_indices_by_base.get(meta['base_type'])
+        query_indices_by_base[meta['base_type']].append(i)
+    for base_type, query_indices in query_indices_by_base.items():
+        ref_indices = ref_indices_by_base.get(base_type)
         if ref_indices is None or len(ref_indices) == 0:
-            match_indices.append(None)
             continue
-        _, neighbors = nn_by_base[meta['base_type']].kneighbors(
-            query_feats_scaled[i:i + 1],
-            n_neighbors=len(ref_indices),
+        base_matches = _batched_matches_for_base_type(
+            query_indices,
+            query_feats_scaled,
+            query_metas,
+            ref_indices,
+            ref_metas,
+            nn_by_base[base_type],
+            allow_same_sample=allow_same_sample,
         )
-        match_idx = None
-        for local_idx in neighbors[0]:
-            ref_idx = int(ref_indices[int(local_idx)])
-            if candidate_allowed(meta, ref_metas[ref_idx], allow_same_sample):
-                match_idx = ref_idx
-                break
-        match_indices.append(match_idx)
+        for query_idx, match_idx in zip(query_indices, base_matches):
+            match_indices[query_idx] = match_idx
     return match_indices
 
 

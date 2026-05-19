@@ -1,4 +1,3 @@
-import json
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -6,9 +5,8 @@ import pytest
 
 from base2backbone.eval.molprobity import (
     annotate_benchmark_rows_with_molprobity,
-    extract_json_object,
-    metrics_from_clashscore_json,
-    metrics_from_rna_validate_json,
+    metrics_from_molprobity_stdout,
+    print_molprobity_summary,
     run_structure_molprobity,
     summarize_molprobity_rows,
 )
@@ -16,31 +14,18 @@ from base2backbone.eval.local_geometry import backbone_predictions_from_matched_
 from base2backbone.eval.structure_runners import FixedTorsionSampler
 
 
-def test_extract_json_object_finds_summary_payload():
-    stdout = 'noise\n{"summary_results": {"": {"clashscore": 12.5, "num_clashes": 3}}}\n'
-    payload = extract_json_object(stdout)
-    assert payload is not None
-    assert payload['summary_results']['']['clashscore'] == 12.5
-
-
-def test_metrics_from_clashscore_json():
-    payload = {'summary_results': {'': {'clashscore': 9.0, 'num_clashes': 2}}}
-    metrics = metrics_from_clashscore_json(payload)
-    assert metrics == {'clashscore': 9.0, 'num_clashes': 2}
-
-
-def test_metrics_from_rna_validate_json():
-    payload = {
-        'rna_bonds': {
-            'summary_results': {
-                '': {'num_outliers': 4, 'num_total': 100},
-            },
-        },
-    }
-    metrics = metrics_from_rna_validate_json(payload)
+def test_metrics_from_molprobity_stdout():
+    stdout = (
+        '  Clashscore            = 9.0\n'
+        '  RMS(bonds)            =   0.021\n'
+        '  RMS(angles)           =   2.345\n'
+    )
+    metrics = metrics_from_molprobity_stdout(stdout)
     assert metrics == {
-        'rna_bond_num_outliers': 4,
-        'rna_bond_num_total': 100,
+        'clashscore': 9.0,
+        'num_clashes': None,
+        'bond_rmsd': 0.021,
+        'angle_rmsd': 2.345,
     }
 
 
@@ -73,29 +58,22 @@ def test_backbone_predictions_from_matched_local_uses_query_frame():
 
 
 @patch('base2backbone.eval.molprobity._run_molprobity_tool')
-def test_run_structure_molprobity_parses_clashscore_and_rna(mock_tool, tmp_path):
+def test_run_structure_molprobity_parses_molprobity_summary(mock_tool, tmp_path):
     pdb_path = tmp_path / 'x.pdb'
     pdb_path.write_text('END\n', encoding='utf-8')
-    clash_json = json.dumps({
-        'summary_results': {'': {'clashscore': 5.5, 'num_clashes': 1}},
-    })
-    rna_json = json.dumps({
-        'rna_bonds': {
-            'summary_results': {'': {'num_outliers': 2, 'num_total': 20}},
-        },
-    })
-    mock_tool.side_effect = [
-        MagicMock(returncode=0, stdout=clash_json, stderr=''),
-        MagicMock(returncode=0, stdout=rna_json, stderr=''),
-    ]
+    stdout = (
+        '  Clashscore            = 5.5\n'
+        '  RMS(bonds)            =   0.014\n'
+        '  RMS(angles)           =   1.234\n'
+    )
+    mock_tool.return_value = MagicMock(returncode=0, stdout=stdout, stderr='')
 
-    result = run_structure_molprobity(pdb_path, run_rna_validate=True)
+    result = run_structure_molprobity(pdb_path)
 
     assert result.success
     assert result.clashscore == pytest.approx(5.5)
-    assert result.num_clashes == 1
-    assert result.rna_bond_num_outliers == 2
-    assert result.rna_bond_num_total == 20
+    assert result.bond_rmsd == pytest.approx(0.014)
+    assert result.angle_rmsd == pytest.approx(1.234)
 
 
 @patch('base2backbone.eval.molprobity.run_structure_molprobity')
@@ -108,8 +86,8 @@ def test_annotate_benchmark_rows_with_molprobity(mock_run):
         returncode=0,
         clashscore=3.0,
         num_clashes=1,
-        rna_bond_num_outliers=0,
-        rna_bond_num_total=10,
+        bond_rmsd=0.02,
+        angle_rmsd=1.5,
         stdout='',
         stderr='',
     )
@@ -123,21 +101,38 @@ def test_annotate_benchmark_rows_with_molprobity(mock_run):
     assert mock_run.call_count == 1
 
 
+def test_print_molprobity_summary(capsys):
+    rows = [
+        {
+            'molprobity_success': True,
+            'molprobity_clashscore': 8.0,
+            'molprobity_num_clashes': 1,
+            'molprobity_bond_rmsd': 0.02,
+            'molprobity_angle_rmsd': 1.5,
+        },
+    ]
+    summary = print_molprobity_summary('Test MolProbity:', rows)
+    captured = capsys.readouterr()
+    assert 'Test MolProbity:' in captured.out
+    assert 'clashscore=8.000' in captured.out
+    assert summary['n_validated'] == 1
+
+
 def test_summarize_molprobity_rows():
     rows = [
         {
             'molprobity_success': True,
             'molprobity_clashscore': 10.0,
             'molprobity_num_clashes': 2,
-            'molprobity_rna_bond_num_outliers': 1,
-            'molprobity_rna_bond_num_total': 50,
+            'molprobity_bond_rmsd': 0.01,
+            'molprobity_angle_rmsd': 1.0,
         },
         {
             'molprobity_success': True,
             'molprobity_clashscore': 20.0,
             'molprobity_num_clashes': 4,
-            'molprobity_rna_bond_num_outliers': 3,
-            'molprobity_rna_bond_num_total': 60,
+            'molprobity_bond_rmsd': 0.03,
+            'molprobity_angle_rmsd': 2.0,
         },
     ]
     summary = summarize_molprobity_rows(rows)

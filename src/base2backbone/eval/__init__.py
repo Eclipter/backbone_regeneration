@@ -27,6 +27,7 @@ from .molprobity import (
     annotate_benchmark_rows_with_molprobity,
     format_molprobity_summary,
     print_molprobity_method_summaries,
+    print_molprobity_summary,
     run_structure_molprobity,
     summarize_molprobity_rows,
 )
@@ -57,6 +58,7 @@ __all__ = [
     'ordered_backbone_segments',
     'phosphodiester_segments_local',
     'print_molprobity_method_summaries',
+    'print_molprobity_summary',
     'run_knn_baseline_structure',
     'run_knn_protocol',
     'run_mean_baseline_structure',

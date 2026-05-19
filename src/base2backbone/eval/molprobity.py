@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import re
 import shlex
 import subprocess
 import time
@@ -22,8 +22,8 @@ DEFAULT_MOLPROBITY_BIN_DIR = Path('/opt/shared_soft/phenix2.0/bin')
 MOLPROBITY_METRIC_KEYS = (
     'clashscore',
     'num_clashes',
-    'rna_bond_num_outliers',
-    'rna_bond_num_total',
+    'bond_rmsd',
+    'angle_rmsd',
 )
 
 
@@ -34,8 +34,8 @@ class MolprobityRunResult:
     returncode: int
     clashscore: float | None
     num_clashes: int | None
-    rna_bond_num_outliers: int | None
-    rna_bond_num_total: int | None
+    bond_rmsd: float | None
+    angle_rmsd: float | None
     stdout: str
     stderr: str
     error: str | None = None
@@ -46,8 +46,8 @@ class MolprobityRunResult:
             f'{prefix}_wall_time_s': self.wall_time_s,
             f'{prefix}_clashscore': self.clashscore,
             f'{prefix}_num_clashes': self.num_clashes,
-            f'{prefix}_rna_bond_num_outliers': self.rna_bond_num_outliers,
-            f'{prefix}_rna_bond_num_total': self.rna_bond_num_total,
+            f'{prefix}_bond_rmsd': self.bond_rmsd,
+            f'{prefix}_angle_rmsd': self.angle_rmsd,
             f'{prefix}_error': self.error,
         }
 
@@ -74,16 +74,20 @@ def _run_molprobity_tool(
     timeout_s: int = 600,
 ) -> subprocess.CompletedProcess[str]:
     structure_path = str(Path(structure_path).resolve())
-    tool_path = molprobity_tool_path(tool, bin_dir=bin_dir)
-    phil_args = [
-        f'model={structure_path}',
-        'json=True',
-        'verbose=False',
-        *extra_args,
-    ]
+    if tool == 'molprobity':
+        tool_cmd = 'phenix.molprobity'
+        phil_args = [structure_path, *extra_args]
+    else:
+        tool_cmd = shlex.quote(str(molprobity_tool_path(tool, bin_dir=bin_dir)))
+        phil_args = [
+            f'model={structure_path}',
+            'json=True',
+            'verbose=False',
+            *extra_args,
+        ]
     cmd = (
         f'{_molprobity_shell_prefix(phenix_module)}'
-        f' && {shlex.quote(str(tool_path))}'
+        f' && {tool_cmd}'
         f' {" ".join(shlex.quote(arg) for arg in phil_args)}'
     )
     return subprocess.run(
@@ -97,57 +101,55 @@ def _run_molprobity_tool(
     )
 
 
-def extract_json_object(stdout: str) -> dict[str, Any] | None:
-    decoder = json.JSONDecoder()
-    idx = 0
-    while idx < len(stdout):
-        start = stdout.find('{', idx)
-        if start < 0:
-            break
-        try:
-            obj, end = decoder.raw_decode(stdout, start)
-        except json.JSONDecodeError:
-            idx = start + 1
-            continue
-        if isinstance(obj, dict) and (
-            'summary_results' in obj
-            or 'validation_type' in obj
-            or 'rna_bonds' in obj
-        ):
-            return obj
-        idx = end
+def _search_metric(
+    stdout: str,
+    patterns: tuple[str, ...],
+) -> str | None:
+    for pattern in patterns:
+        match = re.search(pattern, stdout, flags=re.IGNORECASE | re.MULTILINE)
+        if match is not None:
+            return match.group(1)
     return None
 
 
-def _summary_bucket(payload: dict[str, Any]) -> dict[str, Any]:
-    summary = payload.get('summary_results') or {}
-    if not isinstance(summary, dict):
-        return {}
-    if '' in summary:
-        return summary['']
-    if len(summary) == 1:
-        return next(iter(summary.values()))
-    return {}
-
-
-def metrics_from_clashscore_json(payload: dict[str, Any]) -> dict[str, float | int | None]:
-    summary = _summary_bucket(payload)
-    clashscore = summary.get('clashscore')
-    num_clashes = summary.get('num_clashes')
+def metrics_from_molprobity_stdout(stdout: str, stderr: str = '') -> dict[str, float | int | None]:
+    # phenix.molprobity summary uses "Clashscore =", "RMS(bonds)", "RMS(angles)".
+    text = f'{stdout}\n{stderr}'
+    clashscore = _search_metric(
+        text,
+        (
+            r'Clashscore\s*=\s*([0-9]+(?:\.[0-9]+)?)',
+            r'All-atom Clashscore\s*:\s*([0-9]+(?:\.[0-9]+)?)',
+        ),
+    )
+    num_clashes = _search_metric(
+        text,
+        (
+            r'Num(?:ber of)? clashes\s*[:=]\s*([0-9]+)',
+            r'Clashes\s*[:=]\s*([0-9]+)',
+        ),
+    )
+    bond_rmsd = _search_metric(
+        text,
+        (
+            r'RMS\(bonds\)\s*=\s*([0-9]+(?:\.[0-9]+)?)',
+            r'covalent geometry\s*:\s*bond\s+([0-9]+(?:\.[0-9]+)?)',
+            r'^\s*Bond\s*:\s*([0-9]+(?:\.[0-9]+)?)\s',
+        ),
+    )
+    angle_rmsd = _search_metric(
+        text,
+        (
+            r'RMS\(angles\)\s*=\s*([0-9]+(?:\.[0-9]+)?)',
+            r'covalent geometry\s*:\s*angle\s+([0-9]+(?:\.[0-9]+)?)',
+            r'^\s*Angle\s*:\s*([0-9]+(?:\.[0-9]+)?)\s',
+        ),
+    )
     return {
         'clashscore': float(clashscore) if clashscore is not None else None,
         'num_clashes': int(num_clashes) if num_clashes is not None else None,
-    }
-
-
-def metrics_from_rna_validate_json(payload: dict[str, Any]) -> dict[str, int | None]:
-    bonds = payload.get('rna_bonds') or {}
-    summary = _summary_bucket(bonds if isinstance(bonds, dict) else {})
-    num_outliers = summary.get('num_outliers')
-    num_total = summary.get('num_total')
-    return {
-        'rna_bond_num_outliers': int(num_outliers) if num_outliers is not None else None,
-        'rna_bond_num_total': int(num_total) if num_total is not None else None,
+        'bond_rmsd': float(bond_rmsd) if bond_rmsd is not None else None,
+        'angle_rmsd': float(angle_rmsd) if angle_rmsd is not None else None,
     }
 
 
@@ -159,75 +161,54 @@ def run_structure_molprobity(
     timeout_s: int = 600,
     run_rna_validate: bool = True,
 ) -> MolprobityRunResult:
-    """Run clashscore (+ optional rna_validate) and return flat MolProbity metrics."""
+    """Run phenix.molprobity and return flat MolProbity metrics."""
     structure_path = Path(structure_path)
     t0 = time.perf_counter()
     metrics: dict[str, float | int | None] = {
         'clashscore': None,
         'num_clashes': None,
-        'rna_bond_num_outliers': None,
-        'rna_bond_num_total': None,
+        'bond_rmsd': None,
+        'angle_rmsd': None,
     }
-    stdout_parts: list[str] = []
-    stderr_parts: list[str] = []
     returncode = 0
     error = None
 
     try:
-        clash_proc = _run_molprobity_tool(
-            'clashscore',
+        molprobity_proc = _run_molprobity_tool(
+            'molprobity',
             structure_path,
             phenix_module=phenix_module,
             bin_dir=bin_dir,
             timeout_s=timeout_s,
         )
-        stdout_parts.append(clash_proc.stdout)
-        stderr_parts.append(clash_proc.stderr)
-        returncode = clash_proc.returncode
-        if clash_proc.returncode != 0:
-            error = (clash_proc.stderr or clash_proc.stdout)[-2000:]
+        returncode = molprobity_proc.returncode
+        if molprobity_proc.returncode != 0:
+            error = (molprobity_proc.stderr or molprobity_proc.stdout)[-2000:]
         else:
-            clash_json = extract_json_object(clash_proc.stdout)
-            if clash_json is None:
-                error = 'clashscore produced no parseable JSON'
-            else:
-                metrics.update(metrics_from_clashscore_json(clash_json))
-
-        if run_rna_validate and error is None:
-            rna_proc = _run_molprobity_tool(
-                'rna_validate',
-                structure_path,
-                phenix_module=phenix_module,
-                bin_dir=bin_dir,
-                timeout_s=timeout_s,
-            )
-            stdout_parts.append(rna_proc.stdout)
-            stderr_parts.append(rna_proc.stderr)
-            if rna_proc.returncode != 0:
-                error = (rna_proc.stderr or rna_proc.stdout)[-2000:]
-                returncode = rna_proc.returncode
-            else:
-                rna_json = extract_json_object(rna_proc.stdout)
-                if rna_json is None:
-                    error = 'rna_validate produced no parseable JSON'
-                else:
-                    metrics.update(metrics_from_rna_validate_json(rna_json))
+            metrics.update(metrics_from_molprobity_stdout(
+                molprobity_proc.stdout,
+                molprobity_proc.stderr,
+            ))
     except subprocess.TimeoutExpired as exc:
         error = f'timeout after {timeout_s}s'
         returncode = -1
-        stderr_parts.append(str(exc))
+        molprobity_stdout = ''
+        molprobity_stderr = str(exc)
+    else:
+        molprobity_stdout = molprobity_proc.stdout
+        molprobity_stderr = molprobity_proc.stderr
 
-    success = error is None and metrics['clashscore'] is not None
+    success = error is None and any(metrics[key] is not None for key in MOLPROBITY_METRIC_KEYS)
     return MolprobityRunResult(
         success=success,
         wall_time_s=time.perf_counter() - t0,
         returncode=returncode,
         clashscore=metrics['clashscore'],  # type: ignore[arg-type]
         num_clashes=metrics['num_clashes'],  # type: ignore[arg-type]
-        rna_bond_num_outliers=metrics['rna_bond_num_outliers'],  # type: ignore[arg-type]
-        rna_bond_num_total=metrics['rna_bond_num_total'],  # type: ignore[arg-type]
-        stdout='\n'.join(stdout_parts),
-        stderr='\n'.join(stderr_parts),
+        bond_rmsd=metrics['bond_rmsd'],  # type: ignore[arg-type]
+        angle_rmsd=metrics['angle_rmsd'],  # type: ignore[arg-type]
+        stdout=molprobity_stdout,
+        stderr=molprobity_stderr,
         error=error,
     )
 
@@ -372,6 +353,19 @@ def format_molprobity_summary(summary: dict[str, float | int | None]) -> str:
     return '  '.join(parts)
 
 
+def print_molprobity_summary(
+    title: str,
+    rows: list[dict[str, Any]],
+    *,
+    prefix: str = 'molprobity',
+) -> dict[str, float | int | None]:
+    """Print one MolProbity aggregate block (same layout as per-method lines)."""
+    summary = summarize_molprobity_rows(rows, prefix=prefix)
+    print(f'\n{title}')
+    print(f'  {format_molprobity_summary(summary)}')
+    return summary
+
+
 def print_molprobity_method_summaries(
     method_rows: dict[str, list[dict[str, Any]]],
     *,
@@ -380,7 +374,9 @@ def print_molprobity_method_summaries(
     summaries = {}
     print('\nMolProbity summaries:')
     for method_name, rows in method_rows.items():
-        summary = summarize_molprobity_rows(rows, prefix=prefix)
-        summaries[method_name] = summary
-        print(f'  {method_name}: {format_molprobity_summary(summary)}')
+        summaries[method_name] = print_molprobity_summary(
+            method_name,
+            rows,
+            prefix=prefix,
+        )
     return summaries

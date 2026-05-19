@@ -35,7 +35,12 @@ def _edge_target_idx(data) -> int:
     return int(data.is_chain_edge_nt.nonzero(as_tuple=True)[0][0].item())
 
 
-def _build_target_payload(data, tidx: int) -> dict[str, torch.Tensor]:
+def _build_target_payload(
+    data,
+    tidx: int,
+    target_segid: str,
+    target_resid: int,
+) -> dict[str, Any]:
     ws = int(data.nt_origins_world.size(0))
     target_nt_idx = torch.tensor(tidx, dtype=torch.long)
 
@@ -51,6 +56,8 @@ def _build_target_payload(data, tidx: int) -> dict[str, torch.Tensor]:
 
     return {
         'target_nt_idx': target_nt_idx,
+        'target_segid': target_segid,
+        'target_resid': target_resid,
         'is_target_nt': is_target,
         'rel_origins': rel_o.float(),
         'rel_frames': rel_r.float(),
@@ -248,11 +255,27 @@ class PyGDataset(Dataset):
 
         data_idx = 0
         for _, _, windows in chain_records:
-            for _, _, data in windows:
+            for window, _, data in windows:
                 # Precompute target-conditioned geometry once during processing.
-                payloads = {'central': _build_target_payload(data, self.window_size // 2)}
+                central_idx = self.window_size // 2
+                central_nt = window[central_idx]
+                payloads = {
+                    'central': _build_target_payload(
+                        data,
+                        central_idx,
+                        central_nt.segid,
+                        int(central_nt.resid),
+                    ),
+                }
                 if bool(data.touches_chain_edge.item()):
-                    payloads['edge'] = _build_target_payload(data, _edge_target_idx(data))
+                    edge_idx = _edge_target_idx(data)
+                    edge_nt = window[edge_idx]
+                    payloads['edge'] = _build_target_payload(
+                        data,
+                        edge_idx,
+                        edge_nt.segid,
+                        int(edge_nt.resid),
+                    )
                 data._precomputed_target_payloads = payloads
                 save_path = osp.join(pdb_id_processed_dir, f'{data_idx}.pt')
                 torch.save(data, save_path)
@@ -304,7 +327,7 @@ class WindowTargetDataset(torch.utils.data.Dataset):
         data = copy(base_data)
         payload_key = 'central' if target_type == self.CENTRAL else 'edge'
         payloads = cast(
-            dict[str, dict[str, torch.Tensor]],
+            dict[str, dict[str, Any]],
             getattr(base_data, '_precomputed_target_payloads'),
         )
         payload = payloads[payload_key]

@@ -62,6 +62,7 @@ ANALYSIS_TMP_ROOT = Path(__file__).resolve().parents[1] / 'data'
 KNN_CACHE_ROOT = ANALYSIS_TMP_ROOT / 'knn_cache'
 KNN_CACHE_VERSION = 'v1'
 KNN_MOLPROBITY_ROOT = ANALYSIS_TMP_ROOT / 'knn_molprobity'
+BASE2BACKBONE_MOLPROBITY_ROOT = ANALYSIS_TMP_ROOT / 'base2backbone_molprobity'
 MOLPROBITY_TIMEOUT_S = 600
 MOLPROBITY_MAX_WORKERS = 32
 RMSD_EVAL_BATCH_SIZE = 20000
@@ -1065,6 +1066,98 @@ view.addLabel(
 view.zoomTo()
 view.show()
 
+
+# %% Calculate chemical validity for base2backbone
+
+
+def run_base2backbone_inference(
+    input_path: str | Path,
+    output_dir: str | Path,
+    checkpoint_model,
+    device: str | None = None,
+    window_size: int | None = None,
+    num_timesteps: int | None = None,
+) -> dict:
+    """
+    Run end-to-end inference from a Lightning checkpoint and write a backbone PDB.
+
+    Timing includes inference and output serialization to mirror PHENIX latency.
+    """
+
+    input_path = Path(input_path).resolve()
+    output_dir = Path(output_dir).resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if device is None:
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    if window_size is None:
+        window_size_i = int(getattr(test_dataset.base, 'window_size', 3))
+    else:
+        window_size_i = int(window_size)
+
+    output_pdb = output_dir / f'{input_path.stem}_base2backbone.pdb'
+    t0 = time.perf_counter()
+    input_path_str = str(input_path)
+
+    try:
+        adapter = CheckpointSamplerAdapter(checkpoint_model, num_timesteps)
+        _, chain_records = parse_dna(
+            input_path_str,
+            use_full_nucleotide=False,
+            window_size=window_size_i,
+        )
+        predictions = predict_backbone_from_chain_records(
+            [chain_records],
+            adapter,
+            device
+        )[0]
+        with warnings.catch_warnings():
+            warnings.simplefilter('ignore', PDBConstructionWarning)
+            _, full_chain_records = parse_dna(
+                input_path_str,
+                use_full_nucleotide=True,
+                window_size=window_size_i,
+            )
+        write_structure(build_output_universe(full_chain_records, predictions), output_pdb)
+    except Exception as e:
+        return {
+            'success': False,
+            'wall_time_s': time.perf_counter() - t0,
+            'returncode': -999,
+            'output_pdb': None,
+            'stdout': '',
+            'stderr': repr(e),
+        }
+
+    return {
+        'success': True,
+        'wall_time_s': time.perf_counter() - t0,
+        'returncode': 0,
+        'output_pdb': output_pdb,
+        'stdout': '',
+        'stderr': '',
+    }
+
+
+base2backbone_molprobity_rows = run_structure_benchmark(
+    collect_test_dataset_raw_paths(test_dataset),
+    BASE2BACKBONE_MOLPROBITY_ROOT,
+    partial(
+        run_base2backbone_inference,
+        checkpoint_model=model,
+        device=device,
+    ),
+    label='base2backbone',
+    max_workers=1,
+    window_size=int(test_dataset.base.window_size),
+    molprobity_timeout_s=MOLPROBITY_TIMEOUT_S,
+    molprobity_max_workers=MOLPROBITY_MAX_WORKERS,
+)
+print_molprobity_summary(
+    'Base2Backbone MolProbity:',
+    base2backbone_molprobity_rows,
+)
+
 # %% Measure stochastic spread across independent diffusion runs on the same input
 K = 10
 N_SAMPLES = 60
@@ -1994,75 +2087,6 @@ def run_phenix_geometry_minimization(
             'stdout': result.stdout,
             'stderr': stderr_out,
         }
-
-
-def run_base2backbone_inference(
-    input_path: str | Path,
-    output_dir: str | Path,
-    checkpoint_model,
-    device: str | None = None,
-    window_size: int | None = None,
-    num_timesteps: int | None = None,
-) -> dict:
-    """
-    Run end-to-end inference from a Lightning checkpoint and write a backbone PDB.
-
-    Timing includes inference and output serialization to mirror PHENIX latency.
-    """
-
-    input_path = Path(input_path).resolve()
-    output_dir = Path(output_dir).resolve()
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if device is None:
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    if window_size is None:
-        window_size_i = int(getattr(test_dataset.base, 'window_size', 3))
-    else:
-        window_size_i = int(window_size)
-
-    output_pdb = output_dir / f'{input_path.stem}_base2backbone.pdb'
-    t0 = time.perf_counter()
-    input_path_str = str(input_path)
-
-    try:
-        adapter = CheckpointSamplerAdapter(checkpoint_model, num_timesteps)
-        _, chain_records = parse_dna(
-            input_path_str,
-            use_full_nucleotide=False,
-            window_size=window_size_i,
-        )
-        predictions = predict_backbone_from_chain_records(
-            [chain_records],
-            adapter,
-            device
-        )[0]
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore', PDBConstructionWarning)
-            _, full_chain_records = parse_dna(
-                input_path_str,
-                use_full_nucleotide=True,
-                window_size=window_size_i,
-            )
-        write_structure(build_output_universe(full_chain_records, predictions), output_pdb)
-    except Exception as e:
-        return {
-            'success': False,
-            'wall_time_s': time.perf_counter() - t0,
-            'returncode': -999,
-            'output_pdb': None,
-            'stdout': '',
-            'stderr': repr(e),
-        }
-
-    return {
-        'success': True,
-        'wall_time_s': time.perf_counter() - t0,
-        'returncode': 0,
-        'output_pdb': output_pdb,
-        'stdout': '',
-        'stderr': '',
-    }
 
 
 def run_base2backbone_checkpoint_inference(
